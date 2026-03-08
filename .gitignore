@@ -1,0 +1,17 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+
+# Virtual environments
+.venv/
+
+# OS artifacts
+.DS_Store
+
+# Output directories (regenerable)
+results/
+logs/
+synthe_py/out/
+lines/.py_line_cache/
