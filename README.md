@@ -389,7 +389,7 @@ pyKurucz faithfully reimplements the *atomic-line* synthesis path through Kurucz
 | Limitation | Impact | Next step |
 |---|---|---|
 | **No molecular line opacity** | TiO, H₂O, VO, CH, CN bands missing — affects cool stars ($T_{\text{eff}} \lesssim 4000$ K) and the infrared. Negligible for FGK+ in the optical. | Parse Kurucz molecular line catalogs into the existing opacity loop. |
-| **No self-consistent atmosphere iteration** | Emulator approximates nearest 4-parameter model; cannot iterate $T$-$P$-$\kappa$ for arbitrary abundance patterns. | Full Python ATLAS12 reimplementation (radiative/convective equilibrium + opacity sampling). |
+| **No self-consistent atmosphere iteration** | Emulator approximates nearest 4-parameter model; cannot iterate T–P–κ for arbitrary abundance patterns. | Full Python ATLAS12 reimplementation (radiative/convective equilibrium + opacity sampling). |
 | **LTE only** | NLTE effects matter for specific lines (Li I, Na D, O I triplet) in metal-poor/hot stars. | Ingest departure coefficients from external NLTE codes as correction factors. |
 | **1D plane-parallel geometry** | Breaks down for evolved giants with extended atmospheres. | Ingest 3D model atmospheres (Stagger, CO⁵BOLD) as stratifications for post-processing. |
 
