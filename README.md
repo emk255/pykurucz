@@ -102,7 +102,7 @@ Spectrum synthesis requires a **model atmosphere** as input — a description of
 
 | | Mode A | Mode B |
 |---|---|---|
-| **Input** | Your own `.atm` file | Stellar parameters ($T_{\text{eff}}$, $\log g$, [M/H], [$\alpha$/M]) |
+| **Input** | Your own `.atm` file | Stellar parameters ($T_{\text{eff}}$, $\log g$, [M/H], [α/M]) |
 | **Atmosphere source** | Pre-computed (ATLAS12, MARCS, PHOENIX, etc.) | Neural network emulator (kurucz-a1) |
 | **Dependencies** | Core only | Core + PyTorch |
 | **Best for** | Full control, non-standard abundances, outside emulator range | Quick exploration, no pre-computed atmosphere available |
@@ -135,7 +135,7 @@ python pykurucz.py --teff 5770 --logg 4.44 --abund C:+0.5 --abund Fe:-1.0
 python pykurucz.py --teff 5770 --logg 4.44 --wl-start 400 --wl-end 700 --resolution 50000
 ```
 
-The emulator is trained on 104,269 ATLAS12 models ($T_{\text{eff}}$ 2,500–50,000 K, $\log g$ −1.0–5.5, [M/H] −4.0–+1.5, [$\alpha$/M] −0.2–+0.6). Outside this range, the code warns you — use Mode A instead.
+The emulator is trained on 104,269 ATLAS12 models ($T_{\text{eff}}$ 2,500–50,000 K, $\log g$ −1.0–5.5, [M/H] −4.0–+1.5, [α/M] −0.2–+0.6). Outside this range, the code warns you — use Mode A instead.
 
 > **Note**: The emulator approximates the nearest 4-parameter atmospheric model. It cannot self-consistently iterate the atmosphere for arbitrary abundance patterns. If your science depends on this, use **Mode A** with an atmosphere from the full ATLAS12 or another atmosphere code.
 
@@ -208,7 +208,7 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
 When using the emulator (Mode B) and specifying individual element abundances via `--abund`, values are **dex offsets relative to Asplund solar** (e.g., `Fe:-1.0` means [Fe/H] = −1.0). The script automatically derives the best-matching 4-parameter model for the emulator:
 
 - **[M/H]**: proxied by the Fe offset (if given): $[\text{M/H}] \approx [\text{Fe/H}]$
-- **[$\alpha$/M]**: computed as the average offset of alpha elements (O, Ne, Mg, Si, S, Ca, Ti) relative to the derived [M/H]
+- **[α/M]**: computed as the average offset of alpha elements (O, Ne, Mg, Si, S, Ca, Ti) relative to the derived [M/H]
 
 The emulator predicts the closest atmospheric structure for those derived parameters. Your exact abundances (solar + offsets) are written into the `.atm` file's abundance table, so SYNTHE uses the precise values you requested for all line opacity calculations.
 
@@ -339,7 +339,7 @@ python pykurucz.py --teff <Teff> --logg <logg> [options]
 | `--teff` | (required) | Effective temperature (K) |
 | `--logg` | (required) | Surface gravity (log10 cgs) |
 | `--mh` | 0.0 | Overall metallicity [M/H] — scales all metals uniformly |
-| `--am` | 0.0 | Alpha enhancement [$\alpha$/M] — extra offset for O, Ne, Mg, Si, S, Ca, Ti |
+| `--am` | 0.0 | Alpha enhancement [α/M] — extra offset for O, Ne, Mg, Si, S, Ca, Ti |
 | `--vturb` | 2.0 | Microturbulent velocity (km/s) |
 | `--abund` | — | Element offset relative to solar: `--abund Fe:-1.0` for [Fe/H]=−1.0 (repeatable) |
 | `--wl-start` | 300 | Start wavelength (nm) |
