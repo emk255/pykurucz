@@ -33,6 +33,18 @@ class LineDataConfig:
     cache_directory: Optional[Path] = None
     allow_tfort_runtime: bool = False
 
+    # Molecular line opacity (Kurucz rmolecasc / rschwenk / rh2ofast)
+    molecular_line_dirs: List[Path] = field(default_factory=list)
+    """Directories containing Kurucz ASCII molecular .dat/.asc files."""
+    include_tio: bool = False
+    """Include Schwenke TiO binary line list (rschwenk)."""
+    include_h2o: bool = False
+    """Include Partridge-Schwenke H2O binary line list (rh2ofast)."""
+    tio_bin_path: Optional[Path] = None
+    """Explicit path to schwenke.bin (or eschwenke.bin). Auto-located if None."""
+    h2o_bin_path: Optional[Path] = None
+    """Explicit path to h2ofastfix.bin. Auto-located if None."""
+
 
 @dataclass
 class AtmosphereInput:
@@ -99,6 +111,11 @@ class SynthesisConfig:
         npz_path: Optional[Path] = None,
         n_workers: Optional[int] = None,
         allow_tfort_runtime: bool = False,
+        molecular_line_dirs: Optional[List[Path]] = None,
+        include_tio: bool = False,
+        include_h2o: bool = False,
+        tio_bin_path: Optional[Path] = None,
+        h2o_bin_path: Optional[Path] = None,
     ) -> "SynthesisConfig":
         """Helper for the default CLI entry point."""
 
@@ -113,6 +130,11 @@ class SynthesisConfig:
             line_data=LineDataConfig(
                 atomic_catalog=atomic_catalog,
                 allow_tfort_runtime=allow_tfort_runtime,
+                molecular_line_dirs=molecular_line_dirs or [],
+                include_tio=include_tio,
+                include_h2o=include_h2o,
+                tio_bin_path=tio_bin_path,
+                h2o_bin_path=h2o_bin_path,
             ),
             atmosphere=AtmosphereInput(model_path=atmosphere_path, npz_path=npz_path),
             output=OutputConfig(spec_path=spec_path, diagnostics_path=diagnostics_path),

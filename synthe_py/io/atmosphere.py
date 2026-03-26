@@ -82,7 +82,7 @@ class AtmosphereModel:
 def load_cached(path: Path) -> AtmosphereModel:
     """Load a cached numpy `.npz` representation of the atmosphere."""
 
-    with np.load(path, allow_pickle=False) as data:
+    with np.load(path, allow_pickle=True) as data:
         # Load metadata (keys starting with "meta_")
         metadata = {}
         abundances_dict = {}

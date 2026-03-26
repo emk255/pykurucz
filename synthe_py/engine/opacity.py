@@ -19,6 +19,7 @@ from numba import jit, prange
 from ..config import SynthesisConfig
 from ..io import atmosphere, export
 from ..io.lines import atomic, compiler as line_compiler, fort19 as fort19_io
+from ..io.lines import molecular_compiler as mol_compiler
 from ..io import spectrv as spectrv_io
 from ..physics import (
     bfudge,
@@ -278,6 +279,144 @@ def _accumulate_metal_profile_kernel(
                 value = value * (wave - base) / max(wtail - base, 1e-12)
 
         buffer[idx] += value
+
+
+@jit(nopython=True, parallel=True, cache=True)
+def _accumulate_mol_wings_batch(
+    mol_asynth: np.ndarray,       # (n_depths, n_wl) — written in-place
+    cont_arr: np.ndarray,         # (n_depths, n_wl) raw continuum opacity
+    wavelength: np.ndarray,       # (n_wl,)
+    center_indices: np.ndarray,   # (n_mol_lines,) int64 grid indices
+    mol_wavelength: np.ndarray,   # (n_mol_lines,) line wavelengths (nm)
+    mol_kappa0: np.ndarray,       # (n_mol_lines, n_depths)
+    mol_adamp: np.ndarray,        # (n_mol_lines, n_depths) dimensionless damping
+    mol_doppler_widths: np.ndarray,  # (n_mol_lines, n_depths) in nm
+    mol_valid_mask: np.ndarray,   # (n_mol_lines, n_depths) bool
+    cutoff: float,
+    max_profile_steps: int,
+    h0tab: np.ndarray,
+    h1tab: np.ndarray,
+    h2tab: np.ndarray,
+) -> None:
+    """Batched Fortran fort.12 molecular wing accumulation.
+
+    Matches synthe.for lines 286-326 exactly:
+      - Near-wing profile computed via H0TAB/H1TAB table or full Voigt
+      - KAPMIN evaluated at line CENTER (not at each wing step)
+      - Early-cutoff step IS included in wing addition (Fortran GO TO 323)
+      - Far wings use X/nstep^2 falloff
+      - Wing addition is UNCONDITIONAL (no per-step cutoff)
+
+    Profile values are computed on-the-fly to avoid storing the full
+    PROFILE array (which would be MAX_PROFILE_STEPS * n_depths * 8 bytes).
+    The early-cutoff step is still added to the buffer before breaking,
+    matching the Fortran GO TO 323 path.
+
+    Parallelized over depth layers (prange); no write conflicts since each
+    depth has its own mol_asynth[di, :] row.
+    """
+    n_depths = mol_asynth.shape[0]
+    n_wl = mol_asynth.shape[1]
+    n_mol_lines = center_indices.shape[0]
+    vsteps = 200.0
+
+    for di in prange(n_depths):  # parallel over depth layers
+        buf = mol_asynth[di]
+        cont_row = cont_arr[di]
+
+        for li in range(n_mol_lines):
+            if not mol_valid_mask[li, di]:
+                continue
+
+            kappa0 = mol_kappa0[li, di]
+            adamp = mol_adamp[li, di]
+            doppler_width = mol_doppler_widths[li, di]
+            center_index = center_indices[li]
+            line_wavelength = mol_wavelength[li]
+
+            if doppler_width <= 0.0 or kappa0 <= 0.0:
+                continue
+
+            # KAPMIN at line center — Fortran: CONTINUUM(MIN(MAX(NBUFF,1),LENGTH))*CUTOFF
+            clamped_center = max(0, min(center_index, n_wl - 1))
+            kapmin = cutoff * cont_row[clamped_center]
+
+            # RESOLU = 1 / (lambda_ratio - 1)
+            if clamped_center < n_wl - 1:
+                resolu = 1.0 / (wavelength[clamped_center + 1] / wavelength[clamped_center] - 1.0)
+            elif clamped_center > 0:
+                resolu = 1.0 / (wavelength[clamped_center] / wavelength[clamped_center - 1] - 1.0)
+            else:
+                resolu = 300000.0
+
+            # DOPPLE = dimensionless thermal velocity (in units of c)
+            dopple = doppler_width / line_wavelength if line_wavelength > 0.0 else 1e-6
+
+            # N10DOP = int(10 * DOPPLE * RESOLU) — near-wing span in grid steps
+            n10dop = int(10.0 * dopple * resolu)
+            n10dop = min(n10dop, max_profile_steps)
+
+            early_cutoff = False
+            profile_n10dop = 0.0  # profile value at nstep = n10dop (for far wings)
+
+            # ===== Near wing: compute on-the-fly, add to buffer =====
+            # Includes the early-cutoff step (matches Fortran GO TO 323 path)
+            if adamp < 0.2:
+                # Fortran: table lookup path
+                tabstep = vsteps / (dopple * resolu) if (dopple * resolu) > 0.0 else vsteps
+                tabi = 0.5  # 0-based offset (Fortran uses 1.5 for 1-based)
+                for nstep in range(1, n10dop + 1):
+                    tabi += tabstep
+                    itab = min(max(int(tabi), 0), len(h0tab) - 1)
+                    pval = kappa0 * (h0tab[itab] + adamp * h1tab[itab])
+                    # Red wing
+                    idx_red = center_index + nstep
+                    if 0 <= idx_red < n_wl:
+                        buf[idx_red] += pval
+                    # Blue wing
+                    idx_blue = center_index - nstep
+                    if 0 <= idx_blue < n_wl:
+                        buf[idx_blue] += pval
+                    if pval < kapmin:
+                        early_cutoff = True
+                        break
+                    if nstep == n10dop:
+                        profile_n10dop = pval
+            else:
+                # Fortran: full Voigt function path
+                dvoigt = 1.0 / dopple / resolu if (dopple * resolu) > 0.0 else 1e-6
+                for nstep in range(1, n10dop + 1):
+                    x_val = float(nstep) * dvoigt
+                    pval = kappa0 * _voigt_profile_jit(x_val, adamp, h0tab, h1tab, h2tab)
+                    idx_red = center_index + nstep
+                    if 0 <= idx_red < n_wl:
+                        buf[idx_red] += pval
+                    idx_blue = center_index - nstep
+                    if 0 <= idx_blue < n_wl:
+                        buf[idx_blue] += pval
+                    if pval < kapmin:
+                        early_cutoff = True
+                        break
+                    if nstep == n10dop:
+                        profile_n10dop = pval
+
+            # ===== Far wings (only if near-wing completed without early cutoff) =====
+            # Fortran: X = PROFILE(N10DOP)*N10DOP^2, MAXSTEP = sqrt(X/KAPMIN)+1
+            if not early_cutoff and n10dop > 0 and profile_n10dop > 0.0:
+                x_far = profile_n10dop * float(n10dop) * float(n10dop)
+                if x_far > 0.0 and kapmin > 0.0:
+                    maxstep = int(math.sqrt(x_far / kapmin) + 1.0)
+                    maxstep = min(maxstep, max_profile_steps)
+                else:
+                    maxstep = n10dop
+                for nstep in range(n10dop + 1, maxstep + 1):
+                    pval = x_far / (float(nstep) * float(nstep))  # x_far / nstep^2
+                    idx_red = center_index + nstep
+                    if 0 <= idx_red < n_wl:
+                        buf[idx_red] += pval
+                    idx_blue = center_index - nstep
+                    if 0 <= idx_blue < n_wl:
+                        buf[idx_blue] += pval
 
 
 _ATOMIC_MASS = {
@@ -2180,16 +2319,124 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
         line_filter=cfg.line_filter,
         cache_directory=cfg.line_data.cache_directory,
     )
+
+    # --- Molecular line opacity (rmolecasc / rschwenk / rh2ofast) ---
+    mol_dicts = []
+    if cfg.line_data.molecular_line_dirs:
+        from pathlib import Path as _Path
+        import glob as _glob
+        all_mol_files: list = []
+        for mol_dir in cfg.line_data.molecular_line_dirs:
+            mol_dir = _Path(mol_dir)
+            for ext in ("*.dat", "*.asc"):
+                all_mol_files.extend(sorted(mol_dir.glob(ext)))
+            # Also include ASCII molecular files in known subdirectories
+            # (e.g. vo/voax.asc, vo/vobx.asc, vo/vocx.asc which Fortran kurucz.py
+            # explicitly processes via rmolecasc.exe from their subdirectory paths)
+            for subdir in ("vo",):
+                for ext in ("*.dat", "*.asc"):
+                    all_mol_files.extend(sorted((mol_dir / subdir).glob(ext)))
+        if all_mol_files:
+            logger.info("Compiling molecular ASCII line lists: %d files", len(all_mol_files))
+            t_mol = time.perf_counter()
+            mol_d = mol_compiler.compile_molecular_ascii(
+                paths=all_mol_files,
+                wlbeg=cfg.wavelength_grid.start,
+                wlend=cfg.wavelength_grid.end,
+                resolution=cfg.wavelength_grid.resolution,
+                ifvac=1,   # Fortran rmolecasc.for default: WLVAC from energy levels
+            )
+            mol_dicts.append(mol_d)
+            logger.info(
+                "Molecular ASCII compiled: %d lines in %.2fs",
+                len(mol_d["nbuff"]),
+                time.perf_counter() - t_mol,
+            )
+
+    if cfg.line_data.include_tio:
+        tio_path = cfg.line_data.tio_bin_path
+        if tio_path is None and cfg.line_data.molecular_line_dirs:
+            from pathlib import Path as _Path
+            for mol_dir in cfg.line_data.molecular_line_dirs:
+                mol_dir = _Path(mol_dir)
+                for candidate in ("tio/schwenke.bin", "tio/eschwenke.bin",
+                                  "schwenke.bin", "eschwenke.bin"):
+                    p = mol_dir / candidate
+                    if p.exists():
+                        tio_path = p
+                        break
+                if tio_path is not None:
+                    break
+        if tio_path is not None and tio_path.exists():
+            logger.info("Compiling TiO Schwenke binary: %s", tio_path)
+            t_tio = time.perf_counter()
+            tio_d = mol_compiler.compile_tio_schwenke(
+                bin_path=tio_path,
+                wlbeg=cfg.wavelength_grid.start,
+                wlend=cfg.wavelength_grid.end,
+                resolution=cfg.wavelength_grid.resolution,
+            )
+            mol_dicts.append(tio_d)
+            logger.info(
+                "TiO compiled: %d lines in %.2fs",
+                len(tio_d["nbuff"]),
+                time.perf_counter() - t_tio,
+            )
+        else:
+            logger.warning("--include-tio requested but TiO binary not found (path=%s)", tio_path)
+
+    if cfg.line_data.include_h2o:
+        h2o_path = cfg.line_data.h2o_bin_path
+        if h2o_path is None and cfg.line_data.molecular_line_dirs:
+            from pathlib import Path as _Path
+            for mol_dir in cfg.line_data.molecular_line_dirs:
+                mol_dir = _Path(mol_dir)
+                for candidate in ("h2o/h2ofastfix.bin", "h2ofastfix.bin"):
+                    p = mol_dir / candidate
+                    if p.exists():
+                        h2o_path = p
+                        break
+                if h2o_path is not None:
+                    break
+        if h2o_path is not None and h2o_path.exists():
+            logger.info("Compiling H2O Partridge-Schwenke binary: %s", h2o_path)
+            t_h2o = time.perf_counter()
+            h2o_d = mol_compiler.compile_h2o_partridge(
+                bin_path=h2o_path,
+                wlbeg=cfg.wavelength_grid.start,
+                wlend=cfg.wavelength_grid.end,
+                resolution=cfg.wavelength_grid.resolution,
+            )
+            mol_dicts.append(h2o_d)
+            logger.info(
+                "H2O compiled: %d lines in %.2fs",
+                len(h2o_d["nbuff"]),
+                time.perf_counter() - t_h2o,
+            )
+        else:
+            logger.warning("--include-h2o requested but H2O binary not found (path=%s)", h2o_path)
+
+    if mol_dicts:
+        n_mol_total = sum(len(d["nbuff"]) for d in mol_dicts)
+        logger.info("Merging %d molecular line records into compiled catalog", n_mol_total)
+        compiled_lines = mol_compiler.merge_molecular_into_compiled(compiled_lines, *mol_dicts)
+
     catalog = compiled_lines.catalog
     fort19_data = compiled_lines.fort19_data
     logger.info(
-        "Compiled line metadata from catalog (contract=%s, lines=%d, fort19=%d)",
+        "Compiled line metadata from catalog (contract=%s, lines=%d, fort19=%d, mol=%d)",
         line_compiler.LINE_COMPILER_CONTRACT.nbuff_indexing,
         len(catalog.records),
         len(fort19_data.wavelength_vacuum),
+        sum(len(d["nbuff"]) for d in mol_dicts),
     )
     has_lines = len(catalog.records) > 0
-    logger.info(f"Catalog: {len(catalog.records)} lines")
+    n_mol_total = sum(len(d["nbuff"]) for d in mol_dicts)
+    logger.info(
+        "Catalog: %d atomic lines | %d molecular lines compiled",
+        len(catalog.records),
+        n_mol_total,
+    )
     _timings["line catalog"] = time.perf_counter() - t_stage
     logger.info("Timing: line catalog in %.3fs", _timings["line catalog"])
     catalog_wavelength = catalog.wavelength
@@ -2392,6 +2639,251 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
         logger.info(
             f"Computed ASYNTH: shape {asynth.shape}, range [{np.min(asynth):.2e}, {np.max(asynth):.2e}]"
         )
+
+        # --- Molecular line opacity (unified through TRANSP kernel) ---
+        # Molecular lines use the Voigt + far-wing + STIM physics from the
+        # fort.12 path. TRANSP (center) uses _compute_transp_numba_kernel;
+        # wings use _accumulate_metal_profile_kernel (Fortran synthe.for
+        # lines 286-326: pre-compute PROFILE, unconditional wing addition).
+        if mol_dicts:
+            from ..physics import mol_populations as _mol_pops
+            from ..physics.line_opacity import (
+                _compute_transp_numba_kernel,
+            )
+            import math as _math
+
+            _ratio = 1.0 + 1.0 / cfg.wavelength_grid.resolution
+            _ratiolg = _math.log(_ratio)
+            _ixwlbeg = int(_math.floor(_math.log(cfg.wavelength_grid.start) / _ratiolg))
+            if _math.exp(_ixwlbeg * _ratiolg) < cfg.wavelength_grid.start:
+                _ixwlbeg += 1
+
+            combined_mol: dict = {}
+            if len(mol_dicts) == 1:
+                combined_mol = mol_dicts[0]
+            else:
+                for key in ("nbuff", "cgf", "nelion", "elo_cm", "gamma_rad", "gamma_stark", "gamma_vdw", "limb"):
+                    combined_mol[key] = np.concatenate([d[key] for d in mol_dicts])
+
+            n_mol_lines = len(combined_mol["nbuff"])
+            unique_nelions = set(int(n) for n in combined_mol["nelion"])
+            logger.info(
+                "Molecular unified path: %d lines, %d NELION species",
+                n_mol_lines, len(unique_nelions),
+            )
+
+            # --- Phase 3a: Compute molecular populations and inject ---
+            molecules_path = None
+            if cfg.line_data.molecular_line_dirs:
+                for mol_dir in cfg.line_data.molecular_line_dirs:
+                    cand = Path(mol_dir).parent / "lines" / "molecules.dat"
+                    if not cand.exists():
+                        cand = Path(mol_dir) / ".." / "lines" / "molecules.dat"
+                    if cand.exists():
+                        molecules_path = cand.resolve()
+                        break
+
+            t_mol_pop = time.perf_counter()
+            xnfpmol_dict, dopple_dict = _mol_pops.compute_mol_xnfpmol_dopple(
+                atm=atm,
+                nelion_set=unique_nelions,
+                molecules_path=molecules_path,
+            )
+            logger.info(
+                "Molecular populations computed in %.2fs (%d NELION with data)",
+                time.perf_counter() - t_mol_pop, len(xnfpmol_dict),
+            )
+
+            if xnfpmol_dict:
+                # Inject XNFPMOL into population_per_ion[:, 5, elem_idx]
+                # and DOPPLE into doppler_per_ion[:, 5, elem_idx].
+                # Fortran xnfpelsyn.for: XNFPEL(6, NELEM), DOPPLE(6, NELEM)
+                pop_arr = np.array(atm.population_per_ion, dtype=np.float64)
+                dop_arr = np.array(atm.doppler_per_ion, dtype=np.float64)
+                max_elem = pop_arr.shape[2]
+
+                for nelion, xnfpmol_vals in xnfpmol_dict.items():
+                    nelem = nelion // 6
+                    elem_idx = nelem - 1  # Fortran NELEM (1-based) → 0-based
+                    if 0 <= elem_idx < max_elem:
+                        pop_arr[:, 5, elem_idx] = xnfpmol_vals
+                        dop_arr[:, 5, elem_idx] = dopple_dict[nelion]
+
+                atm.population_per_ion = pop_arr
+                atm.doppler_per_ion = dop_arr
+
+                # --- Phase 3b: Build molecular line flat arrays ---
+                mol_nelion_raw = np.asarray(combined_mol["nelion"], dtype=np.int32)
+                mol_element_idx = np.array(
+                    [int(n) // 6 - 1 for n in mol_nelion_raw], dtype=np.int64
+                )
+                mol_ion_stage = np.full(n_mol_lines, 6, dtype=np.int64)
+                mol_line_type = np.zeros(n_mol_lines, dtype=np.int64)
+                mol_cgf = np.asarray(combined_mol["cgf"], dtype=np.float64)
+                mol_gf = np.zeros(n_mol_lines, dtype=np.float64)
+                mol_gamma_rad = np.asarray(combined_mol["gamma_rad"], dtype=np.float64)
+                mol_gamma_stark = np.asarray(combined_mol["gamma_stark"], dtype=np.float64)
+                mol_gamma_vdw = np.asarray(combined_mol["gamma_vdw"], dtype=np.float64)
+                mol_nbuff = np.asarray(combined_mol["nbuff"], dtype=np.int32)
+                mol_elo_cm = np.asarray(combined_mol["elo_cm"], dtype=np.float64)
+
+                # Reconstruct wavelength from nbuff (inverse of compilation formula)
+                mol_wavelength = np.exp((mol_nbuff.astype(np.float64) - 1 + _ixwlbeg) * _ratiolg)
+
+                # CRITICAL FIX: Use nbuff-1 as center index directly, NOT _nearest_grid_indices.
+                # _nearest_grid_indices returns sentinel -1 for ALL lines below the grid, meaning
+                # a line at 250 nm and a line at 299.99 nm both get center_idx=-1. In the wings
+                # kernel, center_idx=-1 + step=1 = bin 0 (300 nm), so every below-grid line's
+                # first wing step lands at 300 nm, creating catastrophic fake UV absorption.
+                # Fortran synthe.for uses the actual NBUFF value (which can be very negative),
+                # so far-below-grid lines have wings that never reach the valid range.
+                # nbuff is 1-based relative to the synthesis grid, so center_idx = nbuff - 1
+                # correctly places each line (positive = in grid, negative = below grid by |idx| bins).
+                mol_center_indices = (mol_nbuff.astype(np.int64) - 1)
+
+                # Boltzmann factors: exp(-E_lower * hckt) per depth
+                _hckt_arr = np.asarray(
+                    atm.hckt if atm.hckt is not None else 1.4388 / atm.temperature,
+                    dtype=np.float64,
+                )
+                mol_boltzmann = np.zeros((atm.layers, n_mol_lines), dtype=np.float64)
+                for d_idx in range(atm.layers):
+                    mol_boltzmann[d_idx, :] = np.exp(-mol_elo_cm * _hckt_arr[d_idx])
+
+                mol_process_mask = np.ones(n_mol_lines, dtype=np.bool_)
+
+                # TXNXN: perturber density for van der Waals broadening
+                _txnxn = np.zeros(atm.layers, dtype=np.float64)
+                if atm.txnxn is not None:
+                    _txnxn = np.asarray(atm.txnxn, dtype=np.float64)
+                else:
+                    for d_idx in range(atm.layers):
+                        _xh = float(atm.xnf_h[d_idx]) if atm.xnf_h is not None else 0.0
+                        _xhe = float(atm.xnf_he1[d_idx]) if atm.xnf_he1 is not None else 0.0
+                        _xh2 = float(atm.xnf_h2[d_idx]) if atm.xnf_h2 is not None else 0.0
+                        _txnxn[d_idx] = (_xh + 0.42 * _xhe + 0.85 * _xh2) * (atm.temperature[d_idx] / 10_000.0) ** 0.3
+
+                voigt_tbl = tables.voigt_tables()
+
+                # --- Run TRANSP kernel for molecular lines ---
+                t_mol_transp = time.perf_counter()
+                mol_transp = np.zeros((n_mol_lines, atm.layers), dtype=np.float64)
+                mol_valid_mask = np.zeros((n_mol_lines, atm.layers), dtype=np.bool_)
+
+                _compute_transp_numba_kernel(
+                    mol_transp, mol_valid_mask, mol_process_mask,
+                    mol_element_idx, mol_ion_stage, mol_line_type,
+                    mol_wavelength, mol_gf, mol_cgf,
+                    mol_gamma_rad, mol_gamma_stark, mol_gamma_vdw,
+                    mol_center_indices,
+                    np.zeros(n_mol_lines, dtype=np.int64),
+                    mol_boltzmann,
+                    pop_arr, dop_arr,
+                    np.asarray(atm.mass_density, dtype=np.float64),
+                    np.asarray(atm.electron_density, dtype=np.float64),
+                    _txnxn,
+                    np.asarray(cont_kapmin, dtype=np.float64),
+                    np.zeros((0, 0), dtype=np.float64),
+                    len(wavelength),
+                    cfg.cutoff,
+                    cfg.wavelength_grid.velocity_microturb,
+                    C_LIGHT_KM,
+                    voigt_tbl.h0tab, voigt_tbl.h1tab, voigt_tbl.h2tab,
+                )
+                n_valid = int(np.sum(mol_valid_mask))
+                logger.info(
+                    "Molecular TRANSP: %d/%d valid line-depth pairs (%.2fs)",
+                    n_valid, n_mol_lines * atm.layers,
+                    time.perf_counter() - t_mol_transp,
+                )
+
+                # --- Accumulate center + wing contributions into mol_asynth ---
+                t_mol_asynth = time.perf_counter()
+                n_wl = len(wavelength)
+                mol_asynth = np.zeros((atm.layers, n_wl), dtype=np.float64)
+
+                # Center contributions
+                for li in range(n_mol_lines):
+                    ci = int(mol_center_indices[li])
+                    if 0 <= ci < n_wl:
+                        for di in range(atm.layers):
+                            if mol_valid_mask[li, di]:
+                                mol_asynth[di, ci] += mol_transp[li, di]
+
+                # Wing contributions: Fortran fort.12 symmetric wing loop
+                # (synthe.for lines 286-326): pre-compute PROFILE array,
+                # then add wings unconditionally with no per-step cutoff.
+                # Uses _accumulate_metal_profile_kernel which matches this path exactly.
+                mol_kappa0 = np.zeros((n_mol_lines, atm.layers), dtype=np.float64)
+                mol_adamp = np.zeros((n_mol_lines, atm.layers), dtype=np.float64)
+                mol_doppler_widths = np.zeros((n_mol_lines, atm.layers), dtype=np.float64)
+
+                for li in range(n_mol_lines):
+                    ei = int(mol_element_idx[li])
+                    if ei < 0 or ei >= max_elem:
+                        continue
+                    wl_li = mol_wavelength[li]
+
+                    for di in range(atm.layers):
+                        if not mol_valid_mask[li, di]:
+                            continue
+                        dop_val = dop_arr[di, 5, ei]
+                        mol_doppler_widths[li, di] = dop_val * wl_li
+
+                        xne = atm.electron_density[di]
+                        adamp_val = (
+                            mol_gamma_rad[li]
+                            + mol_gamma_stark[li] * xne
+                            + mol_gamma_vdw[li] * _txnxn[di]
+                        )
+                        # Fortran synthe.for line 274: ADAMP = gamma / DOPPLE(NELION)
+                        # DOPPLE is dimensionless v/c, not doppler_width in nm.
+                        # dop_val (already fetched above) is the correct dimensionless quantity.
+                        if dop_val > 0:
+                            adamp_val /= dop_val
+                        mol_adamp[li, di] = max(adamp_val, 1e-12)
+
+                        # Recover kappa0 from transp = kappa0 * voigt_center
+                        tv = mol_transp[li, di]
+                        ad = mol_adamp[li, di]
+                        if ad < 0.2:
+                            vc = 1.0 - 1.128 * ad
+                        else:
+                            from ..physics.profiles.voigt import voigt_profile as _vp
+                            vc = _vp(0.0, ad)
+                        mol_kappa0[li, di] = tv / vc if vc > 0 else tv
+
+                # Accumulate molecular wings using the Fortran fort.12 path:
+                # KAPMIN evaluated at line CENTER; wings added unconditionally
+                # (no per-step cutoff). _accumulate_mol_wings_batch parallelizes
+                # over depths and processes all lines in a single JIT call.
+                _accumulate_mol_wings_batch(
+                    mol_asynth,
+                    np.asarray(cont_kapmin, dtype=np.float64),
+                    wavelength,
+                    mol_center_indices.astype(np.int64),
+                    mol_wavelength,
+                    mol_kappa0,
+                    mol_adamp,
+                    mol_doppler_widths,
+                    mol_valid_mask,
+                    cfg.cutoff,
+                    int(MAX_PROFILE_STEPS),
+                    voigt_tbl.h0tab, voigt_tbl.h1tab, voigt_tbl.h2tab,
+                )
+
+                # Apply per-wavelength-bin STIM (Fortran synthe.for line 368)
+                freq_mol = C_LIGHT_NM / wavelength
+                hkt_mol = H_PLANCK / (K_BOLTZ * np.maximum(atm.temperature, 1.0))
+                stim_mol = 1.0 - np.exp(-freq_mol[np.newaxis, :] * hkt_mol[:, np.newaxis])
+                mol_asynth *= stim_mol
+
+                asynth += mol_asynth
+                logger.info(
+                    "Molecular ASYNTH (unified): max=%.3e, timing=%.2fs",
+                    float(np.max(mol_asynth)),
+                    time.perf_counter() - t_mol_asynth,
+                )
 
         # --- Stage 4 dump: ASYNTH (full line opacity with wings) ---
         if _stage_dump_path is not None:

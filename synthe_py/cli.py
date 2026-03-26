@@ -65,6 +65,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow using tfort.* files as runtime line input (compatibility/debug mode only).",
     )
     parser.add_argument(
+        "--molecules-dir",
+        type=Path,
+        action="append",
+        dest="molecules_dirs",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory containing Kurucz ASCII molecular .dat/.asc files "
+            "(e.g. kurucz/molecules/). Can be repeated for multiple directories."
+        ),
+    )
+    parser.add_argument(
+        "--include-tio",
+        action="store_true",
+        help="Include Schwenke TiO binary line list (schwenke.bin / eschwenke.bin).",
+    )
+    parser.add_argument(
+        "--include-h2o",
+        action="store_true",
+        help="Include Partridge-Schwenke H2O binary line list (h2ofastfix.bin).",
+    )
+    parser.add_argument(
+        "--tio-bin",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Explicit path to Schwenke TiO binary file (auto-located under --molecules-dir if omitted).",
+    )
+    parser.add_argument(
+        "--h2o-bin",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Explicit path to Partridge-Schwenke H2O binary file (auto-located under --molecules-dir if omitted).",
+    )
+    parser.add_argument(
         "--n-workers",
         type=int,
         default=None,
@@ -139,6 +175,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         npz_path=args.npz,
         n_workers=args.n_workers,
         allow_tfort_runtime=args.allow_tfort_runtime,
+        molecular_line_dirs=args.molecules_dirs,
+        include_tio=args.include_tio,
+        include_h2o=args.include_h2o,
+        tio_bin_path=args.tio_bin,
+        h2o_bin_path=args.h2o_bin,
     )
     if args.cache:
         cfg.line_data.cache_directory = args.cache
