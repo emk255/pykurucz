@@ -535,58 +535,9 @@ def compute_derived_quantities(
 
     xnatm_atomic = np.maximum(xnatm_atomic, 1e-30)
 
-    # NOTE: The early compute_derived_quantities runs with ifpres=0 because
-    # NMOLEC is properly handled later inside the POPS calls (pops_exact module
-    # with set_ifpres(1) / set_ifmol(1)).  The results from compute_derived_quantities
-    # get overwritten by the XNE-from-.atm block anyway.
-    ifpres = 0
-
-    xnatm = xnatm_atomic.copy()  # Default to atomic-only
-    electron_density_updated = electron_density_atm.copy()
-
-    if ifpres == 1 and NMOLEC_AVAILABLE and xabund is not None:
-        # Call NMOLEC to get molecular corrections for XNATOM
-        # This is critical for cool stars where molecules lock up hydrogen
-        try:
-            mol_path = molecules_path if molecules_path else locate_molecules_file()
-            xnatm_mol, xne_mol, success = compute_xnatom_with_molecules(
-                xnatom_atomic=xnatm_atomic,
-                temperature=temperature,
-                tkev=tkev,
-                tk=tk,
-                tlog=tlog,
-                gas_pressure=gas_pressure,
-                electron_density=electron_density_atm,
-                xabund=xabund,
-                wtmole=wtmole,  # Fortran requires WTMOLE from abundances - no fallback
-                molecules_path=mol_path,
-            )
-            if success:
-                xnatm = xnatm_mol
-                electron_density_updated = xne_mol
-                print(
-                    f"  NMOLEC: XNATOM[0] = {xnatm[0]:.4e} (atomic: {xnatm_atomic[0]:.4e}, ratio: {xnatm[0]/xnatm_atomic[0]:.4f})"
-                )
-            else:
-                print("  NOTE: NMOLEC failed - using atomic XNATOM")
-                xnatm = xnatm_atomic
-        except FileNotFoundError:
-            print("  NOTE: molecules.dat not found - using atomic XNATOM")
-            xnatm = xnatm_atomic
-        except Exception as e:
-            print(f"  WARNING: NMOLEC error: {e} - using atomic XNATOM")
-            xnatm = xnatm_atomic
-    elif ifpres == 1 and xabund is None:
-        print(
-            "  NOTE: No abundances provided - using atomic XNATOM (NMOLEC requires xabund)"
-        )
-        xnatm = xnatm_atomic
-    elif ifpres == 1:
-        print("  NOTE: NMOLEC not available - using atomic XNATOM")
-        xnatm = xnatm_atomic
-    else:
-        print("  NOTE: IFPRES=0 (xnfpelsyn) - skipping NMOLEC, using atomic XNATOM")
-        xnatm = xnatm_atomic
+    # Match xnfpelsyn/IFPRES=0 behavior: do not run NMOLEC in this phase.
+    print("  NOTE: IFPRES=0 (xnfpelsyn) - skipping NMOLEC, using atomic XNATOM")
+    xnatm = xnatm_atomic
 
     # RHO = mass density
 
@@ -1504,43 +1455,37 @@ if __name__ == "__main__":
 
     glog = atm_data["glog"]
 
-    # Compute WTMOLE and xabund from abundances if available
-    # xabund is needed for NMOLEC molecular corrections in compute_derived_quantities
+    # Compute WTMOLE and xabund from abundances if available.
+    # Fail hard on missing/invalid Fortran data: no fallback branches.
     wtmole = None
     xabund = None  # Will be set if abundances are available
     if "abundances" in atm_data:
-        try:
-            from synthe_py.tools.pops_exact import load_fortran_data
+        from synthe_py.tools.pops_exact import load_fortran_data
 
-            data_dir = Path(__file__).parent.parent / "data"
-            fortran_data_path = data_dir / "fortran_data.npz"
-            if fortran_data_path.exists():
-                load_fortran_data(fortran_data_path)
-                import synthe_py.tools.pops_exact as pops_exact
+        data_dir = Path(__file__).parent.parent / "data"
+        fortran_data_path = data_dir / "fortran_data.npz"
+        if not fortran_data_path.exists():
+            raise FileNotFoundError(f"Fortran data file not found: {fortran_data_path}")
+        load_fortran_data(fortran_data_path)
+        import synthe_py.tools.pops_exact as pops_exact
 
-                if pops_exact.ATMASS is not None:
-                    # Normalize abundances
-                    xabund = np.zeros(99)
-                    for iz in range(1, 100):
-                        abund_val = atm_data["abundances"].get(iz, -99.0)
-                        if abund_val > -50:
-                            xabund[iz - 1] = 10.0**abund_val
-                        else:
-                            xabund[iz - 1] = 0.0
-                    xabund_sum = np.sum(xabund)
-                    if xabund_sum > 0:
-                        xabund_normalized = xabund / xabund_sum
-                        wtmole = np.sum(xabund_normalized * pops_exact.ATMASS[:99])
-                        print(f"  Computed WTMOLE from abundances: {wtmole:.6f} amu")
-        except Exception as e:
-            # Fortran does NOT have a fallback - WTMOLE must be computed from abundances
-            # This is computed later in the XNE-from-.atm block anyway, so we can proceed
-            # with wtmole=None here - it will be computed properly later
-            print(f"  Warning: Could not compute WTMOLE from abundances initially: {e}")
-            print(
-                f"  Will compute WTMOLE later from XABUND (matching Fortran behavior)"
-            )
-            wtmole = None
+        if pops_exact.ATMASS is None:
+            raise ValueError("ATMASS not loaded from fortran_data.npz")
+
+        # Normalize abundances for this early-phase WTMOLE estimate.
+        xabund = np.zeros(99)
+        for iz in range(1, 100):
+            abund_val = atm_data["abundances"].get(iz, -99.0)
+            if abund_val > -50:
+                xabund[iz - 1] = 10.0**abund_val
+            else:
+                xabund[iz - 1] = 0.0
+        xabund_sum = np.sum(xabund)
+        if xabund_sum <= 0:
+            raise ValueError("Invalid abundances: sum(XABUND) <= 0")
+        xabund_normalized = xabund / xabund_sum
+        wtmole = np.sum(xabund_normalized * pops_exact.ATMASS[:99])
+        print(f"  Computed WTMOLE from abundances: {wtmole:.6f} amu")
 
     # Get molecules path for NMOLEC call
     molecules_path = Path(args.molecules) if args.molecules else None
