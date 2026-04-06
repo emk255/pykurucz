@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from . import config
 from .engine.opacity import run_synthesis
@@ -65,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow using tfort.* files as runtime line input (compatibility/debug mode only).",
     )
     parser.add_argument(
+        "--no-molecular-lines",
+        action="store_true",
+        help=(
+            "Disable molecular line opacity: skip auto-discovered ../kurucz/molecules "
+            "and ignore --molecules-dir."
+        ),
+    )
+    parser.add_argument(
         "--molecules-dir",
         type=Path,
         action="append",
@@ -73,18 +82,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help=(
             "Directory containing Kurucz ASCII molecular .dat/.asc files "
-            "(e.g. kurucz/molecules/). Can be repeated for multiple directories."
+            "(e.g. kurucz/molecules/). Can be repeated for multiple directories. "
+            "If omitted, ../kurucz/molecules next to the pykurucz repo is used when present."
         ),
     )
+    parser.set_defaults(include_tio=True, include_h2o=True)
     parser.add_argument(
-        "--include-tio",
-        action="store_true",
-        help="Include Schwenke TiO binary line list (schwenke.bin / eschwenke.bin).",
+        "--no-tio",
+        dest="include_tio",
+        action="store_false",
+        help="Exclude Schwenke TiO binary line list (default: include if binary exists).",
     )
     parser.add_argument(
-        "--include-h2o",
-        action="store_true",
-        help="Include Partridge-Schwenke H2O binary line list (h2ofastfix.bin).",
+        "--no-h2o",
+        dest="include_h2o",
+        action="store_false",
+        help="Exclude Partridge-Schwenke H2O binary line list (default: include if binary exists).",
     )
     parser.add_argument(
         "--tio-bin",
@@ -155,7 +168,26 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     diagnostics_path = args.diagnostics
 
-    # Parse wavelength range if provided
+    resolved_molecular_dirs: List[Path]
+    include_tio_eff: bool
+    include_h2o_eff: bool
+    if args.no_molecular_lines:
+        resolved_molecular_dirs = []
+        include_tio_eff = False
+        include_h2o_eff = False
+        if args.molecules_dirs:
+            print(
+                "synthe_py.cli: --no-molecular-lines set; ignoring --molecules-dir.",
+                file=sys.stderr,
+            )
+    else:
+        if args.molecules_dirs:
+            resolved_molecular_dirs = list(args.molecules_dirs)
+        else:
+            resolved_molecular_dirs = config.discover_default_molecular_line_directories()
+        include_tio_eff = args.include_tio
+        include_h2o_eff = args.include_h2o
+
     cfg = config.SynthesisConfig.from_cli(
         spec_path=args.spec,
         diagnostics_path=diagnostics_path,
@@ -175,9 +207,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         npz_path=args.npz,
         n_workers=args.n_workers,
         allow_tfort_runtime=args.allow_tfort_runtime,
-        molecular_line_dirs=args.molecules_dirs,
-        include_tio=args.include_tio,
-        include_h2o=args.include_h2o,
+        molecular_line_dirs=resolved_molecular_dirs,
+        include_tio=include_tio_eff,
+        include_h2o=include_h2o_eff,
         tio_bin_path=args.tio_bin,
         h2o_bin_path=args.h2o_bin,
     )

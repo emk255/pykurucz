@@ -8,6 +8,21 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 
+def discover_default_molecular_line_directories() -> List[Path]:
+    """Return ``../kurucz/molecules`` next to the pykurucz repo root if it exists.
+
+    Matches a common layout: clone ``tingyuansen/kurucz`` and ``tingyuansen/pykurucz``
+    as sibling directories so ``all_kurucz/kurucz/molecules`` sits beside ``pykurucz/``.
+    If the directory is missing, returns an empty list (atomic-line synthesis only).
+    """
+
+    pykurucz_root = Path(__file__).resolve().parent.parent
+    candidate = (pykurucz_root.parent / "kurucz" / "molecules").resolve()
+    if candidate.is_dir():
+        return [candidate]
+    return []
+
+
 @dataclass
 class WavelengthGrid:
     """Defines the spectral sampling to synthesise."""
@@ -36,10 +51,10 @@ class LineDataConfig:
     # Molecular line opacity (Kurucz rmolecasc / rschwenk / rh2ofast)
     molecular_line_dirs: List[Path] = field(default_factory=list)
     """Directories containing Kurucz ASCII molecular .dat/.asc files."""
-    include_tio: bool = False
-    """Include Schwenke TiO binary line list (rschwenk)."""
-    include_h2o: bool = False
-    """Include Partridge-Schwenke H2O binary line list (rh2ofast)."""
+    include_tio: bool = True
+    """Include Schwenke TiO binary line list (rschwenk) when the binary is found."""
+    include_h2o: bool = True
+    """Include Partridge-Schwenke H2O binary line list (rh2ofast) when the binary is found."""
     tio_bin_path: Optional[Path] = None
     """Explicit path to schwenke.bin (or eschwenke.bin). Auto-located if None."""
     h2o_bin_path: Optional[Path] = None
@@ -112,8 +127,8 @@ class SynthesisConfig:
         n_workers: Optional[int] = None,
         allow_tfort_runtime: bool = False,
         molecular_line_dirs: Optional[List[Path]] = None,
-        include_tio: bool = False,
-        include_h2o: bool = False,
+        include_tio: bool = True,
+        include_h2o: bool = True,
         tio_bin_path: Optional[Path] = None,
         h2o_bin_path: Optional[Path] = None,
     ) -> "SynthesisConfig":

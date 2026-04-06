@@ -2383,7 +2383,7 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                 time.perf_counter() - t_tio,
             )
         else:
-            logger.warning("--include-tio requested but TiO binary not found (path=%s)", tio_path)
+            logger.info("TiO binary not found; skipping Schwenke TiO lines (path=%s)", tio_path)
 
     if cfg.line_data.include_h2o:
         h2o_path = cfg.line_data.h2o_bin_path
@@ -2414,7 +2414,7 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                 time.perf_counter() - t_h2o,
             )
         else:
-            logger.warning("--include-h2o requested but H2O binary not found (path=%s)", h2o_path)
+            logger.info("H2O binary not found; skipping Partridge-Schwenke H2O lines (path=%s)", h2o_path)
 
     if mol_dicts:
         n_mol_total = sum(len(d["nbuff"]) for d in mol_dicts)

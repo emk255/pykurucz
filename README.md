@@ -57,7 +57,7 @@ This project is dedicated to the memory of <strong>Robert L. Kurucz</strong> (19
 
 # pyKurucz — Pure Python Stellar Spectrum Synthesis
 
-**A ground-truth reimplementation of Kurucz's SYNTHE in pure Python** — validated to sub-0.01% agreement with the original Fortran. No Fortran compiler needed. Just Python, NumPy, SciPy, and Numba.
+**A ground-truth reimplementation of Kurucz's SYNTHE in pure Python** — atomic-line synthesis validated to sub-0.01% agreement with the original Fortran; molecular lines use the same Fortran-grounded path and are **on by default** when a sibling `kurucz/molecules/` tree is present (TiO/H₂O binaries are included if the files exist). Use `--no-molecular-lines` for atomic-only runs. No Fortran compiler needed. Just Python, NumPy, SciPy, and Numba.
 
 **Authors:** Elliot M. Kim (Cornell) and Yuan-Sen Ting (The Ohio State), building on the original Fortran codes by Robert L. Kurucz (CfA/Harvard & Smithsonian).
 
@@ -93,7 +93,7 @@ Both produce a `.spec` file with wavelength, flux, and continuum columns. Use a 
 
 Bob Kurucz's codes — ATLAS, SYNTHE, DFSYNTHE, WIDTH, BALMER — together with his atomic and molecular line lists, form one of the most consequential software ecosystems in astrophysics. They have been used to analyze spectra from nearly every major telescope and spectroscopic survey for decades, accumulating tens of thousands of citations. But the original Fortran codebase, developed continuously since the 1960s, is increasingly difficult to compile, install, modify, and integrate with modern workflows.
 
-pyKurucz is a line-by-line numerical reimplementation — not a wrapper around Fortran — ensuring that this extraordinary body of work remains accessible, extensible, and usable for the next generation of astronomers. SYNTHE is the first piece. A full Python ATLAS12 is the next milestone: arbitrary stellar parameters → self-consistent atmosphere → spectrum synthesis, all in Python.
+pyKurucz is a line-by-line numerical reimplementation — not a wrapper around Fortran — ensuring that this extraordinary body of work remains accessible, extensible, and usable for the next generation of astronomers. The core is faithful SYNTHE-class spectrum synthesis from a model atmosphere, including **molecular line opacity** loaded automatically from a sibling `kurucz/molecules/` directory when present (with Schwenke TiO and Partridge–Schwenke H₂O if the binaries are there). Override with `--molecules-dir` or switch off with `--no-molecular-lines`.
 
 
 ## Two modes of operation
@@ -113,10 +113,21 @@ Spectrum synthesis requires a **model atmosphere** as input — a description of
 # Step 1: Preprocess the atmosphere (populations, molecular equilibrium, opacities)
 python synthe_py/tools/convert_atm_to_npz.py your_model.atm results/your_model.npz
 
-# Step 2: Run synthesis
+# Step 2: Run synthesis (molecular lines default ON if ../kurucz/molecules exists;
+# TiO/H2O load when schwenke.bin / h2ofastfix.bin are found — use --no-tio / --no-h2o to skip)
 python -m synthe_py.cli your_model.atm lines/gfallvac.latest \
     --npz results/your_model.npz --spec results/your_model.spec \
     --wl-start 300 --wl-end 1800
+
+# Atomic lines only (faster setup when you have no molecule data)
+python -m synthe_py.cli your_model.atm lines/gfallvac.latest \
+    --npz results/your_model.npz --spec results/your_model_atomic.spec \
+    --no-molecular-lines --wl-start 300 --wl-end 1800
+
+# Custom molecule trees (repeat --molecules-dir for multiple directories)
+python -m synthe_py.cli your_model.atm lines/gfallvac.latest \
+    --npz results/your_model.npz --spec results/your_model_custommol.spec \
+    --molecules-dir /path/to/extra/molecules --wl-start 300 --wl-end 1800
 ```
 
 ### Mode B examples
@@ -133,6 +144,13 @@ python pykurucz.py --teff 5770 --logg 4.44 --abund C:+0.5 --abund Fe:-1.0
 
 # Optical only, lower resolution (faster)
 python pykurucz.py --teff 5770 --logg 4.44 --wl-start 400 --wl-end 700 --resolution 50000
+
+# Cool-star run (molecular lines default on if ../kurucz/molecules exists)
+python pykurucz.py --teff 4000 --logg 4.5
+
+# Turn off molecular lines or specific binaries
+python pykurucz.py --teff 5770 --logg 4.44 --no-molecular-lines
+python pykurucz.py --teff 4000 --logg 4.5 --no-tio --no-h2o
 ```
 
 The emulator is trained on 104,269 ATLAS12 models ($T_{\text{eff}}$ 2,500–50,000 K, $\log g$ −1.0–5.5, [M/H] −4.0–+1.5, [α/M] −0.2–+0.6). Outside this range, the code warns you — use Mode A instead.
@@ -144,11 +162,12 @@ The emulator is trained on 104,269 ATLAS12 models ($T_{\text{eff}}$ 2,500–50,0
 
 The heart of this repository is **`synthe_py/`** — a pure Python reimplementation of Kurucz's SYNTHE spectral synthesis code. Given a model atmosphere and an atomic line list, it computes the emergent stellar spectrum wavelength by wavelength:
 
-1. **Continuum opacity** — H⁻ bound-free/free-free (the dominant source in Sun-like stars), H I bound-free (Karsas & Latter cross-sections), He I/II, metal photoionization, Rayleigh scattering (H, He, H₂), Thomson scattering — interpolated from pre-tabulated arrays following the original KAPP subroutine logic.
-2. **Line opacity** — every atomic transition in the Kurucz GFALL catalog (~1.3 million lines) near the current wavelength contributes a **Voigt profile** (thermal Doppler + van der Waals + Stark + radiative broadening). Hydrogen Balmer/Lyman lines get dedicated Stark-broadened profiles (HPROF4); helium lines use tabulated BCS/Griem/Dimitrijević profiles.
-3. **Radiative transfer** — the JOSH solver (ported from Kurucz's ATLAS) integrates the transfer equation on a fixed log-τ grid with parabolic optical depth quadrature and Lambda iteration for scattering, yielding both line+continuum $F_\lambda$ and continuum-only $F_{\rm cont}$.
+1. **Continuum opacity** — H⁻ bound-free/free-free (the dominant source in Sun-like stars), H I bound-free (Karsas & Latter cross-sections), He I/II, metal photoionization, Rayleigh scattering (H, He, H₂), Thomson scattering — interpolated from pre-tabulated arrays following the original KAPP subroutine logic. For cool atmospheres, the COOLOP path also adds CH, OH, and H₂ collisional opacity when molecular populations from equilibrium are available.
+2. **Line opacity — atomic** — every transition in the Kurucz GFALL catalog (~1.3 million lines) near the current wavelength contributes a **Voigt profile** (thermal Doppler + van der Waals + Stark + radiative broadening). Hydrogen Balmer/Lyman lines get dedicated Stark-broadened profiles (HPROF4); helium lines use tabulated BCS/Griem/Dimitrijević profiles.
+3. **Line opacity — molecular** — Kurucz ASCII molecular catalogs (e.g. CH, OH, CO, CN, C₂, MgH, …) from auto-discovered `../kurucz/molecules` or explicit `--molecules-dir`, plus Schwenke TiO and Partridge–Schwenke H₂O when enabled (default on; binaries skipped quietly if missing). Use `--no-molecular-lines`, `--no-tio`, or `--no-h2o` to disable. Molecular lines use the same opacity accumulation and radiative-transfer loop as atoms, with populations tied to the **NELION** dispatch and molecular equilibrium (NMOLEC-class solver) from preprocessing.
+4. **Radiative transfer** — the JOSH solver integrates the transfer equation on a fixed log-τ grid with parabolic optical depth quadrature and Lambda iteration for scattering, yielding both line+continuum $F_\lambda$ and continuum-only $F_{\rm cont}$.
 
-Plus supporting physics: Saha–Boltzmann populations with detailed partition functions, molecular equilibrium for ~300 diatomic species, and Doppler widths at every atmospheric layer.
+Plus supporting physics: Saha–Boltzmann populations with detailed partition functions, molecular equilibrium for ~300 species, and Doppler widths at every atmospheric layer.
 
 ### Validated against the Fortran original
 
@@ -189,7 +208,8 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
                      │
                      v
               [synthe_py.cli]
-          (line-by-line radiative transfer)
+          (line-by-line radiative transfer;
+           molecular catalogs + TiO/H2O by default when data exist)
                      │
                      v
                  .spec file
@@ -200,7 +220,7 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
 
 **Stage 2 — Preprocessing** (`convert_atm_to_npz.py`): Reads the `.atm` file and computes Saha–Boltzmann populations, molecular equilibrium (~300 species), continuous opacity coefficients (H⁻, H I, He, metals, scattering), and Doppler widths at each atmospheric layer.
 
-**Stage 3 — Synthesis** (`synthe_py.cli`): The core loop. For each wavelength point: evaluate continuum opacity, search the line list, compute Voigt profiles, solve the transfer equation. Outputs wavelength, $F_\lambda$, and $F_{\text{cont}}$.
+**Stage 3 — Synthesis** (`synthe_py.cli`): The core loop. For each wavelength point: evaluate continuum opacity, search atomic and (by default) molecular line lists when catalogs are available, compute profiles, solve the transfer equation. Outputs wavelength, $F_\lambda$, and $F_{\text{cont}}$.
 
 
 ## Individual element abundances (Mode B only)
@@ -219,7 +239,7 @@ python pykurucz.py --teff 5000 --logg 3.0 --abund Fe:-1.0 --abund Mg:+0.4 --abun
 # -> writes exact Fe, Mg, Ca abundances into .atm for SYNTHE
 ```
 
-For fully self-consistent treatment where the atmospheric structure itself responds to non-standard abundances, a full Python ATLAS12 is planned as future work.
+For fully self-consistent treatment where the atmospheric structure itself responds to non-standard abundances, use **Mode A** with an atmosphere computed by a full stellar-atmosphere code (not generated here).
 
 
 ## Output
@@ -346,6 +366,9 @@ python pykurucz.py --teff <Teff> --logg <logg> [options]
 | `--wl-end` | 1800 | End wavelength (nm) |
 | `--resolution` | 300000 | Resolving power $\lambda / \Delta\lambda$ |
 | `--output-dir` | results/ | Output directory |
+| `--no-molecular-lines` | off | Disable all molecular line opacity (GFALL only) |
+| `--no-tio` | off | Exclude Schwenke TiO (when molecular lines are enabled) |
+| `--no-h2o` | off | Exclude Partridge–Schwenke H₂O (when molecular lines are enabled) |
 
 ### `synthe_py.cli` — synthesis from `.atm` file (no PyTorch needed)
 
@@ -353,6 +376,8 @@ python pykurucz.py --teff <Teff> --logg <logg> [options]
 python synthe_py/tools/convert_atm_to_npz.py <atm_file> <output.npz>
 python -m synthe_py.cli <atm_file> lines/gfallvac.latest --npz <output.npz> --spec <output.spec> [options]
 ```
+
+**Molecular line behavior (default on):** If you omit `--molecules-dir`, the code looks for `../kurucz/molecules` next to the pykurucz repo (same layout as cloning [tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) beside this repo). TiO and H₂O are included by default when the Schwenke / Partridge–Schwenke binaries are present under that tree. Use `--no-molecular-lines` for atomic-only synthesis; `--no-tio` / `--no-h2o` to drop specific species. **`--molecules-dir DIR`** (repeatable) overrides the search paths; **`--tio-bin`** / **`--h2o-bin`** set explicit binary paths.
 
 
 ## Dependencies
@@ -372,13 +397,14 @@ pip install torch
 
 ## Current limitations and roadmap
 
-pyKurucz faithfully reimplements the *atomic-line* synthesis path through Kurucz's SYNTHE. It is already a fully functional tool for most stellar spectroscopy applications. The remaining gaps define a clear roadmap toward a complete Python replacement for the entire Kurucz suite.
+pyKurucz reimplements the SYNTHE synthesis path in Python — atomic lines throughout, **molecular lines by default** when the standard Kurucz-family `molecules/` tree is available next to the repo (TiO/H₂O binaries used if present). Clone [tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) alongside pykurucz or pass `--molecules-dir`; use `--no-molecular-lines` for GFALL-only runs. Remaining gaps are mostly about breadth of physics (NLTE, geometry) and workflow (external atmosphere codes for self-consistency).
 
 ### What works today
 
 - Full atomic line synthesis from any `.atm` file (Mode A)
+- **Molecular line synthesis** from Kurucz ASCII catalogs (auto `../kurucz/molecules` or `--molecules-dir`), Schwenke TiO and Partridge–Schwenke H₂O when binaries exist — opt out with `--no-molecular-lines` / `--no-tio` / `--no-h2o`
 - Neural network atmosphere emulator for end-to-end synthesis (Mode B)
-- All continuous opacity sources (H⁻, H I, He I/II, metals, Rayleigh, Thomson)
+- All continuous opacity sources (H⁻, H I, He I/II, metals, Rayleigh, Thomson), including cool-star COOLOP molecular continuum (CH, OH, H₂) when populations are present
 - Voigt line profiles with van der Waals, Stark, and radiative broadening
 - Dedicated hydrogen Stark-broadened (Balmer/Lyman) and helium tabulated profiles
 - Saha–Boltzmann populations, molecular equilibrium (~300 species)
@@ -388,14 +414,14 @@ pyKurucz faithfully reimplements the *atomic-line* synthesis path through Kurucz
 
 | Limitation | Impact | Next step |
 |---|---|---|
-| **No molecular line opacity** | TiO, H₂O, VO, CH, CN bands missing — affects cool stars ($T_{\text{eff}} \lesssim 4000$ K) and the infrared. Negligible for FGK+ in the optical. | Parse Kurucz molecular line catalogs into the existing opacity loop. |
-| **No self-consistent atmosphere iteration** | Emulator approximates nearest 4-parameter model; cannot iterate T–P–κ for arbitrary abundance patterns. | Full Python ATLAS12 reimplementation (radiative/convective equilibrium + opacity sampling). |
+| **Molecular data not bundled in-repo** | ASCII/binary molecule lists are large and live with the Fortran distribution (e.g. clone [tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) as `../kurucz` next to pykurucz). Without that tree, synthesis falls back to atomic lines only unless you pass `--molecules-dir`. | Keep validation runs reproducible by fixing the clone layout or explicit paths. |
+| **No self-consistent atmosphere iteration in this repo** | The emulator approximates the nearest 4-parameter model; arbitrary abundance patterns do not drive a full T–P–κ iteration here. | Use Mode A with atmospheres from a full atmosphere code when that matters. |
 | **LTE only** | NLTE effects matter for specific lines (Li I, Na D, O I triplet) in metal-poor/hot stars. | Ingest departure coefficients from external NLTE codes as correction factors. |
 | **1D plane-parallel geometry** | Breaks down for evolved giants with extended atmospheres. | Ingest 3D model atmospheres (Stagger, CO⁵BOLD) as stratifications for post-processing. |
 
 ## Relation to tingyuansen/kurucz
 
-[tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) provides the original Fortran ATLAS12 + SYNTHE pipeline with pre-compiled binaries, plus the kurucz-a1 emulator. **This repository** (`pykurucz`) replaces the Fortran SYNTHE with pure Python and bundles the kurucz-a1 emulator weights for convenience. If you need Fortran ATLAS12 or DFSYNTHE, use the `kurucz` repo; if you want a pure Python synthesis engine, use this one.
+[tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) provides the original Fortran ATLAS12 + SYNTHE pipeline with pre-compiled binaries, plus the kurucz-a1 emulator. **This repository** (`pykurucz`) replaces the Fortran SYNTHE with pure Python (molecular lines load automatically when `../kurucz/molecules` exists or you pass `--molecules-dir`) and bundles the kurucz-a1 emulator weights for convenience. Use the `kurucz` repo for Fortran tools and the standard `molecules/` line-list tree; use this repo for pure Python synthesis.
 
 
 ## License
