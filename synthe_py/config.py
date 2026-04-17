@@ -53,8 +53,11 @@ class LineDataConfig:
     """Directories containing Kurucz ASCII molecular .dat/.asc files."""
     include_tio: bool = True
     """Include Schwenke TiO binary line list (rschwenk) when the binary is found."""
-    include_h2o: bool = True
-    """Include Partridge-Schwenke H2O binary line list (rh2ofast) when the binary is found."""
+    include_h2o: bool = False
+    """Include Partridge-Schwenke H2O binary line list (rh2ofast) when the binary is found.
+    Disabled by default: the Fortran reference tfort.12 has all 12.6M H2O records
+    with out-of-range NBUFF values, so Fortran synthe.for effectively skips every
+    H2O line.  Enable with --h2o if using a corrected H2O compilation."""
     tio_bin_path: Optional[Path] = None
     """Explicit path to schwenke.bin (or eschwenke.bin). Auto-located if None."""
     h2o_bin_path: Optional[Path] = None

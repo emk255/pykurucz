@@ -187,6 +187,72 @@ def load_molecular_metadata(
     return idmol, momass
 
 
+def _freeff_parse_float(token: str) -> float:
+    """Parse a float from a Fortran .atm token using FREEFF state-machine behavior.
+
+    Handles the compact format produced by Fortran's atlas12.for FORMAT 554
+    ``(1PE15.8,0PF9.1,1P7E10.3)``:  when a positive field (e.g. P = 4.131E+00,
+    9 chars) is immediately followed by a negative field (e.g. XNE = -1.058E+07,
+    10 chars), the two fields are written without a separating space:
+    ``4.131E+00-1.058E+07``.
+
+    Fortran's FREEFF (atlas12.for line 2612) reads character-by-character.  When
+    it encounters a ``-`` or ``+`` while in state 400 (reading exponent digits),
+    it jumps to label 999 which resets ANSWER/ASIGN/NPT/N **but not ISIGN**.
+    The leaked ISIGN from the first number's exponent sign is then inherited by
+    the second number whenever the second number's exponent sign passes through
+    label 303 (``+`` or blank, which does not set ISIGN).  Only an explicit ``-``
+    in the second exponent (label 304) overrides ISIGN to -1.
+
+    Net effect on the returned value:
+
+    ========== ============== =============== ===========
+    1st E-sign 2nd E-sign     Leaked ISIGN    Result exp
+    ========== ============== =============== ===========
+    ``E+``     ``E+``         +1 (init)       correct
+    ``E+``     ``E-``         overridden to -1 correct
+    ``E-``     ``E+``         -1 (leaked!)     **negated**
+    ``E-``     ``E-``         overridden to -1 correct
+    ========== ============== =============== ===========
+
+    Additionally, the separator sign (``-`` or ``+``) between the two numbers is
+    consumed by the 999 reset — it is NOT applied as ASIGN to the second number.
+    ASIGN is reset to +1 at 999, and the second number starts from the digit
+    after the separator.
+
+    Examples::
+
+        '1.933E+00-1.697E+06'  ->  +1.697e+06  (ISIGN=+1 from E+, no leak)
+        '4.875E-01-1.376E+06'  ->  +1.376e-06  (ISIGN=-1 leaked from E-, flips E+06 to E-06)
+        '8.740E-01-1.021E+07'  ->  +1.021e-07  (ISIGN=-1 leaked from E-, flips E+07 to E-07)
+    """
+    try:
+        return float(token)
+    except ValueError:
+        import re as _re
+
+        m = _re.match(
+            r'^[+-]?[\d.]+[Ee]([+-])(\d+)[+-]([\d.]+)(?:[Ee]([+-]?)(\d+))?$',
+            token,
+        )
+        if m:
+            first_exp_sign = m.group(1)
+            second_mantissa = m.group(3)
+            second_exp_sign = m.group(4)   # '+', '-', '' or None
+            second_exp_digits = m.group(5)  # or None
+
+            if second_exp_digits is not None:
+                if second_exp_sign == '-':
+                    eff_sign = '-'
+                else:
+                    eff_sign = first_exp_sign
+                return float(f"{second_mantissa}E{eff_sign}{second_exp_digits}")
+
+            return float(second_mantissa)
+
+        raise ValueError(f"_freeff_parse_float: cannot parse {token!r}")
+
+
 def parse_atm_file(atm_path: Path) -> dict:
     """Parse .atm file and extract all data.
 
@@ -339,7 +405,12 @@ def parse_atm_file(atm_path: Path) -> dict:
         line = lines[i].strip()
 
         # Parse: RHOX T P XNE ABROSS ACCRAD VTURB (plus 2 extra zeros)
-
+        # Use _freeff_parse_float for the P column: Fortran atlas12.for FORMAT 554
+        # uses 1PE10.3 fields with no separator between adjacent fields.  When P>0
+        # (9 chars) is followed by XNE<0 (10 chars) the token becomes compact, e.g.
+        # '4.131E+00-1.058E+07'.  Fortran's FREEFF parser discards 4.131E+00 and
+        # returns +1.058e7 as P (sign consumed).  All subsequent columns shift by -1
+        # in that case (XNE gets ABROSS value, VTURB gets extra1 = 0, etc.).
         parts = line.split()
 
         if len(parts) >= 7:
@@ -347,7 +418,7 @@ def parse_atm_file(atm_path: Path) -> dict:
             layer_data = {
                 "RHOX": float(parts[0]),
                 "T": float(parts[1]),
-                "P": float(parts[2]),
+                "P": _freeff_parse_float(parts[2]),
                 "XNE": float(parts[3]),
                 "ABROSS": float(parts[4]),
                 "ACCRAD": float(parts[5]),
@@ -425,13 +496,12 @@ def compute_derived_quantities(
 
         rhox = 10.0**rhox
 
-        print(f"  Converted RHOX from log10 format (first value: {rhox[0]:.6e})")
+        print("  Converted RHOX from log10 format in .atm")
 
     else:
 
         # Use RHOX from .atm file directly
-
-        print(f"  Using RHOX from .atm directly (first value: {rhox[0]:.6e})")
+        print("  Using RHOX from .atm as linear column mass")
 
     # Ensure RHOX is surface -> deep (monotonic increasing)
     needs_reverse = rhox.size > 1 and rhox[0] > rhox[-1]
@@ -475,55 +545,9 @@ def compute_derived_quantities(
 
     gas_pressure_atm = np.array([l["P"] for l in layers], dtype=np.float64)
 
-    # Check if P from .atm matches P = G * RHOX (for validation)
-    grav = 10.0**glog  # cm/s²
-    p_from_rhox = grav * rhox
-
-    # Use P from .atm file (matching xnfpelsyn behavior)
-    # However, if P leads to unreasonable RHO (scale height way too large),
-    # we need to check if P needs unit conversion or if we should compute P from RHOX
-
-    gas_pressure = gas_pressure_atm.copy()  # Default: use P from .atm
-
-    # Check if P from .atm leads to reasonable RHO
-    if len(rhox) > 0 and len(temperature) > 0:
-        # Compute RHO with current P to check scale height
-        xnatm_test = gas_pressure_atm[0] / tk[0] - electron_density_atm[0]
-        xnatm_test = max(xnatm_test, 1e-30)
-        # For validation only - use provided wtmole if available, otherwise skip scale height check
-        # Fortran does NOT have a fallback - WTMOLE must be computed from abundances
-        if wtmole is not None:
-            rho_test = xnatm_test * wtmole * 1.660e-24
-        else:
-            rho_test = 0.0  # Skip scale height check if WTMOLE not available
-        scale_height_test = rhox[0] / rho_test if rho_test > 0 else 0
-
-        # Check if P from .atm matches G*RHOX (this is the primary check)
-        p_atm_0 = gas_pressure_atm[0]
-        p_rhox_0 = p_from_rhox[0]
-        ratio = p_rhox_0 / p_atm_0 if p_atm_0 > 0 else 0
-
-        # CRITICAL FIX: If P matches G*RHOX (ratio ≈ 1.0), use P as-is
-        # This means P is already in correct units (dyn/cm²), regardless of scale height
-        # The scale height check is unreliable because it depends on TK, which might be wrong
-        if 0.9 < ratio < 1.1:
-            # P matches G*RHOX - use P as-is (already in dyn/cm²)
-            print(f"  P from .atm matches G*RHOX (ratio={ratio:.6f}) - using P as-is")
-            print(f"  P[0] = {gas_pressure_atm[0]:.6e} dyn/cm²")
-            gas_pressure = gas_pressure_atm.copy()
-        elif ratio > 1e5:
-            # P from .atm is way smaller than G*RHOX - likely needs conversion from bar to dyn/cm²
-            print(
-                f"  WARNING: P from .atm ({p_atm_0:.6e}) is much smaller than G*RHOX ({p_rhox_0:.6e})"
-            )
-            print(f"  Ratio: {ratio:.2e} - Converting P from bar to dyn/cm²")
-            gas_pressure = gas_pressure_atm * 1e6
-            print(f"  P[0] converted: {gas_pressure[0]:.6e} dyn/cm²")
-        else:
-            # P doesn't match G*RHOX, but ratio is not extreme - use P as-is
-            print(f"  WARNING: P from .atm doesn't match G*RHOX (ratio={ratio:.6f})")
-            print(f"  Using P as-is: {gas_pressure_atm[0]:.6e} dyn/cm²")
-            gas_pressure = gas_pressure_atm.copy()
+    # Fortran xnfpelsyn.for line 2092: P(J)=FREEFF(CARD)
+    # No unit conversion, no ratio checks, no heuristics — raw FREEFF output.
+    gas_pressure = gas_pressure_atm.copy()
 
     # XNATOM = number density of atoms (from atlas7v.for line 1965)
     # XNATOM(J) = P(J)/TK(J) - XNE(J)
@@ -761,7 +785,6 @@ def generate_standard_edges(
     frqedg, wledge, cmedge = parse_continua_dat(continua_path)
 
     print(f"  Read {len(frqedg)} edges from {continua_path}")
-    print(f"    Wavelength range: {wledge[0]:.2f} - {wledge[-1]:.2f} nm")
 
     return frqedg, wledge, cmedge
 
@@ -776,49 +799,19 @@ def _validate_mass_density_physics(
     teff: float | None = None,
     glog: float | None = None,
 ) -> None:
-    """Validate mass_density using physics-based checks (independent of Fortran).
-
-    This diagnostic verifies that RHO values are physically reasonable and
-    that the calculation chain is correct.
-    """
-    print(f"\n{'='*70}")
-    print(f"PHYSICS VALIDATION: Mass Density (RHO) Calculation")
-    print(f"{'='*70}")
-
-    # Check 1: RHO should be in reasonable range for stellar atmospheres
-    # Typical stellar atmosphere RHO[0]: ~1e-6 to 1e-3 g/cm³ for main sequence stars
-    # For cool/low-gravity stars: can be much smaller (~1e-9 to 1e-6 g/cm³)
+    """Sanity-check mass_density; emit warnings only when checks fail."""
     rho_0 = rho_python[0]
-    print(f"  RHO[0] = {rho_0:.6e} g/cm³")
-
-    # Expected range based on stellar parameters
     if teff is not None and glog is not None:
-        # For cool stars (TEFF < 4000K) with low gravity (glog < 0), RHO can be very small
         if teff < 4000 and glog < 0:
-            rho_min_expected = 1e-12  # Very low for cool/low-gravity stars
-            rho_max_expected = 1e-6
-            print(
-                f"  Expected range for TEFF={teff:.0f}K, GLOG={glog:.2f}: {rho_min_expected:.2e} to {rho_max_expected:.2e} g/cm³"
-            )
+            rho_min_expected, rho_max_expected = 1e-12, 1e-6
         else:
-            rho_min_expected = 1e-6
-            rho_max_expected = 1e-3
+            rho_min_expected, rho_max_expected = 1e-6, 1e-3
+        if rho_0 < rho_min_expected or rho_0 > rho_max_expected:
             print(
-                f"  Expected range for TEFF={teff:.0f}K, GLOG={glog:.2f}: {rho_min_expected:.2e} to {rho_max_expected:.2e} g/cm³"
+                f"  WARNING: surface RHO outside typical range for "
+                f"TEFF={teff:.0f}K, GLOG={glog:+.2f}"
             )
 
-        if rho_0 < rho_min_expected:
-            print(
-                f"  ⚠️  WARNING: RHO[0] is {rho_min_expected/rho_0:.2e}× smaller than expected minimum"
-            )
-        elif rho_0 > rho_max_expected:
-            print(
-                f"  ⚠️  WARNING: RHO[0] is {rho_0/rho_max_expected:.2e}× larger than expected maximum"
-            )
-        else:
-            print(f"  ✓ RHO[0] is within expected range")
-
-    # Check 2: Verify calculation chain
     if (
         p_python is not None
         and tk_python is not None
@@ -826,77 +819,22 @@ def _validate_mass_density_physics(
         and xnatm_python is not None
         and wtmole is not None
     ):
-        print(f"\n  Calculation chain verification:")
-        print(f"    P[0] = {p_python[0]:.6e} dyn/cm²")
-        print(f"    TK[0] = {tk_python[0]:.6e} erg")
-        print(f"    XNE[0] = {xne_python[0]:.6e} cm⁻³")
-        print(f"    XNATOM[0] = {xnatm_python[0]:.6e} cm⁻³")
-        print(f"    WTMOLE = {wtmole:.6f} amu")
-
-        # Verify XNATOM = P/TK - XNE
         xnatm_expected = p_python[0] / tk_python[0] - xne_python[0]
-        xnatm_match = (
+        if (
             abs(xnatm_python[0] - xnatm_expected) / max(abs(xnatm_expected), 1e-40)
-            < 1e-6
-        )
-        print(f"    XNATOM[0] check: P[0]/TK[0] - XNE[0] = {xnatm_expected:.6e} cm⁻³")
-        print(
-            f"    XNATOM[0] match: {xnatm_match} (diff: {abs(xnatm_python[0] - xnatm_expected):.6e})"
-        )
-
-        # Verify RHO = XNATOM * WTMOLE * 1.660e-24
+            >= 1e-6
+        ):
+            print("  WARNING: XNATOM inconsistent with P/TK - XNE at surface")
         rho_expected = xnatm_python[0] * wtmole * 1.660e-24
-        rho_match = abs(rho_python[0] - rho_expected) / max(rho_expected, 1e-40) < 1e-6
-        print(
-            f"    RHO[0] check: XNATOM[0] * WTMOLE * 1.660e-24 = {rho_expected:.6e} g/cm³"
-        )
-        print(
-            f"    RHO[0] match: {rho_match} (diff: {abs(rho_python[0] - rho_expected):.6e})"
-        )
-
-        if not xnatm_match:
-            print(f"    ⚠️  ISSUE: XNATOM calculation doesn't match formula!")
-        if not rho_match:
-            print(f"    ⚠️  ISSUE: RHO calculation doesn't match formula!")
-
-        # Check if P is reasonable
-        # For stellar atmospheres: P[0] ~ 1e4 to 1e6 dyn/cm² (main sequence)
-        # For low gravity: P[0] can be much smaller (~1e-1 to 1e3 dyn/cm²)
+        if abs(rho_python[0] - rho_expected) / max(rho_expected, 1e-40) >= 1e-6:
+            print("  WARNING: RHO inconsistent with XNATOM * WTMOLE at surface")
         if p_python[0] < 1e-2:
-            print(f"\n  ⚠️  WARNING: P[0] = {p_python[0]:.6e} dyn/cm² is very small")
-            print(f"    This could cause XNATOM to be too small, leading to small RHO")
-            if glog is not None:
-                # Check if P = GRAV*RHOX is correct
-                grav = 10.0**glog
-                print(f"    GRAV = 10^{glog:.2f} = {grav:.6e} cm/s²")
-                # We don't have RHOX here, but we can check if P seems reasonable for the gravity
-                print(f"    For low gravity (glog={glog:.2f}), small P is expected")
-
-        # Check if XNATOM is reasonable
-        # Typical XNATOM[0]: ~1e15 to 1e18 cm⁻³ (main sequence)
-        # For low gravity: can be much smaller (~1e12 to 1e15 cm⁻³)
+            print("  WARNING: surface P is very small (.atm / low-g)")
         if xnatm_python[0] < 1e10:
-            print(
-                f"\n  ⚠️  WARNING: XNATOM[0] = {xnatm_python[0]:.6e} cm⁻³ is very small"
-            )
-            print(f"    This will cause RHO to be very small")
-            print(f"    Possible causes:")
-            print(
-                f"      * P is too small (check if PRAD/PTURB/PCON corrections are needed)"
-            )
-            print(f"      * TK is too large (check TK = k_B * T calculation)")
-            print(f"      * XNE is too large (check XNE computation)")
+            print("  WARNING: surface XNATOM is very small")
 
-    # Check 3: RHO should increase with depth (monotonic)
-    if len(rho_python) > 1:
-        rho_increasing = np.all(np.diff(rho_python) >= 0)
-        if not rho_increasing:
-            print(f"\n  ⚠️  WARNING: RHO is not monotonically increasing with depth")
-            print(f"    This is unphysical - RHO should increase going deeper")
-        else:
-            print(f"\n  ✓ RHO increases monotonically with depth")
-
-    print(f"{'='*70}\n")
+    if len(rho_python) > 1 and not np.all(np.diff(rho_python) >= 0):
+        print("  WARNING: RHO is not monotonically increasing with depth")
 
 
 def generate_frequency_grid_from_edges(
@@ -1038,14 +976,9 @@ def compute_continuum_from_atm(
 
     # Compute ACONT and SIGMAC using full KAPP implementation
 
-    print(f"Computing continuum using KAPP (full implementation)...")
+    print("Computing continuum using KAPP (full implementation)...")
     if ifop is not None:
-        print(f"  Using IFOP from .atm: {ifop}")
-        print(f"    IFOP(8)={ifop[7]} (HERAOP), IFOP(13)={ifop[12]} (H2RAOP)")
-
-    print(
-        f"  Frequencies: {freq_hz.size} points, range [{freq_hz.min():.6e}, {freq_hz.max():.6e}] Hz"
-    )
+        print("  Using IFOP vector from .atm for KAPP")
 
     acont, sigmac, scont = kapp.compute_kapp_continuum(
         atmosphere,
@@ -1062,32 +995,10 @@ def compute_continuum_from_atm(
     large_sigmac_mask = sigmac > 1e10
 
     if np.any(large_acont_mask):
-
-        print(f"  WARNING: {np.sum(large_acont_mask)} ACONT values > 1e10 cm²/g")
-
-        print(
-            f"    Max ACONT: {acont.max():.6e} cm²/g at layer {np.unravel_index(np.argmax(acont), acont.shape)[0]}"
-        )
+        print(f"  WARNING: {int(np.sum(large_acont_mask))} ACONT values > 1e10 cm²/g")
 
     if np.any(large_sigmac_mask):
-
-        print(f"  WARNING: {np.sum(large_sigmac_mask)} SIGMAC values > 1e10 cm²/g")
-
-        print(
-            f"    Max SIGMAC: {sigmac.max():.6e} cm²/g at layer {np.unravel_index(np.argmax(sigmac), sigmac.shape)[0]}"
-        )
-
-    # Print sample values for first few layers and frequencies
-
-    print(f"  Sample ACONT values (first 3 layers, first 5 frequencies):")
-
-    for layer_idx in range(min(3, acont.shape[0])):
-
-        for freq_idx in range(min(5, acont.shape[1])):
-
-            print(
-                f"    Layer {layer_idx}, Freq {freq_idx}: ACONT={acont[layer_idx, freq_idx]:.6e} cm²/g"
-            )
+        print(f"  WARNING: {int(np.sum(large_sigmac_mask))} SIGMAC values > 1e10 cm²/g")
 
     # Convert to log10 for NPZ output format
 
@@ -1485,7 +1396,6 @@ if __name__ == "__main__":
             raise ValueError("Invalid abundances: sum(XABUND) <= 0")
         xabund_normalized = xabund / xabund_sum
         wtmole = np.sum(xabund_normalized * pops_exact.ATMASS[:99])
-        print(f"  Computed WTMOLE from abundances: {wtmole:.6f} amu")
 
     # Get molecules path for NMOLEC call
     molecules_path = Path(args.molecules) if args.molecules else None
@@ -1518,11 +1428,7 @@ if __name__ == "__main__":
 
     # Mode: Compute from .atm standalone
 
-    print("=" * 80)
-    print("MODE: Computing from .atm standalone")
-
-    print("=" * 80)
-    print("NOTE: Computing all values from .atm file using physics-based calculations.")
+    print("MODE: computing from .atm (standalone)")
 
     # Generate standard edges
     # CRITICAL: Read edges from continua.dat (pre-existing data file, not Fortran-generated)
@@ -1530,7 +1436,6 @@ if __name__ == "__main__":
     # args.continua is now guaranteed to exist (validated above)
 
     print("Generating standard edge set...")
-    print(f"  Using continua.dat: {args.continua}")
 
     frqedg, wledge, cmedge = generate_standard_edges(continua_path=args.continua)
 
@@ -1572,17 +1477,9 @@ if __name__ == "__main__":
         )
 
     # Match xnfpelsyn.for behavior: Use XNE from .atm file directly
-    print("=" * 70)
-    print("MATCHING xnfpelsyn.for BEHAVIOR: Using XNE from .atm file directly")
-    print("  (xnfpelsyn.for line 1665: XNE(J)=FREEFF(CARD))")
-    print("  (xnfpelsyn.for line 1959: XNATOM(J)=P(J)/TK(J)-XNE(J))")
-    print("=" * 70)
+    print("Stage: electron density and gas pressure from .atm (xnfpelsyn-style path)")
 
     try:
-        print(
-            "Using XNE from .atm file (matching xnfpelsyn.for behavior - no iterative recomputation)..."
-        )
-
         # Use XNE from .atm file directly
         xne_from_atm = electron_density_atm.copy()
 
@@ -1594,18 +1491,12 @@ if __name__ == "__main__":
             "gas_pressure"
         ].copy()  # Already read from .atm file
 
-        print(f"  Using P from .atm file directly (matching xnfpelsyn.for behavior)")
-        print(f"    P[0] from .atm = {gas_pressure_from_atm[0]:.6e} dyn/cm²")
-        print(f"    XNE[0] from .atm = {xne_from_atm[0]:.6e} cm⁻³")
-
         # Keep P from .atm file (don't recompute)
         # derived["gas_pressure"] is already set to gas_pressure_from_atm
 
         # Recompute XNATOM using P from .atm file and XNE from .atm
         xnatm_from_atm_xne = gas_pressure_from_atm / derived["tk"] - xne_from_atm
         xnatm_from_atm_xne = np.maximum(xnatm_from_atm_xne, 1e-30)
-
-        print(f"    XNATOM[0] = P[0]/TK[0] - XNE[0] = {xnatm_from_atm_xne[0]:.6e} cm⁻³")
 
         # Compute WTMOLE from abundances (needed for RHO)
         # Get abundances and convert to XABUND
@@ -1658,9 +1549,6 @@ if __name__ == "__main__":
             # Match Fortran exactly: WTMOLE = sum(XABUND(IZ) * ATMASS(IZ)) for IZ=1,99
             # Note: Fortran uses XABUND directly, NOT normalized
             wtmole = np.sum(xabund * pops_exact.ATMASS[:99])
-            print(
-                f"    Computed WTMOLE from abundances (matching Fortran): {wtmole:.6f} amu"
-            )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to compute WTMOLE from abundances (matching Fortran requirement). "
@@ -1671,35 +1559,19 @@ if __name__ == "__main__":
         # Recompute RHO using XNATOM and WTMOLE
         rho_from_atm_xne = xnatm_from_atm_xne * wtmole * 1.660e-24
 
-        print(
-            f"    RHO[0] = XNATOM[0] * WTMOLE * 1.660e-24 = {rho_from_atm_xne[0]:.6e} g/cm³"
-        )
-
         # CRITICAL VALIDATION: Check if RHO is reasonable
         # Expected range: ~1e-6 to 1e-2 g/cm³ for typical stellar atmospheres
         # For cool/low-gravity stars: can be as small as ~1e-9 g/cm³
         if rho_from_atm_xne[0] < 1e-12:
             print(
-                f"\n  ⚠️  CRITICAL WARNING: RHO[0] = {rho_from_atm_xne[0]:.6e} g/cm³ is EXTREMELY SMALL!"
+                "  WARNING: surface mass_density is extremely small (<1e-12 g/cm³); "
+                "SIGMAC scales as 1/RHO — check P, TK, XNE, and abundances in the .atm"
             )
-            print(f"    Expected: ~1e-6 to 1e-2 g/cm³ for typical stellar atmospheres")
-            print(f"    This will cause SIGMAC to be HUGE (SIGMAC ∝ 1/RHO)")
-            print(f"    Possible causes:")
-            print(f"      1. XNATOM is too small (check P/TK - XNE calculation)")
-            print(f"      2. P from .atm file is too small")
-            print(f"      3. TK calculation is wrong")
-            print(f"      4. XNE is too large relative to P/TK")
-            print(f"    This will cause continuum flux to be incorrect!")
 
         # Update derived quantities BEFORE POPS calls
         derived["electron_density"] = xne_from_atm
         derived["xnatm"] = xnatm_from_atm_xne
         derived["mass_density"] = rho_from_atm_xne
-
-        print(f"  Successfully set XNE from .atm file (will be used by POPS)")
-        print(
-            f"  NOTE: IFPRES=0, so POPS will NOT call NMOLEC (matching xnfpelsyn)."
-        )
 
         # PHYSICS VALIDATION: Verify mass_density calculation
         _validate_mass_density_physics(
@@ -1712,14 +1584,6 @@ if __name__ == "__main__":
             atm_data.get("teff"),
             atm_data.get("glog"),
         )
-
-        # Successfully used XNE from .atm file (matching xnfpelsyn.for)
-        print("\n" + "=" * 70)
-        print("✓ Successfully matched xnfpelsyn.for behavior")
-        print(f"  XNE[0] = {derived['electron_density'][0]:.6e} cm⁻³ (from .atm file)")
-        print(f"  XNATOM[0] = {derived['xnatm'][0]:.6e} cm⁻³")
-        print(f"  RHO[0] = {derived['mass_density'][0]:.6e} g/cm³")
-        print("=" * 70 + "\n")
 
     except Exception as e:
         # This should rarely happen - .atm files should always have XNE
@@ -1833,11 +1697,8 @@ if __name__ == "__main__":
         # is absent → ifmol defaults to 0 → NMOLEC never runs → wrong XNATOM
         # for cool stars.  Fix: always set IFMOL=1, matching at12tosyn behavior.
         ifmol_from_atm = 1  # Always ON, matching at12tosyn.exe
-        teff = atm_data.get("teff", 6000.0)
-        print(f"  IFMOL=1 (forced, matching Fortran at12tosyn.exe for Teff={teff:.0f}K)")
-
         set_ifmol(ifmol_from_atm)
-        print(f"    NMOLEC will compute XNATOM including molecular contributions")
+        print("  IFMOL=1 (at12tosyn-equivalent); POPS may invoke NMOLEC for cool models")
 
         # Fortran data already loaded above for XNE/WTMOLE computation
 
@@ -2113,19 +1974,7 @@ if __name__ == "__main__":
         )
         xnfpfe = np.maximum(xnfpfe_arr[:, 0], 1e-40)  # Fe I ground state
 
-        print(f"  Computed H/He/Metal populations using exact POPS")
-        print(f"    XNFPMG[0] = {xnfpmg[0]:.6e} cm⁻³ (Mg I - 10% of opacity at 300nm)")
-        print(f"    XNFPAL[0] = {xnfpal[0]:.6e} cm⁻³ (Al I - contributes to AL1OP)")
-        print(f"    XNFPSI[0] = {xnfpsi[0]:.6e} cm⁻³ (Si I - 1% of opacity at 300nm)")
-        print(f"    XNFPFE[0] = {xnfpfe[0]:.6e} cm⁻³ (Fe I - 35% of opacity at 300nm)")
-
-        print(f"    XNFH[0] = {xnf_h_basic[0]:.6e} cm⁻³")
-
-        print(f"    XNFHE1[0] = {xnf_he1_basic[0]:.6e} cm⁻³")
-
-        print(f"    XNFHE2[0] = {xnf_he2_basic[0]:.6e} cm⁻³")
-
-        print(f"    XNFH2[0] = {xnf_h2_basic[0]:.6e} cm⁻³")
+        print("  Computed H/He/metal populations (exact POPS)")
 
         # CRITICAL FIX: xnfpelsyn.for sets IFPRES=1 (line 183, overriding 0 at 182).
         # With IFPRES=1 + IFMOL=1 (cool-star models), the first pops_exact call
@@ -2138,19 +1987,10 @@ if __name__ == "__main__":
             nmolec_xnatm_result = xnatm.copy()
             nmolec_xne_result = xne.copy()
             nmolec_mass_density_result = xnatm * wtmole * 1.660e-24
-            print(f"  ✓ NMOLEC ran inside POPS (IFPRES=1, IFMOL=1)")
-            print(f"    XNATOM[0] changed: {derived['xnatm'][0]:.6e} → {xnatm[0]:.6e} "
-                  f"(ratio: {xnatm[0]/derived['xnatm'][0]:.4f})")
-            print(f"    RHO[0] will change: {derived['mass_density'][0]:.6e} → "
-                  f"{nmolec_mass_density_result[0]:.6e}")
+            print("  NMOLEC adjusted XNATOM inside POPS")
         else:
             nmolec_success = False
-            print(f"  NOTE: NMOLEC did not modify XNATOM (either IFMOL=0 or hot star)")
-
-        print(f"    XNE[0] = {xne[0]:.6e} cm⁻³ (from .atm)")
-        if xne.size > 59:
-            print(f"    XNE[59] = {xne[59]:.6e} cm⁻³ (from .atm)")
-        print(f"    XNATOM[0] = {xnatm[0]:.6e} cm⁻³ (after POPS/NMOLEC)")
+            print("  NMOLEC did not change XNATOM (hot/atomic limit or no molecular shift)")
 
     except (FileNotFoundError, ImportError) as e:
 
@@ -2188,10 +2028,7 @@ if __name__ == "__main__":
         derived["electron_density"] = nmolec_xne_result.copy()
         derived["xnatm"] = nmolec_xnatm_result.copy()
         derived["mass_density"] = nmolec_mass_density_result.copy()
-        print(f"  Applied NELECT/NMOLEC corrections before continuum computation:")
-        print(f"    XNE[0]    = {derived['electron_density'][0]:.6e}")
-        print(f"    XNATOM[0] = {derived['xnatm'][0]:.6e}")
-        print(f"    RHO[0]    = {derived['mass_density'][0]:.6e}")
+        print("  Applied NELECT/NMOLEC state to derived quantities before continuum")
 
     # Compute continuum
     # args.atlas_tables is now guaranteed to exist (validated above)
@@ -2225,10 +2062,6 @@ if __name__ == "__main__":
         )
 
         print("Computing continuum from .atm using atlas_tables...")
-
-        print(
-            f"  Using recomputed mass_density: RHO[0] = {derived['mass_density'][0]:.6e} g/cm³"
-        )
         t0 = time.time()
 
         # FIXED: Use IFOP from .atm file to match Fortran xnfpelsyn behavior
@@ -2426,12 +2259,7 @@ if __name__ == "__main__":
         population = np.zeros((n_layers, 6, 139), dtype=np.float64)
 
         print(f"  Computing populations for 99 elements, {n_layers} layers...")
-        print(
-            f"    Note: pfsaha_exact now runs sequentially in Numba to avoid thread overhead for ~80 layers"
-        )
         t0 = time.time()
-        t_pops_total = 0.0
-        t_pops_by_elem = []
 
         def get_element_code(elem_num: int) -> float:
             """Return the CODE value that Fortran uses for each element.
@@ -2488,11 +2316,6 @@ if __name__ == "__main__":
         xne_for_pops = derived["electron_density"].copy()
 
         for elem_num in range(1, 100):  # Elements 1-99
-            if elem_num % 10 == 0:
-                print(f"    Processing element {elem_num}/99...")
-
-            t_elem_start = time.time()
-
             # Call POPS for all ions of this element
             # Code values match xnfpelsyn.for exactly
             code = get_element_code(elem_num)
@@ -2527,33 +2350,14 @@ if __name__ == "__main__":
                     f"Failed to compute populations for element {elem_num}"
                 ) from e
 
-            t_elem = time.time() - t_elem_start
-            t_pops_total += t_elem
-            t_pops_by_elem.append((elem_num, t_elem))
-            if elem_num % 10 == 0:
-                print(
-                    f"      [TIMING] Element {elem_num}: {t_elem:.3f}s (cumulative: {t_pops_total:.3f}s)"
-                )
-
         t_pops = time.time() - t0
         print(f"  Computed populations: shape {population.shape}")
         print(f"  [TIMING] Total population computation: {t_pops:.3f}s")
         print(f"  [TIMING] Average per element: {t_pops/99:.3f}s")
-        # Show top 10 slowest elements
-        t_pops_by_elem.sort(key=lambda x: x[1], reverse=True)
-        print(f"  [TIMING] Top 10 slowest elements:")
-        for elem_num, t_elem in t_pops_by_elem[:10]:
-            print(f"    Element {elem_num}: {t_elem:.3f}s")
 
         # Update RHO after NMOLEC modified XNATOM (NMOLEC was called during first POPS call)
         # RHO = XNATOM * WTMOLE * 1.660e-24
         derived["mass_density"] = derived["xnatm"] * wtmole * 1.660e-24
-        print(
-            f"  Updated RHO after NMOLEC: RHO[0] = {derived['mass_density'][0]:.6e} g/cm³"
-        )
-        print(
-            f"    XNATOM[0] = {derived['xnatm'][0]:.6e} cm⁻³ (may include molecular contributions)"
-        )
 
         # Compute Doppler broadening
         print("Computing Doppler broadening...")
@@ -2596,32 +2400,13 @@ if __name__ == "__main__":
         # avoid internally inconsistent state in downstream continuum physics.
         derived["electron_density"] = nmolec_xne_result.copy()
         derived["mass_density"] = nmolec_mass_density_result.copy()
-        print("  Confirmed NELECT/NMOLEC corrections in derived dict.")
-        print(
-            f"    XNE[0] = {derived['electron_density'][0]:.6e} cm⁻³ (from NMOLEC/NELECT)"
-        )
-        print(f"    Final XNATOM[0] = {derived['xnatm'][0]:.6e} cm⁻³")
+        print("  Confirmed NELECT/NMOLEC corrections in derived dict")
 
         # NOTE: Population scaling was REMOVED (was causing 2.6x error).
         # The populations are ALREADY correctly computed by pops_exact:
         # - Elements in molecular equilibrium use _NMOLEC_XNZ (correct free atom densities)
         # - Other elements use xnatom * xabund, where xnatom was updated by NMOLEC in-place
         # Scaling by xnatom_ratio was double-counting the NMOLEC correction!
-        if population is not None:
-            print(
-                f"    Population scaling skipped (pops_exact already used NMOLEC-corrected XNATOM)"
-            )
-
-        # CRITICAL FIX: Also scale the xnf_h_basic arrays used in continuum
-        # and recompute continuum with corrected values
-        try:
-            xnf_h_basic_exists = xnf_h_basic is not None
-        except NameError:
-            xnf_h_basic_exists = False
-
-        if xnf_h_basic_exists:
-            print("    H2 equilibrium will be computed before interpolation.")
-
         # All computation is done from .atm file
         # NOTE: Interpolation coefficients will be computed AFTER H2 equilibrium correction
         # NOTE: Timing summary will be printed AFTER interpolation
@@ -2639,7 +2424,7 @@ if __name__ == "__main__":
     # can use population_per_ion when IFOP enables them.
     if use_atlas_tables and population is not None:
         atmosphere.population_per_ion = population
-        print("Recomputing continuum with full population_per_ion for KAPP parity...")
+        print("Recomputing continuum with full population_per_ion for KAPP...")
         t0 = time.time()
         cont_abs_log, cont_scat_log = compute_continuum_from_atm(
             atmosphere, freqset, ifop=atm_data.get("ifop", None)

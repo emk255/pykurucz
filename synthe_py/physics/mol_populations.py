@@ -352,11 +352,13 @@ def compute_mol_xnfdop(
 
     hkt = 6.6256e-27 / tk  # h / (k_B × T) in s
 
-    # Run nmolec_exact; capture xnz_out (converged atomic number densities per layer)
-    # needed by _compute_xnfpmol for the Fortran Path-1 XNFPMOL formula.
+    # Run nmolec_exact; capture xnatom_out (converged XNATOM = XN(1) from Newton iteration,
+    # accounting for molecular depletion of atoms) and xnz_out (full converged XN vector).
+    # Fortran atlas12.for line 4335: XNATOM(J)=XN(1) after convergence.
+    # xnatom_out MUST be used in _compute_xnfpmol (not the uncorrected xnatom_atomic).
     xnmol = np.zeros((n_layers, MAXMOL), dtype=np.float64)
     try:
-        _, xnmol_out, xnz_out = nmolec_exact(
+        xnatom_out, xnmol_out, xnz_out = nmolec_exact(
             n_layers=n_layers,
             temperature=temperature,
             tkev=tkev,
@@ -392,6 +394,13 @@ def compute_mol_xnfdop(
             and xnmol_out.shape == (n_layers, MAXMOL)
         ):
             xnmol = xnmol_out
+        # Use converged xnatom_out for _compute_xnfpmol; fall back to xnatom_atomic if
+        # xnatom_out is missing or degenerate (should not happen with Newton path).
+        xnatom_for_xnfpmol = (
+            xnatom_out
+            if (xnatom_out is not None and np.all(np.isfinite(xnatom_out)) and np.any(xnatom_out > 0))
+            else xnatom_atomic
+        )
     except Exception as exc:
         logger.warning("nmolec_exact failed: %s; molecular opacity will be zero", exc)
         return {}
@@ -401,6 +410,9 @@ def compute_mol_xnfdop(
     # which equals n_mol / Z_int_mol, but uses atomic partition functions from PFSAHA
     # (already tabulated in the Fortran code) rather than any externally-derived formula.
     # atlas7v.for lines 4325-4368; Python port in pops_exact._compute_xnfpmol.
+    # CRITICAL: pass xnatom_for_xnfpmol (the converged NMOLEC value, = XN(1) after
+    # convergence) — NOT the raw xnatom_atomic (= P/(kT) - n_e). Fortran NMOLEC updates
+    # XNATOM(J)=XN(1) before exiting, and the XNFPMOL computation uses that updated value.
     try:
         xnfpmol = _compute_xnfpmol(
             temperature=temperature,
@@ -411,7 +423,7 @@ def compute_mol_xnfdop(
             tlog=tlog,
             gas_pressure=gas_pressure,
             electron_density=electron_work,
-            xnatom=xnatom_atomic,
+            xnatom=xnatom_for_xnfpmol,
             xnz=xnz_out,
             xnmol=xnmol,
             code_mol=code_mol,

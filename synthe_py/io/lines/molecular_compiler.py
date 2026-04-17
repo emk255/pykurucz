@@ -146,7 +146,14 @@ _MOL_DISPATCH: Dict[Tuple[int, int], Tuple[int, int, int, float, float]] = {
     (124, 52): (432, 52,  1, -0.077,   0.0),
     (124, 53): (432, 53,  1, -1.022,   0.0),
     (124, 54): (432, 54,  1, -1.626,   0.0),
-    # FeH
+    # FeH — fehfx.dat uses ICODE=156 (rmolecasc.for I4 field = ' 156')
+    # Fortran dispatch: ISO drives the label (540/560/570/580 → NELION=444)
+    # X1 values from rmolecasc.for labels 540(CODE≠124)/560/570/580.
+    (156, 54): (444, 54,  1, -1.237,   0.0),
+    (156, 56): (444, 56,  1, -0.038,   0.0),
+    (156, 57): (444, 57,  1, -1.658,   0.0),
+    (156, 58): (444, 58,  1, -2.553,   0.0),
+    # Legacy entries with ICODE=126 kept for any hypothetical files using that code
     (126, 54): (444, 54,  1, -1.237,   0.0),
     (126, 56): (444, 56,  1, -0.038,   0.0),
     (126, 57): (444, 57,  1, -1.658,   0.0),
@@ -191,7 +198,8 @@ _MOL_CODE_ONLY_DISPATCH: Dict[int, Tuple[int, int, int, float, float]] = {
     120: (342, 40,  1, -0.013,   0.0),    # CaH
     123: (426,  1, 23,  0.0,     0.0),    # VH  (IDMOL(32)=123 → NELION=426)
     124: (432, 52,  1, -0.077,   0.0),    # CrH
-    126: (444, 56,  1, -0.038,   0.0),    # FeH
+    126: (444, 56,  1, -0.038,   0.0),    # FeH (legacy code)
+    156: (444, 56,  1, -0.038,   0.0),    # FeH (actual ICODE=156 in fehfx.dat)
     822: (366, 48, 16,  0.0,    -0.131),  # TiO (IDMOL(22)=822 → NELION=366)
     816: (348, 16, 32,  0.0,     0.0),    # SO  (IDMOL(19)=816 → NELION=348)
     813: (324, 27, 16,  0.0,    -0.001),  # AlO (IDMOL(15)=813 → NELION=324)
@@ -356,6 +364,17 @@ def compile_molecular_ascii(
                     # Files are sorted by wavelength; once past window we can stop
                     break
 
+                # When ifvac=1, some lines get wavelengths far from their stored
+                # file position (e.g. C2 A-X high-v lines stored at 1824-1910 nm
+                # in the file map to ~1799 nm via energy levels).  tfort.12 was
+                # compiled with the file wavelength as the window guard, so any
+                # line whose file position is outside [wlbeg-10, wlend+10] nm
+                # should be excluded to match tfort.12 behaviour.
+                if ifvac == 1:
+                    wl_file = abs(wl_aa)
+                    if wl_file > stop + 10.0 or (wl_file > 0.0 and wl_file < start - 10.0):
+                        continue
+
                 mol = _dispatch_molecule(icode, iso)
                 if mol is None:
                     continue
@@ -429,15 +448,6 @@ def _get_tablog() -> np.ndarray:
     return _TABLOG
 
 
-def _airshift_tio(wlvac_nm: float, airshift: np.ndarray, ifvac: int) -> float:
-    """Apply air correction for TiO (index = int(wlvac * 10 + 0.5))."""
-    if ifvac == 1:
-        return wlvac_nm
-    kwl = int(wlvac_nm * 10.0 + 0.5)
-    if 0 <= kwl < len(airshift):
-        return wlvac_nm + airshift[kwl]
-    return wlvac_nm
-
 
 def compile_tio_schwenke(
     bin_path: Path,
@@ -448,131 +458,96 @@ def compile_tio_schwenke(
 ) -> Dict[str, np.ndarray]:
     """Compile the Schwenke TiO packed-binary line list.
 
-    Each record in fort.11 (schwenke.bin) is 4 × int16:
-      IWL     (packed wavelength)
-      IELION  (encodes isotopologue: ISO = |IELION| - 8949)
-      IELO    (packed lower energy via TABLOG)
-      IGFLOG  (packed log(gf) via TABLOG)
+    Fortran rschwenk.for record layout — RECORDSIZE=4 (4-byte units) = 16 bytes/record,
+    little-endian (VAX/x86 native byte order):
+      IWL     int32  packed wavelength: WLVAC = exp(IWL * RATIOLOG)
+      IELION  int16  encodes isotopologue: ISO = |IELION| - 8949, range 1..5 (46-50TiO)
+      IELO    int16  packed lower energy via TABLOG
+      IGFLOG  int16  packed log(gf) via TABLOG
+      IGR     int16  packed gamma_rad via TABLOG (rschwenk line 182: GAMRF=TABLOG(IGR)/FRQ4PI)
+      IGS     int16  overridden to 1 in Fortran; actual value is unused
+      IGW     int16  overridden to 9384 in Fortran; actual value is unused
 
-    Records are sorted by IWL.
+    Fortran COMMON /IIIIIII/IWL,IELION,IELO,IGFLOG,IGR,IGS,IGW with INTEGER*4 IIIIIII(4)
+    maps to exactly 16 bytes = one direct-access record (RECORDSIZE=4 in 4-byte units).
     """
     tablog = _get_tablog()
-    airshift = _build_airshift_table(60_000)
-
     ratio = 1.0 + 1.0 / resolution
     ratiolg = math.log(ratio)
     ixwlbeg = math.floor(math.log(wlbeg) / ratiolg)
     if math.exp(ixwlbeg * ratiolg) < wlbeg:
         ixwlbeg += 1
 
-    istart_wl = math.log(max(wlbeg - 1.0, 1e-6)) / _TIO_RATIOLOG
-    istop_wl  = math.log(max(wlend + 1.0, 1e-6)) / _TIO_RATIOLOG
-
-    nbuffs:       List[int]   = []
-    cgfs:         List[float] = []
-    nelions:      List[int]   = []
-    elos:         List[float] = []
-    gamma_rads:   List[float] = []
-    gamma_starks: List[float] = []
-    gamma_vdws:   List[float] = []
-    limbs:        List[int]   = []
-
-    record_size = 8  # 4 × int16
-
+    # IWL(i4) IELION(i2) IELO(i2) IGFLOG(i2) IGR(i2) IGS(i2) IGW(i2) = 16 bytes, little-endian
+    _REC_DTYPE = np.dtype([
+        ("iwl",    "<i4"),
+        ("ielion", "<i2"),
+        ("ielo",   "<i2"),
+        ("igflog", "<i2"),
+        ("igr",    "<i2"),
+        ("igs",    "<i2"),
+        ("igw",    "<i2"),
+    ])
     try:
-        data = np.fromfile(bin_path, dtype=np.dtype(">i2"))
+        arr = np.memmap(bin_path, mode="r", dtype=_REC_DTYPE)
     except OSError:
         return _arrays([], [], [], [], [], [], [], [])
 
-    # Each record is 4 int16 words: [IWL_hi, IWL_lo, IELION, IELO, IGFLOG]
-    # Actually the Fortran declares INTEGER*4 IWL (equiv IIIIIII) and reads
-    # IIIIIII(4 ints), which on big-endian VAX is stored as 4×INT16 per record.
-    # The binary layout is 4 words × 2 bytes = 8 bytes / record.
-    # IWL occupies the first INT32 (2 × INT16 big-endian), then IELION (INT16),
-    # IELO (INT16), IGFLOG (INT16) — but Fortran reads as 4 INT32 total = 16 bytes?
-    # Re-reading the Fortran COMMON: IWL is INT32, IELION/IELO/IGFLOG are INT16.
-    # IIIIIII(4) are INT32 each → 16 bytes/record.  Direct-access RECL=4 words (4 bytes each) = 16 bytes.
-    # Let's re-read as: each record = INT32 IWL + INT16 IELION + INT16 IELO + INT16 IGFLOG
-    # = 4+2+2+2 = 10 bytes.  But RECL=4 (INT32 units) = 16 bytes on most systems.
-    # The packed format from Schwenke's website is IWL(4) IELION(2) IELO(2) IGFLOG(2) = 10B.
-    # We'll try reading 10 bytes per record and fall back to 16.
-
-    raw = bin_path.read_bytes()
-    n_bytes = len(raw)
-    rec10 = n_bytes % 10 == 0
-    rec_size = 10 if rec10 else 8
-
-    n_recs = n_bytes // rec_size
-    if n_recs == 0:
+    if arr.size == 0:
         return _arrays([], [], [], [], [], [], [], [])
 
-    if rec_size == 10:
-        # IWL(int32) IELION(int16) IELO(int16) IGFLOG(int16)
-        dt = np.dtype([("iwl", ">i4"), ("ielion", ">i2"), ("ielo", ">i2"), ("igflog", ">i2")])
+    # Vectorised wavelength (rschwenk.for lines 158-161)
+    wlvac = np.exp(arr["iwl"].astype(np.float64) * _TIO_RATIOLOG)
+    if ifvac != 1:
+        airshift = _build_airshift_table(60_000)
+        kwl = np.clip((wlvac * 10.0 + 0.5).astype(np.int64), 0, len(airshift) - 1)
+        wl_use = wlvac + airshift[kwl]          # air wavelength (rschwenk line 160-161)
     else:
-        # 4×INT16; IWL = first two shorts as INT32
-        dt = np.dtype([("iwl", ">i4"), ("ielion", ">i2"), ("ielo", ">i2")])
-        rec_size = 8
+        wl_use = wlvac
 
-    arr = np.frombuffer(raw[:n_recs * rec_size], dtype=dt)
+    # ISO = ABS(IELION) - 8949, valid range 1..5 (rschwenk line 151)
+    iso_arr = np.abs(arr["ielion"].astype(np.int32)) - 8949
+    mask = (
+        (wl_use >= wlbeg - 1.0)
+        & (wl_use <= wlend + 1.0)
+        & (iso_arr >= 1)
+        & (iso_arr <= 5)
+    )
+    n_sel = int(mask.sum())
+    if n_sel == 0:
+        return _arrays([], [], [], [], [], [], [], [])
 
-    for rec in arr:
-        iwl = int(rec["iwl"])
-        if iwl > istop_wl:
-            break
-        if iwl < istart_wl:
-            continue
+    wl_s     = wl_use[mask]
+    iso_s    = iso_arr[mask]
+    ielo_s   = np.clip(arr["ielo"][mask].astype(np.int32),   0, _TABLOG_SIZE - 1)
+    igflog_s = np.clip(arr["igflog"][mask].astype(np.int32), 0, _TABLOG_SIZE - 1)
+    igr_s    = np.clip(arr["igr"][mask].astype(np.int32),    0, _TABLOG_SIZE - 1)
 
-        ielion = int(rec["ielion"])
-        ielo   = int(rec["ielo"])
-        igflog = int(rec["igflog"]) if rec_size == 10 else 9384  # fallback
+    # rschwenk.for line 165: FREQ = 2.99792458D17 / WLVAC  (post-air when IFVAC!=1)
+    freq   = _C_LIGHT_NM / wl_s
+    frq4pi = freq * 12.5664
 
-        iso_idx = abs(ielion) - 8949  # 1-based
-        if iso_idx < 1 or iso_idx > 5:
-            continue
+    # rschwenk.for line 166: CONGF = 0.01502 * TABLOG(IGFLOG) / FREQ * XISO(ISO)
+    xiso_s = np.array(_TIO_XISO, dtype=np.float64)[iso_s - 1]
+    cgf    = 0.01502 * tablog[igflog_s] / freq * xiso_s
 
-        wlvac = math.exp(iwl * _TIO_RATIOLOG)
-        wl_air = _airshift_tio(wlvac, airshift, ifvac)
-        wl_use = wlvac if ifvac == 1 else wl_air
+    # rschwenk.for line 162: ELO = TABLOG(IELO)
+    elo = tablog[ielo_s].astype(np.float64)
 
-        if wl_use < wlbeg - 1.0 or wl_use > wlend + 1.0:
-            continue
+    # rschwenk.for lines 180-184: IGS=1, IGW=9384 (Fortran overrides before GAMSF/GAMWF)
+    # GAMRF = TABLOG(IGR) / FRQ4PI  (uses actual IGR from the binary record)
+    gamrf = tablog[igr_s] / frq4pi
+    gamsf = float(tablog[1])    / frq4pi
+    gamwf = float(tablog[9384]) / frq4pi
 
-        tablog = _get_tablog()
-        elo_val = float(tablog[ielo]) if 0 <= ielo < _TABLOG_SIZE else 0.0
+    # rschwenk.for lines 163-164: NBUFF = IXWL - IXWLBEG + 1
+    ixwl  = np.floor(np.log(np.maximum(wl_s, 1e-30)) / ratiolg + 0.5).astype(np.int32)
+    nbuff = ixwl - ixwlbeg + 1
 
-        igflog_safe = igflog if 0 <= igflog < _TABLOG_SIZE else _TABLOG_OFFSET
-        gf_scaled = float(tablog[igflog_safe]) * _TIO_XISO[iso_idx - 1]
+    nelion = np.full(n_sel, _TIO_NELION, dtype=np.int32)
+    limb   = np.full(n_sel, 7, dtype=np.int16)
 
-        # Fortran rschwenk.for: FREQ = 2.99792458D17 / WLVAC (WLVAC in nm)
-        freq = _C_LIGHT_NM / max(wl_use, 1e-30)
-        congf = 0.01502 * gf_scaled / freq  # rschwenk.for line 166: CONGF = .01502 * GF / FREQ
-
-        ixwl = math.log(max(wl_use, 1e-30)) / ratiolg + 0.5
-        nbuff_val = int(ixwl) - ixwlbeg + 1
-        frq4pi = freq * 12.5664
-
-        # Fortran rschwenk.for lines 180-183: IGS=1, IGW=9384 (fixed)
-        igs = 1
-        igw = 9384
-        gammar_val = float(tablog[igflog_safe])  # IGR stored in igflog slot? Actually IGR separate
-        # In rschwenk, IGR is part of IIIIIII(4) INT16 block.  With our simplified read
-        # we approximate gamma_rad from a classical formula:
-        gammar_val = 2.223e13 / max(wl_use, 1e-6) ** 2 * 0.001
-        gamrf = gammar_val / frq4pi
-        gamsf = float(tablog[igs]) / frq4pi
-        gamwf = float(tablog[igw]) / frq4pi
-
-        nbuffs.append(nbuff_val)
-        cgfs.append(congf)
-        nelions.append(_TIO_NELION)
-        elos.append(elo_val)
-        gamma_rads.append(gamrf)
-        gamma_starks.append(gamsf)
-        gamma_vdws.append(gamwf)
-        limbs.append(7)
-
-    return _arrays(nbuffs, cgfs, nelions, elos, gamma_rads, gamma_starks, gamma_vdws, limbs)
+    return _arrays(nbuff, cgf, nelion, elo, gamrf, gamsf, gamwf, limb)
 
 
 # ---------------------------------------------------------------------------
@@ -600,101 +575,90 @@ def compile_h2o_partridge(
 ) -> Dict[str, np.ndarray]:
     """Compile the Partridge-Schwenke H2O packed-binary line list.
 
-    Each record: INT32 IWL + INT16 IELO + INT16 IGFLOG = 8 bytes.
+    Fortran rh2ofast.for record layout — RECORDSIZE=2 (2-byte units) = 8 bytes/record,
+    little-endian (VAX/x86 native byte order):
+      IWL     int32  packed wavelength: WLVAC = exp(IWL * RATIOLOG)
+      IELO    int16  sign encodes isotopologue; abs value = ELO in cm^-1 (direct integer)
+      IGFLOG  int16  sign encodes isotopologue; abs value = TABLOG index for gf
+
+    Key Fortran convention (rh2ofast.for lines 135-154):
+      FREQ is computed BEFORE the air correction is applied to WLVAC (line 136).
+      WLVAC used in NBUFF and GAMMAR is the post-air wavelength (lines 142, 165).
     """
     tablog = _get_tablog()
-    airshift = _build_airshift_table(100_000)
-
     ratio = 1.0 + 1.0 / resolution
     ratiolg = math.log(ratio)
     ixwlbeg = math.floor(math.log(wlbeg) / ratiolg)
     if math.exp(ixwlbeg * ratiolg) < wlbeg:
         ixwlbeg += 1
 
-    nbuffs:       List[int]   = []
-    cgfs:         List[float] = []
-    nelions:      List[int]   = []
-    elos:         List[float] = []
-    gamma_rads:   List[float] = []
-    gamma_starks: List[float] = []
-    gamma_vdws:   List[float] = []
-    limbs:        List[int]   = []
-
+    # 8 bytes per record: INT32 IWL + INT16 IELO + INT16 IGFLOG, little-endian
+    _REC_DTYPE = np.dtype([("iwl", "<i4"), ("ielo", "<i2"), ("igflog", "<i2")])
     try:
-        raw = bin_path.read_bytes()
+        arr = np.memmap(bin_path, mode="r", dtype=_REC_DTYPE)
     except OSError:
         return _arrays([], [], [], [], [], [], [], [])
 
-    rec_size = 8  # INT32 + INT16 + INT16
-    n_recs = len(raw) // rec_size
-    if n_recs == 0:
+    if arr.size == 0:
         return _arrays([], [], [], [], [], [], [], [])
 
-    dt = np.dtype([("iwl", ">i4"), ("ielo", ">i2"), ("igflog", ">i2")])
-    arr = np.frombuffer(raw[:n_recs * rec_size], dtype=dt)
+    # Vectorised wavelength (rh2ofast.for lines 135-140)
+    # FREQ uses the original vacuum WLVAC (line 136), computed before air correction
+    wlvac_vac = np.exp(arr["iwl"].astype(np.float64) * _H2O_RATIOLOG)
+    freq_vac  = _C_LIGHT_NM / wlvac_vac     # pre-air FREQ (rh2ofast convention)
 
-    wlbeg1 = wlbeg - 1.0
-    wlend1 = wlend + 1.0
+    if ifvac != 1:
+        airshift = _build_airshift_table(100_000)
+        kwl    = np.clip((wlvac_vac * 10.0 + 0.5).astype(np.int64), 0, len(airshift) - 1)
+        wl_use = wlvac_vac + airshift[kwl]  # air wavelength for window / NBUFF / GAMMAR
+    else:
+        wl_use = wlvac_vac
 
-    for rec in arr:
-        iwl = int(rec["iwl"])
-        wlvac = math.exp(iwl * _H2O_RATIOLOG)
-        if ifvac != 1:
-            kwl = int(wlvac * 10.0 + 0.5)
-            if 0 <= kwl < len(airshift):
-                wlvac = wlvac + airshift[kwl]
+    mask  = (wl_use >= wlbeg - 1.0) & (wl_use <= wlend + 1.0)
+    n_sel = int(mask.sum())
+    if n_sel == 0:
+        return _arrays([], [], [], [], [], [], [], [])
 
-        if wlvac > wlend1:
-            break
-        if wlvac < wlbeg1:
-            continue
+    ielo_raw   = arr["ielo"][mask].astype(np.int32)
+    igflog_raw = arr["igflog"][mask].astype(np.int32)
+    wl_s       = wl_use[mask]
+    freq_s     = freq_vac[mask]          # pre-air FREQ used for CONGF (rh2ofast line 154)
 
-        ielo   = int(rec["ielo"])
-        igflog = int(rec["igflog"])
+    # Isotopologue from sign encoding (rh2ofast.for lines 143-149)
+    # ISO=1: IELO>0 and IGFLOG>0; ISO=2: IELO>0 (IGFLOG<=0)
+    # ISO=3: IGFLOG>0 (IELO<=0);  ISO=4: both <=0
+    iso_idx = np.where(
+        (ielo_raw > 0) & (igflog_raw > 0), 0,
+        np.where(ielo_raw > 0, 1,
+        np.where(igflog_raw > 0, 2, 3))
+    )
+    ielo_abs   = np.abs(ielo_raw)
+    igflog_abs = np.clip(np.abs(igflog_raw), 0, _TABLOG_SIZE - 1)
 
-        # Isotopologue sign encoding
-        if ielo > 0 and igflog > 0:
-            iso_idx = 0  # 1H1H16O
-        elif ielo > 0:
-            iso_idx = 1  # 1H1H17O
-        elif igflog > 0:
-            iso_idx = 2  # 1H1H18O
-        else:
-            iso_idx = 3  # 1H2H16O
+    xiso_s = np.array(_H2O_XISO, dtype=np.float64)[iso_idx]
+    frq4pi = freq_s * 12.5664
 
-        ielo_abs   = abs(ielo)
-        igflog_abs = abs(igflog)
+    # rh2ofast.for line 154: CONGF = 0.01502 * TABLOG(IGFLOG) / FREQ * XISO(ISO)
+    cgf = 0.01502 * tablog[igflog_abs] / freq_s * xiso_s
 
-        elo_val  = float(ielo_abs)   # stored as direct cm^-1 integer in this format
-        igflog_safe = igflog_abs if 0 <= igflog_abs < _TABLOG_SIZE else _TABLOG_OFFSET
-        gf_scaled = float(tablog[igflog_safe]) * _H2O_XISO[iso_idx]
+    # rh2ofast.for line 151: ELO = ABS(IELO)  (direct cm^-1 value, not a TABLOG index)
+    elo = ielo_abs.astype(np.float64)
 
-        # Fortran rh2ofast.for: FREQ = 2.99792458D17 / WLVAC (WLVAC in nm)
-        freq = _C_LIGHT_NM / max(wlvac, 1e-30)
-        congf = 0.01502 * gf_scaled / freq  # rh2ofast.for line 154: CONGF = .01502 * GF / FREQ
+    # rh2ofast.for lines 165-169: GAMMAR = 2.223e13 / WLVAC^2 * 0.001 (post-air WLVAC)
+    # IGS=1, IGW=9384 (Fortran fixed overrides)
+    gammar = 2.223e13 / np.maximum(wl_s, 1e-6) ** 2 * 0.001
+    gamrf  = gammar / frq4pi
+    gamsf  = float(tablog[1])    / frq4pi
+    gamwf  = float(tablog[9384]) / frq4pi
 
-        ixwl = math.log(max(wlvac, 1e-30)) / ratiolg + 0.5
-        nbuff_val = int(ixwl) - ixwlbeg + 1
-        frq4pi = freq * 12.5664
+    # NBUFF = INT(LOG(WL) / RATIOLG + 0.5) - IXWLBEG + 1  (post-air WL)
+    ixwl  = np.floor(np.log(np.maximum(wl_s, 1e-30)) / ratiolg + 0.5).astype(np.int32)
+    nbuff = ixwl - ixwlbeg + 1
 
-        # rh2ofast.for: GAMMAR = 2.223e13 / WLVAC^2 * 0.001;  IGS=1, IGW=9384
-        gammar_val = 2.223e13 / max(wlvac, 1e-6) ** 2 * 0.001
-        igs = 1
-        igw = 9384
-        gamrf = gammar_val / frq4pi
-        gamsf = float(tablog[igs]) / frq4pi
-        gamwf = float(tablog[igw]) / frq4pi
+    nelion = np.full(n_sel, _H2O_NELION, dtype=np.int32)
+    limb   = np.full(n_sel, 7, dtype=np.int16)
 
-        nbuffs.append(nbuff_val)
-        cgfs.append(congf)
-        nelions.append(_H2O_NELION)
-        elos.append(elo_val)
-        gamma_rads.append(gamrf)
-        gamma_starks.append(gamsf)
-        gamma_vdws.append(gamwf)
-        limbs.append(7)
-
-    return _arrays(nbuffs, cgfs, nelions, elos, gamma_rads, gamma_starks, gamma_vdws, limbs)
+    return _arrays(nbuff, cgf, nelion, elo, gamrf, gamsf, gamwf, limb)
 
 
 # ---------------------------------------------------------------------------

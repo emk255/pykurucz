@@ -16,6 +16,9 @@ import numpy as np
 
 from numba import jit, prange
 
+# Fortran REAL*4 maximum value – used to clamp Inf opacities matching Fortran masking.
+MAX_OPACITY: float = 3.4028235e38
+
 from ..config import SynthesisConfig
 from ..io import atmosphere, export
 from ..io.lines import atomic, compiler as line_compiler, fort19 as fort19_io
@@ -33,6 +36,7 @@ from ..physics.hydrogen_wings import (
     compute_hydrogen_continuum,
 )
 from ..physics.profiles import hydrogen_line_profile, voigt_profile
+from ..physics.profiles.hydrogen import _fine_structure_cached, hydrogen_tables as _hydrogen_tables
 from .radiative import solve_lte_spectrum
 from .buffers import SynthResult, allocate_buffers
 from synthe_py.tools import pops_exact
@@ -69,6 +73,8 @@ CGF_CONSTANT = 0.026538 / 1.77245  # Factor for converting GF to CONGF
 
 # Shared Voigt profile — single canonical JIT-compiled implementation
 from synthe_py.physics.voigt_jit import voigt_profile_jit as _voigt_profile_jit
+from synthe_py.physics.voigt_jit import accumulate_voigt_wings_jit as _accumulate_voigt_wings_jit
+from synthe_py.physics.voigt_jit import compute_helium_voigt_batch as _compute_helium_voigt_batch
 
 
 @jit(nopython=True, cache=True)
@@ -190,13 +196,12 @@ def _accumulate_metal_profile_kernel(
             maxstep = int(np.sqrt(x_far / kapmin) + 1.0)
             maxstep = min(maxstep, MAX_PROFILE_STEPS)
         else:
-            maxstep = n10dop
+            maxstep = MAX_PROFILE_STEPS if x_far > 0 else n10dop
 
         n1 = n10dop + 1
         for nstep in range(n1, maxstep + 1):
             profile[nstep] = x_far / float(nstep) ** 2 if nstep > 0 else 0.0
 
-        # Fortran: NSTEP = MAXSTEP (line 587)
         nstep_final = maxstep
 
     # ========== Label 323: Boundary check ==========
@@ -402,21 +407,206 @@ def _accumulate_mol_wings_batch(
 
             # ===== Far wings (only if near-wing completed without early cutoff) =====
             # Fortran: X = PROFILE(N10DOP)*N10DOP^2, MAXSTEP = sqrt(X/KAPMIN)+1
+            # NaN kapmin: INT(NaN)=0 in Fortran/Numba → far wing skipped
+            # Zero kapmin: INT(Inf)=MAXINT → capped to max_profile_steps
             if not early_cutoff and n10dop > 0 and profile_n10dop > 0.0:
                 x_far = profile_n10dop * float(n10dop) * float(n10dop)
                 if x_far > 0.0 and kapmin > 0.0:
                     maxstep = int(math.sqrt(x_far / kapmin) + 1.0)
                     maxstep = min(maxstep, max_profile_steps)
+                elif x_far > 0.0 and kapmin == 0.0:
+                    maxstep = max_profile_steps
                 else:
-                    maxstep = n10dop
+                    maxstep = 0
                 for nstep in range(n10dop + 1, maxstep + 1):
-                    pval = x_far / (float(nstep) * float(nstep))  # x_far / nstep^2
-                    idx_red = center_index + nstep
+                    pval = x_far / (float(nstep) * float(nstep))
+                    red_on = 0 <= (center_index + nstep) < n_wl
+                    blue_on = 0 <= (center_index - nstep) < n_wl
+                    if red_on:
+                        buf[center_index + nstep] += pval
+                    if blue_on:
+                        buf[center_index - nstep] += pval
+                    if not red_on and not blue_on:
+                        break
+
+
+@jit(nopython=True, parallel=True, cache=True)
+def _accumulate_mol_fused_batch(
+    mol_asynth: np.ndarray,            # (n_depths, n_wl) — written in-place
+    valid_counts: np.ndarray,          # (n_depths,) — number of valid pairs per depth
+    cont_arr: np.ndarray,              # (n_depths, n_wl) continuum opacity
+    wavelength: np.ndarray,            # (n_wl,)
+    center_indices: np.ndarray,        # (n_mol_lines,) int64
+    mol_wavelength: np.ndarray,        # (n_mol_lines,)
+    mol_element_idx: np.ndarray,       # (n_mol_lines,)
+    mol_cgf: np.ndarray,               # (n_mol_lines,)
+    mol_elo_cm: np.ndarray,            # (n_mol_lines,)
+    mol_gamma_rad: np.ndarray,         # (n_mol_lines,)
+    mol_gamma_stark: np.ndarray,       # (n_mol_lines,)
+    mol_gamma_vdw: np.ndarray,         # (n_mol_lines,)
+    pop_arr: np.ndarray,               # (n_depths, 6, n_elem)
+    dop_arr: np.ndarray,               # (n_depths, 6, n_elem)
+    mass_density: np.ndarray,          # (n_depths,)
+    electron_density: np.ndarray,      # (n_depths,)
+    txnxn: np.ndarray,                 # (n_depths,)
+    hckt_arr: np.ndarray,              # (n_depths,)
+    cutoff: float,
+    max_profile_steps: int,
+    h0tab: np.ndarray,
+    h1tab: np.ndarray,
+    h2tab: np.ndarray,
+) -> None:
+    """Fused molecular kernel: TRANSP center + wing accumulation.
+
+    Eliminates Python-side per-line/per-depth loops by computing Boltzmann,
+    KAPPA0/ADAMP, center opacity, and near/far wings in one depth-parallel pass.
+    """
+    n_depths = mol_asynth.shape[0]
+    n_wl = mol_asynth.shape[1]
+    n_mol_lines = center_indices.shape[0]
+    n_elem = pop_arr.shape[2]
+    vsteps = 200.0
+    tab_max = len(h0tab) - 1
+
+    for di in prange(n_depths):
+        buf = mol_asynth[di]
+        cont_row = cont_arr[di]
+        rho = mass_density[di]
+        xne = electron_density[di]
+        tx_val = txnxn[di]
+        hckt = hckt_arr[di]
+        depth_valid = 0
+
+        if rho <= 0.0:
+            valid_counts[di] = 0
+            continue
+
+        for li in range(n_mol_lines):
+            ei = int(mol_element_idx[li])
+            if ei < 0 or ei >= n_elem:
+                continue
+
+            line_wl = mol_wavelength[li]
+            if line_wl <= 0.0:
+                continue
+
+            dop_val = dop_arr[di, 5, ei]
+            pop_val = pop_arr[di, 5, ei]
+            if dop_val <= 0.0 or pop_val <= 0.0:
+                continue
+
+            ci = int(center_indices[li])
+            clamped_center = max(0, min(ci, n_wl - 1))
+            kapmin = cutoff * cont_row[clamped_center]
+
+            xnfdop = pop_val / (rho * dop_val)
+            kappa0_pre = mol_cgf[li] * xnfdop
+            if kappa0_pre < kapmin:
+                continue
+
+            boltz = math.exp(-mol_elo_cm[li] * hckt)
+            kappa0 = kappa0_pre * boltz
+            if kappa0 <= 0.0 or kappa0 < kapmin:
+                continue
+
+            adamp_raw = (
+                mol_gamma_rad[li]
+                + mol_gamma_stark[li] * xne
+                + mol_gamma_vdw[li] * tx_val
+            ) / dop_val
+            if adamp_raw < 0.0:
+                continue
+            adamp = max(adamp_raw, 1e-12)
+
+            if adamp < 0.2:
+                voigt_center = 1.0 - 1.128 * adamp
+            else:
+                voigt_center = _voigt_profile_jit(0.0, adamp, h0tab, h1tab, h2tab)
+            kapcen = kappa0 * voigt_center
+
+            if 0 <= ci < n_wl:
+                buf[ci] += kapcen
+
+            depth_valid += 1
+
+            doppler_width = dop_val * line_wl
+            if doppler_width <= 0.0:
+                continue
+
+            if clamped_center < n_wl - 1:
+                resolu = 1.0 / (
+                    wavelength[clamped_center + 1] / wavelength[clamped_center] - 1.0
+                )
+            elif clamped_center > 0:
+                resolu = 1.0 / (
+                    wavelength[clamped_center] / wavelength[clamped_center - 1] - 1.0
+                )
+            else:
+                resolu = 300000.0
+
+            dopple = doppler_width / line_wl
+            n10dop = int(10.0 * dopple * resolu)
+            n10dop = min(n10dop, max_profile_steps)
+
+            early_cutoff = False
+            profile_n10dop = 0.0
+
+            if adamp < 0.2:
+                tabstep = vsteps / (dopple * resolu) if (dopple * resolu) > 0.0 else vsteps
+                tabi = 0.5
+                for nstep in range(1, n10dop + 1):
+                    tabi += tabstep
+                    itab = min(max(int(tabi), 0), tab_max)
+                    pval = kappa0 * (h0tab[itab] + adamp * h1tab[itab])
+                    idx_red = ci + nstep
                     if 0 <= idx_red < n_wl:
                         buf[idx_red] += pval
-                    idx_blue = center_index - nstep
+                    idx_blue = ci - nstep
                     if 0 <= idx_blue < n_wl:
                         buf[idx_blue] += pval
+                    if pval < kapmin:
+                        early_cutoff = True
+                        break
+                    if nstep == n10dop:
+                        profile_n10dop = pval
+            else:
+                dvoigt = 1.0 / (dopple * resolu) if (dopple * resolu) > 0.0 else 1e-6
+                for nstep in range(1, n10dop + 1):
+                    x_val = float(nstep) * dvoigt
+                    pval = kappa0 * _voigt_profile_jit(x_val, adamp, h0tab, h1tab, h2tab)
+                    idx_red = ci + nstep
+                    if 0 <= idx_red < n_wl:
+                        buf[idx_red] += pval
+                    idx_blue = ci - nstep
+                    if 0 <= idx_blue < n_wl:
+                        buf[idx_blue] += pval
+                    if pval < kapmin:
+                        early_cutoff = True
+                        break
+                    if nstep == n10dop:
+                        profile_n10dop = pval
+
+            if not early_cutoff and n10dop > 0 and profile_n10dop > 0.0:
+                x_far = profile_n10dop * float(n10dop) * float(n10dop)
+                if x_far > 0.0 and kapmin > 0.0:
+                    maxstep = int(math.sqrt(x_far / kapmin) + 1.0)
+                    maxstep = min(maxstep, max_profile_steps)
+                elif x_far > 0.0 and kapmin == 0.0:
+                    maxstep = max_profile_steps
+                else:
+                    maxstep = 0
+                for nstep in range(n10dop + 1, maxstep + 1):
+                    pval = x_far / (float(nstep) * float(nstep))
+                    red_on = 0 <= (ci + nstep) < n_wl
+                    blue_on = 0 <= (ci - nstep) < n_wl
+                    if red_on:
+                        buf[ci + nstep] += pval
+                    if blue_on:
+                        buf[ci - nstep] += pval
+                    if not red_on and not blue_on:
+                        break
+
+        valid_counts[di] = depth_valid
 
 
 _ATOMIC_MASS = {
@@ -999,6 +1189,7 @@ def _accumulate_metal_profile(
     return
 
 
+@jit(nopython=True, cache=True)
 def _accumulate_merged_continuum(
     buffer: np.ndarray,
     continuum_row: np.ndarray,
@@ -1037,6 +1228,7 @@ def _accumulate_merged_continuum(
         buffer[idx] += value
 
 
+@jit(nopython=True, cache=True)
 def _accumulate_autoionizing_profile(
     buffer: np.ndarray,
     continuum_row: np.ndarray,
@@ -1159,33 +1351,26 @@ def _apply_fort19_profile(
         h1tab = voigt_tables.h1tab
         h2tab = voigt_tables.h2tab
 
-        # Red wing (Fortran 211 loop style): test cutoff before accumulation.
-        if line_wavelength <= wavelength_grid[n_points - 1]:
-            for idx in range(clamped_center, n_points):
-                wave = wavelength_grid[idx]
-                if wcon is not None and wave <= wcon:
-                    continue
-                x_val = abs(wave - line_wavelength) / doppler
-                value = kappa_eff * _voigt_profile_jit(x_val, adamp, h0tab, h1tab, h2tab)
-                if wtail is not None and wave < wtail:
-                    value = value * (wave - base) / max(wtail - base, 1e-12)
-                if value < continuum_row[idx] * cutoff:
-                    break
-                tmp_buffer[idx] += value
-
-        # Blue wing (Fortran 214 loop style): accumulate then test cutoff.
-        if clamped_center > 0 and line_wavelength >= wavelength_grid[0]:
-            for idx in range(clamped_center - 1, -1, -1):
-                wave = wavelength_grid[idx]
-                if wcon is not None and wave <= wcon:
-                    break
-                x_val = abs(wave - line_wavelength) / doppler
-                value = kappa_eff * _voigt_profile_jit(x_val, adamp, h0tab, h1tab, h2tab)
-                if wtail is not None and wave < wtail:
-                    value = value * (wave - base) / max(wtail - base, 1e-12)
-                tmp_buffer[idx] += value
-                if value < continuum_row[idx] * cutoff:
-                    break
+        # Red/blue wing accumulation via JIT kernel (replaces Python loops)
+        _accumulate_voigt_wings_jit(
+            buffer=tmp_buffer,
+            continuum_row=continuum_row,
+            wavelength_grid=wavelength_grid,
+            center_index=clamped_center,
+            line_wavelength=line_wavelength,
+            kappa_eff=kappa_eff,
+            doppler=doppler,
+            adamp=adamp,
+            cutoff=cutoff,
+            has_wcon=wcon is not None,
+            wcon_val=wcon if wcon is not None else 0.0,
+            has_wtail=wtail is not None,
+            wtail_val=wtail if wtail is not None else 0.0,
+            base_wave=base,
+            h0tab=h0tab,
+            h1tab=h1tab,
+            h2tab=h2tab,
+        )
 
         metal_wings_row += tmp_buffer
         metal_sources_row += tmp_buffer * bnu_row
@@ -1471,6 +1656,97 @@ def _apply_fort19_profile(
     return False
 
 
+@jit(nopython=True, parallel=True, cache=True)
+def _prepare_fort19_normal_kernel(
+    center_buffer: np.ndarray,
+    normal_valid: np.ndarray,
+    kappa0_out: np.ndarray,
+    adamp_out: np.ndarray,
+    doppler_width_out: np.ndarray,
+    wing_type_codes: np.ndarray,
+    center_indices: np.ndarray,
+    wavelength_vacuum: np.ndarray,
+    oscillator_strength: np.ndarray,
+    gamma_rad: np.ndarray,
+    gamma_stark: np.ndarray,
+    gamma_vdw: np.ndarray,
+    pop_vals: np.ndarray,
+    boltz_vals: np.ndarray,
+    doppler_vals: np.ndarray,
+    mass_density: np.ndarray,
+    electron_density: np.ndarray,
+    txnxn_vals: np.ndarray,
+    continuum: np.ndarray,
+    cutoff: float,
+    normal_code: int,
+    h0tab: np.ndarray,
+    h1tab: np.ndarray,
+    h2tab: np.ndarray,
+) -> None:
+    """Depth-parallel precompute for fort.19 NORMAL records."""
+    n_depths = center_buffer.shape[0]
+    n_wavelengths = center_buffer.shape[1]
+    n_fort19 = wing_type_codes.shape[0]
+
+    for depth_idx in prange(n_depths):
+        rho = mass_density[depth_idx]
+        if rho <= 0.0:
+            continue
+        xne = electron_density[depth_idx]
+        txnxn = txnxn_vals[depth_idx]
+
+        for fidx in range(n_fort19):
+            if int(wing_type_codes[fidx]) != normal_code:
+                continue
+
+            pop_val = pop_vals[depth_idx, fidx]
+            if pop_val <= 0.0:
+                continue
+
+            boltz = boltz_vals[depth_idx, fidx]
+            line_wavelength = wavelength_vacuum[fidx]
+            doppler_width = doppler_vals[depth_idx, fidx]
+            if line_wavelength <= 0.0 or doppler_width <= 0.0:
+                continue
+
+            dopple = doppler_width / line_wavelength
+            if dopple <= 0.0:
+                continue
+
+            xnfdop = pop_val / (rho * dopple)
+            kappa0_pre = oscillator_strength[fidx] * xnfdop
+
+            center_idx = int(center_indices[fidx])
+            clamped_center = max(0, min(center_idx, n_wavelengths - 1))
+            kapmin = continuum[depth_idx, clamped_center] * cutoff
+            if kappa0_pre < kapmin:
+                continue
+
+            kappa0 = kappa0_pre * boltz
+            if kappa0 < kapmin:
+                continue
+
+            gamma_total = (
+                gamma_rad[fidx]
+                + gamma_stark[fidx] * xne
+                + gamma_vdw[fidx] * txnxn
+            )
+            adamp = gamma_total / dopple if dopple > 0.0 else 0.0
+
+            if adamp < 0.2:
+                kapcen = kappa0 * (1.0 - 1.128 * adamp)
+            else:
+                kapcen = kappa0 * _voigt_profile_jit(0.0, adamp, h0tab, h1tab, h2tab)
+
+            if kapcen >= kapmin:
+                center_buffer[depth_idx, clamped_center] += kapcen
+
+            normal_valid[depth_idx, fidx] = True
+            kappa0_out[depth_idx, fidx] = kappa0
+            adamp_out[depth_idx, fidx] = max(adamp, 1e-12)
+            doppler_width_out[depth_idx, fidx] = doppler_width
+
+
 def _add_fort19_asynth(
     asynth: np.ndarray,
     stim: np.ndarray,
@@ -1499,9 +1775,93 @@ def _add_fort19_asynth(
 
     # Precompute fort19 center indices on the current wavelength grid
     fort19_centers = _nearest_grid_indices(wavelength, fort19_data.wavelength_vacuum)
+    n_fort19 = len(fort19_indices)
+    n_depths = atm.layers
+
+    # Build dense per-record arrays once; numeric kernel handles NORMAL branch.
+    wing_codes = np.zeros(n_fort19, dtype=np.int32)
+    cat_idx_arr = np.full(n_fort19, -1, dtype=np.int32)
+    for fidx in fort19_indices:
+        wing_val = fort19_data.wing_type[fidx]
+        if isinstance(wing_val, fort19_io.Fort19WingType):
+            wing_codes[fidx] = int(wing_val.value)
+        else:
+            wing_codes[fidx] = int(wing_val)
+        cat_idx = fort19_to_catalog.get(int(fidx))
+        if cat_idx is not None:
+            cat_idx_arr[fidx] = int(cat_idx)
+
+    pop_vals = np.zeros((n_depths, n_fort19), dtype=np.float64)
+    boltz_vals = np.zeros((n_depths, n_fort19), dtype=np.float64)
+    doppler_vals = np.zeros((n_depths, n_fort19), dtype=np.float64)
+    for fidx in fort19_indices:
+        cat_idx = int(cat_idx_arr[fidx])
+        if cat_idx < 0:
+            continue
+        record = catalog.records[cat_idx]
+        element_idx = _element_atomic_number(str(record.element))
+        if element_idx is None:
+            continue
+        element_idx -= 1
+        ion_stage = int(record.ion_stage)
+        if ion_stage <= 0:
+            continue
+        for depth_idx in range(n_depths):
+            pop_val = atm.population_per_ion[depth_idx, ion_stage - 1, element_idx]
+            if pop_val <= 0.0:
+                continue
+            if cat_idx >= pops.layers[depth_idx].doppler_width.size:
+                continue
+            pop_vals[depth_idx, fidx] = float(pop_val)
+            boltz_vals[depth_idx, fidx] = float(pops.layers[depth_idx].boltzmann_factor[cat_idx])
+            doppler_vals[depth_idx, fidx] = float(pops.layers[depth_idx].doppler_width[cat_idx])
+
+    if atm.txnxn is not None:
+        txnxn_vals = np.asarray(atm.txnxn, dtype=np.float64)
+    else:
+        txnxn_vals = np.zeros(n_depths, dtype=np.float64)
+        for depth_idx in range(n_depths):
+            xh = float(atm.xnf_h[depth_idx]) if atm.xnf_h is not None else 0.0
+            xhe = float(atm.xnf_he1[depth_idx]) if atm.xnf_he1 is not None else 0.0
+            xh2 = float(atm.xnf_h2[depth_idx]) if atm.xnf_h2 is not None else 0.0
+            txnxn_vals[depth_idx] = (xh + 0.42 * xhe + 0.85 * xh2) * (
+                atm.temperature[depth_idx] / 10_000.0
+            ) ** 0.3
+    center_buffer = np.zeros((n_depths, wavelength.size), dtype=np.float64)
+    normal_valid = np.zeros((n_depths, n_fort19), dtype=np.bool_)
+    normal_kappa0 = np.zeros((n_depths, n_fort19), dtype=np.float64)
+    normal_adamp = np.zeros((n_depths, n_fort19), dtype=np.float64)
+    normal_doppler = np.zeros((n_depths, n_fort19), dtype=np.float64)
+    voigt_tbl = tables.voigt_tables()
+    _prepare_fort19_normal_kernel(
+        center_buffer,
+        normal_valid,
+        normal_kappa0,
+        normal_adamp,
+        normal_doppler,
+        wing_codes,
+        fort19_centers.astype(np.int64),
+        np.asarray(fort19_data.wavelength_vacuum, dtype=np.float64),
+        np.asarray(fort19_data.oscillator_strength, dtype=np.float64),
+        np.asarray(fort19_data.gamma_rad, dtype=np.float64),
+        np.asarray(fort19_data.gamma_stark, dtype=np.float64),
+        np.asarray(fort19_data.gamma_vdw, dtype=np.float64),
+        pop_vals,
+        boltz_vals,
+        doppler_vals,
+        np.asarray(atm.mass_density, dtype=np.float64),
+        np.asarray(atm.electron_density, dtype=np.float64),
+        txnxn_vals,
+        np.asarray(continuum, dtype=np.float64),
+        cutoff,
+        int(fort19_io.Fort19WingType.NORMAL.value),
+        voigt_tbl.h0tab,
+        voigt_tbl.h1tab,
+        voigt_tbl.h2tab,
+    )
 
     for depth_idx in range(atm.layers):
-        tmp_buffer = np.zeros_like(wavelength, dtype=np.float64)
+        tmp_buffer = center_buffer[depth_idx].copy()
         for fidx in fort19_indices:
             wing_val = fort19_data.wing_type[fidx]
             if isinstance(wing_val, fort19_io.Fort19WingType):
@@ -1544,48 +1904,11 @@ def _add_fort19_asynth(
                 continue
 
             if wing_type == fort19_io.Fort19WingType.NORMAL:
-                rho = (
-                    float(atm.mass_density[depth_idx])
-                    if atm.mass_density is not None
-                    else 0.0
-                )
-                if rho <= 0.0:
+                if not normal_valid[depth_idx, fidx]:
                     continue
-                if cat_idx >= pops.layers[depth_idx].doppler_width.size:
-                    continue
-                doppler_width = float(pops.layers[depth_idx].doppler_width[cat_idx])
-                if line_wavelength <= 0.0 or doppler_width <= 0.0:
-                    continue
-                dopple = doppler_width / line_wavelength
-                if dopple <= 0.0:
-                    continue
-                xnfdop = pop_val / (rho * dopple)
-                cgf = float(fort19_data.oscillator_strength[fidx])
-                kappa0_pre = cgf * xnfdop
-
-                clamped_center = max(0, min(center_index, wavelength.size - 1))
-                kapmin = float(continuum[depth_idx, clamped_center]) * cutoff
-                if kappa0_pre < kapmin:
-                    continue
-
-                kappa0 = kappa0_pre * boltz
-                if kappa0 < kapmin:
-                    continue
-
-                depth_state = pops.layers[depth_idx]
-                gamma_total = (
-                    float(fort19_data.gamma_rad[fidx])
-                    + float(fort19_data.gamma_stark[fidx])
-                    * float(depth_state.electron_density)
-                    + float(fort19_data.gamma_vdw[fidx]) * float(depth_state.txnxn)
-                )
-                adamp = gamma_total / dopple if dopple > 0.0 else 0.0
-                if adamp < 0.2:
-                    kapcen = kappa0 * (1.0 - 1.128 * adamp)
-                else:
-                    kapcen = kappa0 * voigt_profile(0.0, adamp)
-                if kapcen >= kapmin:
-                    tmp_buffer[clamped_center] += kapcen
+                kappa0 = normal_kappa0[depth_idx, fidx]
+                adamp = normal_adamp[depth_idx, fidx]
+                doppler_width = normal_doppler[depth_idx, fidx]
 
                 ncon = int(fort19_data.continuum_index[fidx])
                 nelionx = int(fort19_data.element_index[fidx])
@@ -1906,6 +2229,264 @@ def _compute_hydrogen_line_opacity(
     line_types = catalog.line_types if catalog.line_types is not None else None
     n_lower_arr = catalog.n_lower if catalog.n_lower is not None else None
     n_upper_arr = catalog.n_upper if catalog.n_upper is not None else None
+
+    # ── JIT-accelerated path (Numba depth-parallel) ──────────────────────────
+    _use_hyd_jit = os.getenv("PY_HYD_JIT", "1") != "0"
+    if _use_hyd_jit:
+        try:
+            from ..physics.hydrogen_jit import compute_hydrogen_opacity_jit, _E1_TABLE as _HYD_E1_TABLE
+
+            MAX_FINE = 16  # max fine-structure components (actual max is 14)
+
+            # 1. Pre-filter H lines and precompute line-level geometry
+            h_cat_indices: list = []
+            h_wavelengths_list: list = []
+            h_cgf_list: list = []
+            h_center_idx_list: list = []
+            h_n_lower_list: list = []
+            h_n_upper_list: list = []
+            h_conth_val_list: list = []
+            h_wshift_list: list = []
+            h_redcut_list: list = []
+            h_bluecut_list: list = []
+            h_wlminus1_list: list = []
+            h_wlminus2_list: list = []
+            h_wlplus1_list: list = []
+            h_wlplus2_list: list = []
+
+            for line_idx, record in enumerate(catalog.records):
+                lt = int(line_types[line_idx]) if line_types is not None else record.line_type
+                if lt not in {-1, -2}:
+                    continue
+                if record.ion_stage != 1:
+                    continue
+
+                line_wavelength = float(record.wavelength)
+                center_idx = int(center_indices[line_idx])
+                gf_linear = float(catalog.gf[line_idx])
+                freq_hz = C_LIGHT_NM / line_wavelength
+                cgf = None
+                if record.metadata:
+                    cgf = record.metadata.get("cgf")
+                if cgf is None or cgf <= 0.0:
+                    cgf = CGF_CONSTANT * gf_linear / freq_hz
+
+                nl = (
+                    int(n_lower_arr[line_idx])
+                    if n_lower_arr is not None
+                    else max(record.n_lower, 1)
+                )
+                nu = (
+                    int(n_upper_arr[line_idx])
+                    if n_upper_arr is not None
+                    else max(record.n_upper, nl + 1)
+                )
+                nl_eff = max(nl, 1)
+                nu_eff = max(nu, nl_eff + 1)
+
+                ehyd_lower = _ehyd_cm(nl_eff)
+                wlminus1 = (
+                    1.0e7 / (_ehyd_cm(nu_eff - 1) - ehyd_lower)
+                    if nu_eff - 1 > nl_eff
+                    else line_wavelength
+                )
+                wlminus2 = (
+                    1.0e7 / (_ehyd_cm(nu_eff - 2) - ehyd_lower)
+                    if nu_eff - 2 > nl_eff
+                    else line_wavelength
+                )
+                wlplus1 = 1.0e7 / (_ehyd_cm(nu_eff + 1) - ehyd_lower)
+                wlplus2 = 1.0e7 / (_ehyd_cm(nu_eff + 2) - ehyd_lower)
+                redcut = 1.0e7 / (
+                    conth[0] - _HYD_RYD_CM / (float(nu_eff) - 0.8) ** 2 - ehyd_lower
+                )
+                bluecut = 1.0e7 / (
+                    conth[0] - _HYD_RYD_CM / (float(nu_eff) + 0.8) ** 2 - ehyd_lower
+                )
+                ncon_idx = max(1, min(nl_eff, conth.size)) - 1
+                conth_val = float(conth[ncon_idx])
+                wshift = 1.0e7 / (conth_val - _HYD_RYD_CM / 81.0 ** 2)
+
+                h_cat_indices.append(line_idx)
+                h_wavelengths_list.append(line_wavelength)
+                h_cgf_list.append(float(cgf))
+                h_center_idx_list.append(center_idx)
+                h_n_lower_list.append(nl_eff)
+                h_n_upper_list.append(nu_eff)
+                h_conth_val_list.append(conth_val)
+                h_wshift_list.append(wshift)
+                h_redcut_list.append(redcut)
+                h_bluecut_list.append(bluecut)
+                h_wlminus1_list.append(wlminus1)
+                h_wlminus2_list.append(wlminus2)
+                h_wlplus1_list.append(wlplus1)
+                h_wlplus2_list.append(wlplus2)
+
+            n_h_lines = len(h_cat_indices)
+            logging.getLogger(__name__).info(
+                "Hydrogen JIT: %d H-wing lines found in catalog", n_h_lines
+            )
+
+            if n_h_lines == 0:
+                return ahline
+
+            # 2. Convert line-level lists to NumPy arrays
+            h_cat_indices_np = np.asarray(h_cat_indices, dtype=np.int32)
+            h_n_lower_jit = np.asarray(h_n_lower_list, dtype=np.int32)
+            h_n_upper_jit = np.asarray(h_n_upper_list, dtype=np.int32)
+            h_wavelengths_jit = np.asarray(h_wavelengths_list, dtype=np.float64)
+            h_cgf_jit = np.asarray(h_cgf_list, dtype=np.float64)
+            h_center_jit = np.asarray(h_center_idx_list, dtype=np.int32)
+            h_conth_val_jit = np.asarray(h_conth_val_list, dtype=np.float64)
+            h_wshift_jit = np.asarray(h_wshift_list, dtype=np.float64)
+            h_redcut_jit = np.asarray(h_redcut_list, dtype=np.float64)
+            h_bluecut_jit = np.asarray(h_bluecut_list, dtype=np.float64)
+            h_wlminus1_jit = np.asarray(h_wlminus1_list, dtype=np.float64)
+            h_wlminus2_jit = np.asarray(h_wlminus2_list, dtype=np.float64)
+            h_wlplus1_jit = np.asarray(h_wlplus1_list, dtype=np.float64)
+            h_wlplus2_jit = np.asarray(h_wlplus2_list, dtype=np.float64)
+
+            # 3. Fine structure per H line (padded to MAX_FINE)
+            h_fine_offsets_jit = np.zeros((n_h_lines, MAX_FINE), dtype=np.float64)
+            h_fine_weights_jit = np.zeros((n_h_lines, MAX_FINE), dtype=np.float64)
+            h_n_fine_jit = np.zeros(n_h_lines, dtype=np.int32)
+            for hi, (nl_val, nu_val) in enumerate(zip(h_n_lower_list, h_n_upper_list)):
+                offsets, weights = _fine_structure_cached(nl_val, nu_val)
+                nf = min(len(offsets), MAX_FINE)
+                h_n_fine_jit[hi] = nf
+                h_fine_offsets_jit[hi, :nf] = offsets[:nf]
+                h_fine_weights_jit[hi, :nf] = weights[:nf]
+
+            # 4. Per-depth HydrogenDepthState fields → 1D arrays indexed [depth_idx]
+            t3nhe_jit = np.zeros(n_depths, dtype=np.float64)
+            t3nh2_jit = np.zeros(n_depths, dtype=np.float64)
+            fo_jit = np.zeros(n_depths, dtype=np.float64)
+            dopph_jit = np.zeros(n_depths, dtype=np.float64)
+            c1d_jit = np.zeros(n_depths, dtype=np.float64)
+            c2d_jit = np.zeros(n_depths, dtype=np.float64)
+            y1s_jit = np.zeros(n_depths, dtype=np.float64)
+            y1b_jit = np.zeros(n_depths, dtype=np.float64)
+            gcon1_jit = np.zeros(n_depths, dtype=np.float64)
+            gcon2_jit = np.zeros(n_depths, dtype=np.float64)
+            pp_jit = np.zeros(n_depths, dtype=np.float64)
+            xnfph_0_jit = np.zeros(n_depths, dtype=np.float64)
+            xnfph_1_jit = np.zeros(n_depths, dtype=np.float64)
+            elec_jit = np.zeros(n_depths, dtype=np.float64)
+
+            use_micro = microturb_kms > 0.0
+            micro_dop = (microturb_kms / C_LIGHT_KM) if use_micro else 0.0
+
+            for di, depth_state in layers.items():
+                hyd = depth_state.hydrogen
+                if hyd is not None:
+                    t3nhe_jit[di] = hyd.t3nhe
+                    t3nh2_jit[di] = hyd.t3nh2
+                    fo_jit[di] = hyd.fo
+                    dp = hyd.dopph
+                    if use_micro:
+                        dp = math.sqrt(dp * dp + micro_dop * micro_dop)
+                    dopph_jit[di] = dp
+                    c1d_jit[di] = hyd.c1d
+                    c2d_jit[di] = hyd.c2d
+                    y1s_jit[di] = hyd.y1s
+                    y1b_jit[di] = hyd.y1b
+                    gcon1_jit[di] = hyd.gcon1
+                    gcon2_jit[di] = hyd.gcon2
+                    pp_jit[di] = hyd.pp
+                    xnfph_0_jit[di] = float(hyd.xnfph[0]) if hyd.xnfph.size > 0 else 0.0
+                    xnfph_1_jit[di] = float(hyd.xnfph[1]) if hyd.xnfph.size > 1 else 0.0
+                elec_jit[di] = depth_state.electron_density
+
+            # 5. Boltzmann factors (n_depths, n_h_lines) – precomputed
+            boltz_h_jit = np.ones((n_depths, n_h_lines), dtype=np.float64)
+            for di, depth_state in layers.items():
+                bf = depth_state.boltzmann_factor
+                for hi, cat_idx in enumerate(h_cat_indices):
+                    if cat_idx < bf.shape[0]:
+                        boltz_h_jit[di, hi] = bf[cat_idx]
+
+            # 6. Per-depth pop/dop (ground-state H, ion_stage index 0) and rho
+            pop_1d = np.asarray(pop_densities[:, 0], dtype=np.float64)
+            dop_1d = np.asarray(dop_velocity[:, 0], dtype=np.float64)
+            if use_micro:
+                dop_1d = np.sqrt(dop_1d ** 2 + micro_dop ** 2)
+            rho_1d = np.asarray(mass_density, dtype=np.float64)
+
+            # 7. Tables
+            htab = _hydrogen_tables()
+
+            # 8. stim (always 2D; use ones if not provided)
+            if stim is not None:
+                stim_2d = np.ascontiguousarray(stim, dtype=np.float64)
+            else:
+                stim_2d = np.ones((n_depths, wavelength_grid.size), dtype=np.float64)
+
+            # 9. Call the depth-parallel JIT kernel
+            compute_hydrogen_opacity_jit(
+                h_n_lower_jit,
+                h_n_upper_jit,
+                h_center_jit,
+                h_wavelengths_jit,
+                h_cgf_jit,
+                h_wshift_jit,
+                h_redcut_jit,
+                h_bluecut_jit,
+                h_wlminus1_jit,
+                h_wlminus2_jit,
+                h_wlplus1_jit,
+                h_wlplus2_jit,
+                h_conth_val_jit,
+                np.ascontiguousarray(h_fine_offsets_jit),
+                np.ascontiguousarray(h_fine_weights_jit),
+                h_n_fine_jit,
+                pop_1d,
+                dop_1d,
+                rho_1d,
+                np.ascontiguousarray(emerge_h, dtype=np.float64),
+                np.ascontiguousarray(boltz_h_jit),
+                np.ascontiguousarray(elec_jit),
+                np.ascontiguousarray(t3nhe_jit),
+                np.ascontiguousarray(t3nh2_jit),
+                np.ascontiguousarray(fo_jit),
+                np.ascontiguousarray(dopph_jit),
+                np.ascontiguousarray(c1d_jit),
+                np.ascontiguousarray(c2d_jit),
+                np.ascontiguousarray(y1s_jit),
+                np.ascontiguousarray(y1b_jit),
+                np.ascontiguousarray(gcon1_jit),
+                np.ascontiguousarray(gcon2_jit),
+                np.ascontiguousarray(pp_jit),
+                np.ascontiguousarray(xnfph_0_jit),
+                np.ascontiguousarray(xnfph_1_jit),
+                np.ascontiguousarray(wavelength_grid),
+                np.ascontiguousarray(continuum),
+                stim_2d,
+                float(cutoff),
+                np.ascontiguousarray(htab.asum),
+                np.ascontiguousarray(htab.asum_lyman),
+                np.ascontiguousarray(htab.y1wtm),
+                np.ascontiguousarray(htab.xknmtb),
+                np.ascontiguousarray(htab.propbm),
+                np.ascontiguousarray(htab.c),
+                np.ascontiguousarray(htab.d),
+                np.ascontiguousarray(htab.pp),
+                np.ascontiguousarray(htab.beta),
+                np.ascontiguousarray(htab.cutoff_h2_plus),
+                np.ascontiguousarray(htab.cutoff_h2),
+                np.ascontiguousarray(_HYD_E1_TABLE),
+                ahline,
+            )
+            return ahline
+
+        except Exception as _jit_exc:
+            logging.getLogger(__name__).warning(
+                "Hydrogen JIT path failed (%s); falling back to pure Python.", _jit_exc
+            )
+            ahline[:] = 0.0
+
+    # ── Pure-Python fallback path ─────────────────────────────────────────────
+    use_micro = microturb_kms > 0.0
+    micro_dop = (microturb_kms / C_LIGHT_KM) if use_micro else 0.0
 
     for line_idx, record in enumerate(catalog.records):
         line_type = (
@@ -2325,17 +2906,27 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
     if cfg.line_data.molecular_line_dirs:
         from pathlib import Path as _Path
         import glob as _glob
+        # All .dat/.asc files in the molecules directory are compiled into
+        # tfort.12 by kurucz.py (via rmolecasc.exe) and must be included here too.
+        # alopatrascu.asc (CODE=813, NELION=324) IS the same Patrascu AlO list
+        # that Fortran compiled into tfort.12 — it is not excluded.
+        _MOL_FORTRAN_EXCLUDE: frozenset = frozenset()
         all_mol_files: list = []
         for mol_dir in cfg.line_data.molecular_line_dirs:
             mol_dir = _Path(mol_dir)
             for ext in ("*.dat", "*.asc"):
-                all_mol_files.extend(sorted(mol_dir.glob(ext)))
-            # Also include ASCII molecular files in known subdirectories
-            # (e.g. vo/voax.asc, vo/vobx.asc, vo/vocx.asc which Fortran kurucz.py
-            # explicitly processes via rmolecasc.exe from their subdirectory paths)
+                all_mol_files.extend(
+                    f for f in sorted(mol_dir.glob(ext))
+                    if f.name not in _MOL_FORTRAN_EXCLUDE
+                )
+            # Also include ASCII molecular files in the vo/ subdirectory
+            # (voax.asc, vobx.asc, vocx.asc — kurucz.py processes these via rmolecasc.exe)
             for subdir in ("vo",):
                 for ext in ("*.dat", "*.asc"):
-                    all_mol_files.extend(sorted((mol_dir / subdir).glob(ext)))
+                    all_mol_files.extend(
+                        f for f in sorted((mol_dir / subdir).glob(ext))
+                        if f.name not in _MOL_FORTRAN_EXCLUDE
+                    )
         if all_mol_files:
             logger.info("Compiling molecular ASCII line lists: %d files", len(all_mol_files))
             t_mol = time.perf_counter()
@@ -2375,6 +2966,7 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                 wlbeg=cfg.wavelength_grid.start,
                 wlend=cfg.wavelength_grid.end,
                 resolution=cfg.wavelength_grid.resolution,
+                ifvac=1,  # Match Fortran IFVAC=1 (vacuum wavelengths) from tfort.93
             )
             mol_dicts.append(tio_d)
             logger.info(
@@ -2406,6 +2998,7 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                 wlbeg=cfg.wavelength_grid.start,
                 wlend=cfg.wavelength_grid.end,
                 resolution=cfg.wavelength_grid.resolution,
+                ifvac=1,  # Match Fortran IFVAC=1 (vacuum wavelengths) from tfort.93
             )
             mol_dicts.append(h2o_d)
             logger.info(
@@ -2647,9 +3240,6 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
         # lines 286-326: pre-compute PROFILE, unconditional wing addition).
         if mol_dicts:
             from ..physics import mol_populations as _mol_pops
-            from ..physics.line_opacity import (
-                _compute_transp_numba_kernel,
-            )
             import math as _math
 
             _ratio = 1.0 + 1.0 / cfg.wavelength_grid.resolution
@@ -2709,6 +3299,26 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                         pop_arr[:, 5, elem_idx] = xnfpmol_vals
                         dop_arr[:, 5, elem_idx] = dopple_dict[nelion]
 
+                # Match Fortran synthe.for line 225:
+                #   DO 205 NELION=1,mw6
+                #   QDOPPLE(NELION)=SQRT(QDOPPLE(NELION)**2+(TURBV/299792.458D0)**2)
+                # synthe.for applies this to ALL NELION (atomic and molecular) after
+                # reading QDOPPLE from fort.10 (which already includes depth-dependent
+                # VTURB from xnfpelsyn.for).  For molecular species, xnfpelsyn.for
+                # stores DOPPLE = sqrt(2kT/M + VTURB_atm^2)/c, so the final molecular
+                # DOPPLE used in SYNTHE is sqrt(thermal^2 + VTURB_atm^2 + TURBV_deck^2)/c.
+                # Python's _accumulate_mol_fused_batch does NOT add micro, so we must
+                # apply it here to dop_arr before the kernel reads it.
+                _micro_frac = cfg.wavelength_grid.velocity_microturb / C_LIGHT_KM
+                if _micro_frac > 0.0:
+                    for _nelion in xnfpmol_dict:
+                        _nelem = _nelion // 6
+                        _eidx = _nelem - 1
+                        if 0 <= _eidx < max_elem:
+                            dop_arr[:, 5, _eidx] = np.sqrt(
+                                dop_arr[:, 5, _eidx] ** 2 + _micro_frac ** 2
+                            )
+
                 atm.population_per_ion = pop_arr
                 atm.doppler_per_ion = dop_arr
 
@@ -2717,10 +3327,7 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                 mol_element_idx = np.array(
                     [int(n) // 6 - 1 for n in mol_nelion_raw], dtype=np.int64
                 )
-                mol_ion_stage = np.full(n_mol_lines, 6, dtype=np.int64)
-                mol_line_type = np.zeros(n_mol_lines, dtype=np.int64)
                 mol_cgf = np.asarray(combined_mol["cgf"], dtype=np.float64)
-                mol_gf = np.zeros(n_mol_lines, dtype=np.float64)
                 mol_gamma_rad = np.asarray(combined_mol["gamma_rad"], dtype=np.float64)
                 mol_gamma_stark = np.asarray(combined_mol["gamma_stark"], dtype=np.float64)
                 mol_gamma_vdw = np.asarray(combined_mol["gamma_vdw"], dtype=np.float64)
@@ -2741,135 +3348,85 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                 # correctly places each line (positive = in grid, negative = below grid by |idx| bins).
                 mol_center_indices = (mol_nbuff.astype(np.int64) - 1)
 
-                # Boltzmann factors: exp(-E_lower * hckt) per depth
+                # Pre-compute shared per-depth arrays used by every chunk
                 _hckt_arr = np.asarray(
                     atm.hckt if atm.hckt is not None else 1.4388 / atm.temperature,
                     dtype=np.float64,
                 )
-                mol_boltzmann = np.zeros((atm.layers, n_mol_lines), dtype=np.float64)
-                for d_idx in range(atm.layers):
-                    mol_boltzmann[d_idx, :] = np.exp(-mol_elo_cm * _hckt_arr[d_idx])
-
-                mol_process_mask = np.ones(n_mol_lines, dtype=np.bool_)
-
-                # TXNXN: perturber density for van der Waals broadening
                 _txnxn = np.zeros(atm.layers, dtype=np.float64)
                 if atm.txnxn is not None:
                     _txnxn = np.asarray(atm.txnxn, dtype=np.float64)
                 else:
                     for d_idx in range(atm.layers):
-                        _xh = float(atm.xnf_h[d_idx]) if atm.xnf_h is not None else 0.0
-                        _xhe = float(atm.xnf_he1[d_idx]) if atm.xnf_he1 is not None else 0.0
-                        _xh2 = float(atm.xnf_h2[d_idx]) if atm.xnf_h2 is not None else 0.0
+                        _xh  = float(atm.xnf_h[d_idx])   if atm.xnf_h   is not None else 0.0
+                        _xhe = float(atm.xnf_he1[d_idx])  if atm.xnf_he1 is not None else 0.0
+                        _xh2 = float(atm.xnf_h2[d_idx])   if atm.xnf_h2  is not None else 0.0
                         _txnxn[d_idx] = (_xh + 0.42 * _xhe + 0.85 * _xh2) * (atm.temperature[d_idx] / 10_000.0) ** 0.3
-
                 voigt_tbl = tables.voigt_tables()
+                n_wl = len(wavelength)
+                t_mol_asynth = time.perf_counter()
+                cont_arr = np.asarray(cont_kapmin, dtype=np.float64)
+                mass_density_arr = np.asarray(atm.mass_density, dtype=np.float64)
+                electron_density_arr = np.asarray(atm.electron_density, dtype=np.float64)
 
-                # --- Run TRANSP kernel for molecular lines ---
+                # Boltzmann, TRANSP, and ASYNTH are computed in chunks to avoid
+                # allocating (60M × 80) float64 arrays that would OOM for large
+                # molecular catalogs (TiO 35M + H2O 12M + ASCII 12M = 60M lines).
+                _MOL_CHUNK = 500_000  # lines per chunk; each chunk ~1.6 GB peak
+                mol_asynth = np.zeros((atm.layers, n_wl), dtype=np.float64)
+                n_valid = 0
                 t_mol_transp = time.perf_counter()
-                mol_transp = np.zeros((n_mol_lines, atm.layers), dtype=np.float64)
-                mol_valid_mask = np.zeros((n_mol_lines, atm.layers), dtype=np.bool_)
+                n_chunks = (n_mol_lines + _MOL_CHUNK - 1) // _MOL_CHUNK
 
-                _compute_transp_numba_kernel(
-                    mol_transp, mol_valid_mask, mol_process_mask,
-                    mol_element_idx, mol_ion_stage, mol_line_type,
-                    mol_wavelength, mol_gf, mol_cgf,
-                    mol_gamma_rad, mol_gamma_stark, mol_gamma_vdw,
-                    mol_center_indices,
-                    np.zeros(n_mol_lines, dtype=np.int64),
-                    mol_boltzmann,
-                    pop_arr, dop_arr,
-                    np.asarray(atm.mass_density, dtype=np.float64),
-                    np.asarray(atm.electron_density, dtype=np.float64),
-                    _txnxn,
-                    np.asarray(cont_kapmin, dtype=np.float64),
-                    np.zeros((0, 0), dtype=np.float64),
-                    len(wavelength),
-                    cfg.cutoff,
-                    cfg.wavelength_grid.velocity_microturb,
-                    C_LIGHT_KM,
-                    voigt_tbl.h0tab, voigt_tbl.h1tab, voigt_tbl.h2tab,
-                )
-                n_valid = int(np.sum(mol_valid_mask))
+                for _chunk_idx, _chunk_start in enumerate(range(0, n_mol_lines, _MOL_CHUNK)):
+                    if _chunk_idx % 10 == 0:
+                        logger.info(
+                            "Molecular chunk %d/%d (%.1f%%)",
+                            _chunk_idx + 1,
+                            n_chunks,
+                            100.0 * float(_chunk_idx + 1) / float(max(n_chunks, 1)),
+                        )
+                    _chunk_end = min(_chunk_start + _MOL_CHUNK, n_mol_lines)
+                    _cs = slice(_chunk_start, _chunk_end)
+
+                    c_element_idx     = mol_element_idx[_cs]
+                    c_wavelength      = mol_wavelength[_cs]
+                    c_cgf             = mol_cgf[_cs]
+                    c_gamma_rad       = mol_gamma_rad[_cs]
+                    c_gamma_stark     = mol_gamma_stark[_cs]
+                    c_gamma_vdw       = mol_gamma_vdw[_cs]
+                    c_center_indices  = mol_center_indices[_cs]
+                    c_elo_cm          = mol_elo_cm[_cs]
+                    c_valid_counts = np.zeros(atm.layers, dtype=np.int64)
+                    _accumulate_mol_fused_batch(
+                        mol_asynth,
+                        c_valid_counts,
+                        cont_arr,
+                        wavelength,
+                        c_center_indices.astype(np.int64),
+                        c_wavelength,
+                        c_element_idx,
+                        c_cgf,
+                        c_elo_cm,
+                        c_gamma_rad,
+                        c_gamma_stark,
+                        c_gamma_vdw,
+                        pop_arr,
+                        dop_arr,
+                        mass_density_arr,
+                        electron_density_arr,
+                        _txnxn,
+                        _hckt_arr,
+                        cfg.cutoff,
+                        int(MAX_PROFILE_STEPS),
+                        voigt_tbl.h0tab, voigt_tbl.h1tab, voigt_tbl.h2tab,
+                    )
+                    n_valid += int(np.sum(c_valid_counts))
+
                 logger.info(
                     "Molecular TRANSP: %d/%d valid line-depth pairs (%.2fs)",
                     n_valid, n_mol_lines * atm.layers,
                     time.perf_counter() - t_mol_transp,
-                )
-
-                # --- Accumulate center + wing contributions into mol_asynth ---
-                t_mol_asynth = time.perf_counter()
-                n_wl = len(wavelength)
-                mol_asynth = np.zeros((atm.layers, n_wl), dtype=np.float64)
-
-                # Center contributions
-                for li in range(n_mol_lines):
-                    ci = int(mol_center_indices[li])
-                    if 0 <= ci < n_wl:
-                        for di in range(atm.layers):
-                            if mol_valid_mask[li, di]:
-                                mol_asynth[di, ci] += mol_transp[li, di]
-
-                # Wing contributions: Fortran fort.12 symmetric wing loop
-                # (synthe.for lines 286-326): pre-compute PROFILE array,
-                # then add wings unconditionally with no per-step cutoff.
-                # Uses _accumulate_metal_profile_kernel which matches this path exactly.
-                mol_kappa0 = np.zeros((n_mol_lines, atm.layers), dtype=np.float64)
-                mol_adamp = np.zeros((n_mol_lines, atm.layers), dtype=np.float64)
-                mol_doppler_widths = np.zeros((n_mol_lines, atm.layers), dtype=np.float64)
-
-                for li in range(n_mol_lines):
-                    ei = int(mol_element_idx[li])
-                    if ei < 0 or ei >= max_elem:
-                        continue
-                    wl_li = mol_wavelength[li]
-
-                    for di in range(atm.layers):
-                        if not mol_valid_mask[li, di]:
-                            continue
-                        dop_val = dop_arr[di, 5, ei]
-                        mol_doppler_widths[li, di] = dop_val * wl_li
-
-                        xne = atm.electron_density[di]
-                        adamp_val = (
-                            mol_gamma_rad[li]
-                            + mol_gamma_stark[li] * xne
-                            + mol_gamma_vdw[li] * _txnxn[di]
-                        )
-                        # Fortran synthe.for line 274: ADAMP = gamma / DOPPLE(NELION)
-                        # DOPPLE is dimensionless v/c, not doppler_width in nm.
-                        # dop_val (already fetched above) is the correct dimensionless quantity.
-                        if dop_val > 0:
-                            adamp_val /= dop_val
-                        mol_adamp[li, di] = max(adamp_val, 1e-12)
-
-                        # Recover kappa0 from transp = kappa0 * voigt_center
-                        tv = mol_transp[li, di]
-                        ad = mol_adamp[li, di]
-                        if ad < 0.2:
-                            vc = 1.0 - 1.128 * ad
-                        else:
-                            from ..physics.profiles.voigt import voigt_profile as _vp
-                            vc = _vp(0.0, ad)
-                        mol_kappa0[li, di] = tv / vc if vc > 0 else tv
-
-                # Accumulate molecular wings using the Fortran fort.12 path:
-                # KAPMIN evaluated at line CENTER; wings added unconditionally
-                # (no per-step cutoff). _accumulate_mol_wings_batch parallelizes
-                # over depths and processes all lines in a single JIT call.
-                _accumulate_mol_wings_batch(
-                    mol_asynth,
-                    np.asarray(cont_kapmin, dtype=np.float64),
-                    wavelength,
-                    mol_center_indices.astype(np.int64),
-                    mol_wavelength,
-                    mol_kappa0,
-                    mol_adamp,
-                    mol_doppler_widths,
-                    mol_valid_mask,
-                    cfg.cutoff,
-                    int(MAX_PROFILE_STEPS),
-                    voigt_tbl.h0tab, voigt_tbl.h1tab, voigt_tbl.h2tab,
                 )
 
                 # Apply per-wavelength-bin STIM (Fortran synthe.for line 368)
@@ -2884,7 +3441,6 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                     float(np.max(mol_asynth)),
                     time.perf_counter() - t_mol_asynth,
                 )
-
         # --- Stage 4 dump: ASYNTH (full line opacity with wings) ---
         if _stage_dump_path is not None:
             np.savez(
@@ -4044,42 +4600,188 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
         if helium_line_ids is None or helium_line_ids.size == 0:
             logger.info("No helium wing lines found; skipping helium wings.")
         else:
-            logger.info("Computing helium wings (helium-only pass, inline)...")
+            logger.info("Computing helium wings (batch parallel pass)...")
             start_time = time.time()
-            helium_lines_processed = 0
-            helium_lines_skipped = 0
-            last_log_time = start_time
 
-            helium_progress = os.getenv("PY_HELIUM_PROGRESS", "0") == "1"
-            for depth_idx in range(atm.layers):
-                (
-                    _depth_idx,
-                    _local_wings,
-                    _local_sources,
-                    local_helium_wings,
-                    local_helium_sources,
-                    lines_proc,
-                    lines_skip,
-                ) = process_depth(depth_idx, include_metals=False, include_helium=True)
-                helium_lines_processed += lines_proc
-                helium_lines_skipped += lines_skip
-                helium_wings[depth_idx] += local_helium_wings
-                helium_sources[depth_idx] += local_helium_sources
+            n_he = int(helium_line_ids.size)
+            n_d = int(atm.layers)
+            n_wav = int(wavelength.size)
 
-                if helium_progress and time.time() - last_log_time > 5:
-                    logger.info(
-                        f"Helium wings progress: {depth_idx + 1}/{atm.layers} "
-                        f"({100.0 * (depth_idx + 1) / atm.layers:.1f}%)"
+            he_kappa0_2d = np.zeros((n_d, n_he), dtype=np.float64)
+            he_adamp_2d  = np.zeros((n_d, n_he), dtype=np.float64)
+            he_doppler_2d = np.zeros((n_d, n_he), dtype=np.float64)
+            he_wcon_2d   = np.zeros((n_d, n_he), dtype=np.float64)
+            he_wtail_2d  = np.zeros((n_d, n_he), dtype=np.float64)
+            he_center_idx  = np.zeros(n_he, dtype=np.int64)
+            he_line_wl     = np.zeros(n_he, dtype=np.float64)
+            he_ltc         = np.zeros(n_he, dtype=np.int16)
+
+            rho_arr    = np.asarray(atm.mass_density, dtype=np.float64)
+            ne_arr     = np.asarray(atm.electron_density, dtype=np.float64)
+            txnxn_arr  = np.asarray([pops.layers[d].txnxn for d in range(n_d)], dtype=np.float64)
+
+            _use_atm_pop = (
+                atm.population_per_ion is not None
+                and atm.doppler_per_ion is not None
+            )
+
+            logger.info("Precomputing helium line arrays (%d lines × %d depths)...", n_he, n_d)
+            _precomp_t0 = time.time()
+
+            for le in range(n_he):
+                line_idx = int(helium_line_ids[le])
+                record = catalog.records[line_idx]
+                element_key = str(record.element).strip()
+                line_wavelength = float(catalog.wavelength[line_idx])
+                center_index = int(line_indices[line_idx])
+
+                if center_index < 0 or center_index >= n_wav:
+                    continue  # center outside grid – leave kappa0=0 so batch skips
+
+                nelion = int(record.ion_stage)
+                element_idx_z = _element_atomic_number(element_key)
+
+                if (
+                    _use_atm_pop
+                    and element_idx_z is not None
+                    and element_idx_z - 1 < atm.population_per_ion.shape[2]
+                    and nelion <= atm.population_per_ion.shape[1]
+                ):
+                    pop_d = atm.population_per_ion[:, nelion - 1, element_idx_z - 1]
+                    dop_d = atm.doppler_per_ion[:, nelion - 1, element_idx_z - 1]
+                else:
+                    if element_key not in population_cache:
+                        continue
+                    pop_densities_he, dop_velocity_he = population_cache[element_key]
+                    if nelion > pop_densities_he.shape[1]:
+                        continue
+                    pop_d = pop_densities_he[:, nelion - 1]
+                    dop_d = (
+                        dop_velocity_he[:, nelion - 1]
+                        if dop_velocity_he.ndim == 2
+                        else dop_velocity_he
                     )
-                    last_log_time = time.time()
+
+                valid = (pop_d > 0.0) & (dop_d > 0.0) & (rho_arr > 0.0)
+
+                freq_hz = C_LIGHT_NM / line_wavelength
+                gf_v    = catalog.gf[line_idx]
+                cgf     = CGF_CONSTANT * gf_v / freq_hz
+
+                boltz_d = np.asarray(
+                    [pops.layers[d].boltzmann_factor[line_idx] for d in range(n_d)],
+                    dtype=np.float64,
+                )
+
+                dop_safe = np.maximum(dop_d, 1e-40)
+                xnfdop   = np.where(valid, pop_d / (rho_arr * dop_safe), 0.0)
+                kappa0_pre = cgf * xnfdop
+
+                clamped_ci = max(0, min(center_index, n_wav - 1))
+                kappa_min  = buffers.continuum[:, clamped_ci] * cfg.cutoff  # (n_d,)
+                valid = valid & (kappa0_pre >= kappa_min)
+                kappa0 = kappa0_pre * boltz_d
+                valid = valid & (kappa0 >= kappa_min)
+
+                # line_type_code
+                ltc = int(record_line_type[line_idx])
+                line19_idx_he = None
+                if fort19_data is not None:
+                    line19_idx_he = catalog_to_fort19.get(line_idx)
+                    if line19_idx_he is not None:
+                        ltc = int(fort19_data.line_type[line19_idx_he])
+
+                gamma_rad_v   = catalog.gamma_rad[line_idx]
+                gamma_stark_v = catalog.gamma_stark[line_idx]
+                gamma_vdw_v   = catalog.gamma_vdw[line_idx]
+
+                # txnxn: apply alpha correction per-line if metadata provides it
+                meta_idx_he = catalog_to_meta.get(line_idx) if metadata is not None else None
+                alpha_he = (
+                    float(metadata.extra1[meta_idx_he])
+                    if (metadata is not None and meta_idx_he is not None)
+                    else 0.0
+                )
+                if np.isfinite(alpha_he) and abs(alpha_he) > 1e-8:
+                    atomic_mass_he = _atomic_mass_lookup(record.element)
+                    if atomic_mass_he is not None and atomic_mass_he > 0.0:
+                        v2 = 0.5 * (1.0 - alpha_he)
+                        t_arr = np.asarray(atm.temperature, dtype=np.float64)
+                        h_factor  = (t_arr / 10000.0) ** v2
+                        he_factor = (0.628 * (2.0991e-4 * t_arr * (1.008 / atomic_mass_he))) ** v2
+                        h2_factor = (1.08  * (2.0991e-4 * t_arr * (1.008 / atomic_mass_he))) ** v2
+                        xnfh_v  = np.asarray(atm.xnf_h,   dtype=np.float64) if atm.xnf_h   is not None else np.zeros(n_d)
+                        xnfhe_v = np.asarray(atm.xnf_he1, dtype=np.float64) if atm.xnf_he1 is not None else np.zeros(n_d)
+                        xnfh2_v = np.asarray(atm.xnf_h2,  dtype=np.float64) if atm.xnf_h2  is not None else np.zeros(n_d)
+                        txnxn_line_arr = xnfh_v * h_factor + xnfhe_v * he_factor + xnfh2_v * h2_factor
+                    else:
+                        txnxn_line_arr = txnxn_arr
+                else:
+                    txnxn_line_arr = txnxn_arr
+
+                gamma_total = gamma_rad_v + gamma_stark_v * ne_arr + gamma_vdw_v * txnxn_line_arr
+                adamp_d     = gamma_total / dop_safe  # dopple = dop_val = dop_width / wl
+
+                he_kappa0_2d[:, le]  = np.where(valid, kappa0, 0.0)
+                he_doppler_2d[:, le] = np.where(valid, dop_d * line_wavelength, 0.0)
+                he_adamp_2d[:, le]   = np.where(valid, adamp_d, 0.0)
+                he_center_idx[le]    = clamped_ci
+                he_line_wl[le]       = line_wavelength
+                he_ltc[le]           = np.int16(ltc)
+
+                # wcon/wtail: depth-specific (emerge varies per depth)
+                ncon_he    = 0
+                nelionx_he = 0
+                if fort19_data is not None and line19_idx_he is not None:
+                    ncon_he    = int(fort19_data.continuum_index[line19_idx_he])
+                    nelionx_he = int(fort19_data.element_index[line19_idx_he])
+                elif metadata is not None and meta_idx_he is not None:
+                    ncon_he    = int(metadata.ncon[meta_idx_he])
+                    nelionx_he = int(metadata.nelionx[meta_idx_he])
+
+                if ncon_he > 0 and nelionx_he > 0 and metal_tables is not None:
+                    for d in range(n_d):
+                        if not valid[d]:
+                            continue
+                        wcon_v, wtail_v = _compute_continuum_limits(
+                            ncon=ncon_he, nelion=nelion, nelionx=nelionx_he,
+                            emerge_val=float(emerge[d]),
+                            emerge_h_val=float(emerge_h[d]),
+                            metal_tables=metal_tables, ifvac=1,
+                        )
+                        he_wcon_2d[d, le]  = wcon_v  if wcon_v  is not None else 0.0
+                        he_wtail_2d[d, le] = wtail_v if wtail_v is not None else 0.0
+
+            logger.info("Helium precompute done in %.2fs", time.time() - _precomp_t0)
+
+            voigt_tbl = tables.voigt_tables()
+            _batch_t0 = time.time()
+            _compute_helium_voigt_batch(
+                helium_wings,
+                helium_sources,
+                bnu,
+                buffers.continuum,
+                wavelength,
+                he_kappa0_2d,
+                he_doppler_2d,
+                he_adamp_2d,
+                he_center_idx,
+                he_line_wl,
+                he_ltc.astype(np.int16),
+                he_wcon_2d,
+                he_wtail_2d,
+                float(cfg.cutoff),
+                voigt_tbl.h0tab,
+                voigt_tbl.h1tab,
+                voigt_tbl.h2tab,
+            )
+            logger.info("Helium batch kernel done in %.2fs", time.time() - _batch_t0)
 
             elapsed_time = time.time() - start_time
             logger.info(
-                f"Completed helium wings: {atm.layers} depths in {elapsed_time:.2f}s "
-                f"({atm.layers/elapsed_time:.2f} depths/s)"
+                "Completed helium wings (batch): %d depths in %.2fs (%.2f depths/s)",
+                atm.layers, elapsed_time, atm.layers / elapsed_time,
             )
-            if helium_lines_skipped > 0:
-                logger.info(f"Helium lines skipped: {helium_lines_skipped:,} total")
 
     if use_wings:
         logger.info("Metal wings computation complete")
@@ -4203,23 +4905,6 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
     logger.info("Timing: line opacity stage in %.3fs", _timings["line opacity stage"])
     logger.info("Solving radiative transfer equation...")
 
-    # Diagnostic: check line opacity magnitude
-    if wavelength.size > 0 and cont_abs.shape[1] == wavelength.size:
-        idx_check = wavelength.size // 2  # Check middle wavelength
-        logger.info(f"Diagnostic (wavelength {float(wavelength[idx_check]):.2f} nm):")
-        logger.info(
-            f"  Continuum absorption (surface): {float(cont_abs[0, idx_check]):.6E}"
-        )
-        logger.info(
-            f"  Line opacity (surface): {float(buffers.line_opacity[0, idx_check]):.6E}"
-        )
-        logger.info(
-            f"  Line/Continuum ratio: {float(buffers.line_opacity[0, idx_check]) / max(float(cont_abs[0, idx_check]), 1e-40):.6f}"
-        )
-        logger.info(
-            f"  Total opacity (surface): {float(cont_abs[0, idx_check] + buffers.line_opacity[0, idx_check]):.6E}"
-        )
-
     # Determine number of workers for parallel processing
     n_workers = cfg.n_workers
     if n_workers is None:
@@ -4230,50 +4915,9 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
             n_workers = max(1, multiprocessing.cpu_count())
         else:
             n_workers = 1  # Sequential for small grids
-    # Add right before line 1462 (before solve_lte_spectrum call)
-    logger.info("=" * 70)
-    logger.info("DIAGNOSTIC: Before solve_lte_spectrum")
-    logger.info("=" * 70)
-    logger.info(f"Line opacity shape: {buffers.line_opacity.shape}")
-    logger.info(
-        f"Line opacity non-zero count: {np.count_nonzero(buffers.line_opacity)}"
-    )
-    logger.info(f"Line opacity max: {np.max(buffers.line_opacity):.2e}")
-    if np.any(buffers.line_opacity > 0):
-        non_zero_indices = np.where(buffers.line_opacity > 0)
-        logger.info(
-            f"Sample non-zero line opacity: {float(buffers.line_opacity[non_zero_indices[0][0], non_zero_indices[1][0]]):.2e} at depth {int(non_zero_indices[0][0])}, wavelength idx {int(non_zero_indices[1][0])}"
-        )
-    logger.info(f"Continuum absorption shape: {cont_abs.shape}")
-    logger.info(f"Continuum absorption max: {np.max(cont_abs):.2e}")
-    logger.info(
-        f"Line source shape: {line_source.shape if line_source is not None else 'None'}"
-    )
-    if line_source is not None:
-        logger.info(f"Line source max: {np.max(line_source):.2e}")
-        logger.info(f"Line source min: {np.min(line_source):.2e}")
-    logger.info("=" * 70)
-    # Right before solve_lte_spectrum call
-    logger.info(f"Line opacity stats before solve_lte_spectrum:")
-    logger.info(f"  Shape: {buffers.line_opacity.shape}")
-    logger.info(f"  Non-zero count: {np.count_nonzero(buffers.line_opacity)}")
-    logger.info(f"  Max: {np.max(buffers.line_opacity):.2e}")
-    if len(line_indices) > 0:
-        first_line_idx = line_indices[0]
-        logger.info(
-            f"  At first line wavelength (idx {first_line_idx}): {float(buffers.line_opacity[0, first_line_idx]):.2e}"
-        )
-        logger.info(
-            f"  At first line wavelength (all depths): min={float(np.min(buffers.line_opacity[:, first_line_idx])):.2e}, max={float(np.max(buffers.line_opacity[:, first_line_idx])):.2e}"
-        )
-    # CRITICAL CHECK: Verify line opacity is not all zeros
     if np.all(buffers.line_opacity == 0.0):
         logger.error(
             "ERROR: buffers.line_opacity is ALL ZEROS! This will cause flux == continuum!"
-        )
-    else:
-        logger.info(
-            f"  Line opacity is NOT all zeros - should produce different flux and continuum"
         )
 
     t_rt = time.perf_counter()
@@ -4307,39 +4951,11 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
         )
         logger.info("Stage 5 dump (RT output) saved")
 
-    # Diagnostic: check flux before conversion
-    if wavelength.size > 0:
-        idx_check = wavelength.size // 2
-        logger.info(
-            f"Flux BEFORE conversion (wavelength {float(wavelength[idx_check]):.2f} nm):"
+    if wavelength.size > 0 and np.allclose(flux_total, flux_cont, rtol=1e-10):
+        logger.error(
+            "ERROR: flux_total and flux_cont are IDENTICAL before Hz→nm conversion; "
+            "line opacity may not be applied in RT."
         )
-        logger.info(f"  Flux total: {float(flux_total[idx_check]):.6E}")
-        logger.info(f"  Flux continuum: {float(flux_cont[idx_check]):.6E}")
-        logger.info(
-            f"  Line opacity (surface): {float(buffers.line_opacity[0, idx_check]):.6E}"
-        )
-        logger.info(f"  Line source (surface): {float(line_source[0, idx_check]):.6E}")
-        logger.info(
-            f"  Continuum absorption (surface): {float(cont_abs[0, idx_check]):.6E}"
-        )
-        logger.info(
-            f"  Line/Continuum ratio: {float(buffers.line_opacity[0, idx_check]) / max(float(cont_abs[0, idx_check]), 1e-40):.6f}"
-        )
-        flux_ratio = float(flux_total[idx_check]) / max(
-            float(flux_cont[idx_check]), 1e-40
-        )
-        logger.info(f"  Flux ratio (total/cont): {flux_ratio:.6f}")
-        # CRITICAL CHECK: Are flux_total and flux_cont identical?
-        if np.allclose(flux_total, flux_cont, rtol=1e-10):
-            logger.error(
-                "ERROR: flux_total and flux_cont are IDENTICAL! This means line opacity is not being used!"
-            )
-            logger.error(f"  This will cause all output flux == continuum!")
-        else:
-            n_different = np.sum(~np.isclose(flux_total, flux_cont, rtol=1e-10))
-            logger.info(
-                f"  Flux values differ at {n_different}/{len(flux_total)} wavelengths"
-            )
 
     # Convert from per Hz to per nm: F_λ = F_ν * c / λ^2
     # Fortran uses: FREQTOWAVE = 2.99792458D17 / WAVE^2 (where WAVE is in nm)
@@ -4351,16 +4967,6 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
     # The multiplication creates new arrays, but we need to ensure they're independent
     flux_total = (flux_total * conversion).copy()
     flux_cont = (flux_cont * conversion).copy()
-
-    if wavelength.size > 0:
-        idx_check = wavelength.size // 2
-        logger.info(
-            f"Conversion factor (wavelength {float(wavelength[idx_check]):.2f} nm): {float(conversion[idx_check]):.6E}"
-        )
-        logger.info(f"Flux AFTER conversion:")
-        logger.info(f"  Flux total: {float(flux_total[idx_check]):.6E}")
-        logger.info(f"  Flux continuum: {float(flux_cont[idx_check]):.6E}")
-        # Note: Ground truth comparison removed to avoid hardcoded configuration-specific paths
 
     # Optional post-conversion RT dump to make units explicit for diagnostics.
     if _stage_dump_path is not None:

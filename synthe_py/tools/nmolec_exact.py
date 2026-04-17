@@ -1017,7 +1017,6 @@ def _accumulate_molecules_atlas7(
         has_target_component = bool(_TRACE_EQ_TARGETS) and any(
             int(kcomps[idx]) in _TRACE_EQ_TARGETS for idx in range(locj1, locj2 + 1)
         )
-        trace_pfsa = False
         trace_scope_ok = layer_index == 0 or force_trace or env_trace
         trace_this_molecule = trace_scope_ok and (
             env_trace
@@ -1675,23 +1674,6 @@ def _should_trace_xn(layer_idx: int, iteration: int, k_idx: int) -> bool:
     return k_idx in _TRACE_XN_INDICES
 
 
-def _should_trace_eq_full(layer_idx: int, iteration: int) -> bool:
-    if not _TRACE_EQ_FULL or layer_idx != 0:
-        return False
-    if _TRACE_ITERATIONS_ENV_SET:
-        return (iteration + 1) in _TRACE_ITERATIONS
-    return iteration == 0
-
-
-def _should_trace_deq_full(layer_idx: int, iteration: int) -> bool:
-    if not _TRACE_DEQ_FULL or layer_idx != 0:
-        return False
-    if _TRACE_ITERATIONS_ENV_SET:
-        return (iteration + 1) in _TRACE_ITERATIONS
-    # Default behavior: iteration 0 (after setup) and iteration 2 (post-check)
-    return iteration in (0, 2)
-
-
 def _trace_deq_update(
     *,
     layer: int,
@@ -2084,14 +2066,17 @@ def nmolec_exact(
         is_first_iteration = iter_idx == 0
 
         if is_first_iteration:
-            # Fortran layer-1 initialization (atlas7v.for lines 4910-4916):
+            # Fortran layer-1 initialization (atlas7v.for NMOLEC, lines 4106-4112):
             #   XNTOT = P(JSTART)/TK(JSTART)
-            #   XN(1) = XNTOT/2
-            #   X = XN(1)/10
+            #   XN(1) = XNTOT/2.          ← always XNTOT/2, no cool-star override
+            #   X = XN(1)/10.
             #   XN(K) = X*XAB(K)  for K=2..NEQUA
+            #   IF(ID.EQ.100) XN(NEQUA) = X
             #   XNE(1) = X
+            # NOTE: atlas12.for has IF(T(1).LT.4000.)XN(1)=XNTOT but atlas7v.for
+            # (used by xnfpelsyn) does NOT have this override.
             seed_ratio = None
-            xn[0] = xntot / 2.0  # Fortran: XN(1) = XNTOT/2
+            xn[0] = xntot / 2.0
             base_x = xn[0] / 10.0  # Fortran: X = XN(1)/10
             for k in range(1, nequa):
                 xn[k] = base_x * xab[k]  # Fortran: XN(K) = X*XAB(K)
@@ -2152,10 +2137,11 @@ def nmolec_exact(
                 invalid_reason = "nonfinite_xne"
 
             if nonfinite_seed:
-                # Fallback: reinitialize like layer 1
+                # Fallback: reinitialize like layer 1 (atlas12.for lines 4185-4191)
                 failed_ratio = seed_ratio
                 seed_ratio = None
-                xn[0] = xntot / 2.0
+                is_cool_outer_layer = temperature[0] < 4000.0  # atlas12.for line 4187
+                xn[0] = xntot if is_cool_outer_layer else xntot / 2.0
                 base_x = xn[0] / 10.0
                 for k in range(1, nequa):
                     xn[k] = base_x * xab[k]
@@ -2269,13 +2255,6 @@ def nmolec_exact(
         for jmol in range(nummol):
             ncomp = locj[jmol + 1] - locj[jmol]
 
-            trace_pfsa = _should_trace_pfsa(j, jmol)
-            if trace_pfsa:
-                _append_nmolec_log(
-                    f"PY_NMOLEC: Before path check: JMOL={jmol+1} CODE={code_mol[jmol]:.2f} "
-                    f"EQUIL(0)={equil[0, jmol]:.17E}"
-                )
-
             if equil[0, jmol] == 0.0:
                 # Use PFSAHA-based equilibrium
                 if ncomp > 1:
@@ -2284,34 +2263,10 @@ def nmolec_exact(
                     # Call PFSAHA in mode 12 (ionization fractions)
                     if pfsaha_func is not None:
                         frac = np.zeros((n_layers, 31), dtype=np.float64)
-                        log_pfsaha = trace_pfsa or (
-                            j == 0
-                            and (
-                                (jmol + 1) in _PFSAHA_TRACKED_JMOLS
-                                or _should_trace_molecule(jmol, code_mol[jmol])
-                            )
-                        )
-
-                        if trace_pfsa:
-                            _append_nmolec_log(
-                                f"PY_NMOLEC: PFSAHA path start: JMOL={jmol+1} "
-                                f"CODE={code_mol[jmol]:.2f} ID={id_elem} "
-                                f"NCOMP={ncomp} ION={ion}"
-                            )
 
                         # Match Fortran NMOLEC/PFSAHA: use the live XNE(J) state directly.
                         # Do not substitute a separate seed value before PFSAHA calls.
                         pfsaha_func(j, id_elem, ncomp, 12, frac, 0)
-
-                        if trace_pfsa:
-                            preview_len = min(max(ncomp, 2), 5)
-                            frac_preview = " ".join(
-                                f"{frac[j, idx]:.6E}" for idx in range(preview_len)
-                            )
-                            _append_nmolec_log(
-                                "PY_NMOLEC: PFSAHA frac snapshot: "
-                                f"JMOL={jmol+1} values={frac_preview} any_nonzero={np.any(frac[j, :ncomp])}"
-                            )
 
                         frac0 = np.float64(frac[j, 0])
                         fracn = np.float64(frac[j, ncomp - 1])
@@ -2322,11 +2277,6 @@ def nmolec_exact(
                         ):
                             equilj_before = 0.0
                             equilj_str = "0.00000000000000000E+00"
-                            if trace_pfsa:
-                                _append_nmolec_log(
-                                    f"PY_NMOLEC: PFSAHA warning JMOL={jmol+1} frac(j,0)=0; "
-                                    "equilj set to 0 before ratio"
-                                )
                         else:
                             # Use log-space to preserve precision: log(fracn) - log(frac0) + ion*log(xne)
                             if fracn > 0.0:
@@ -2345,10 +2295,6 @@ def nmolec_exact(
                                 equilj_str = "Inf"
                             else:
                                 equilj_str = f"{equilj_before:.17E}"
-                                if trace_pfsa:
-                                    _append_nmolec_log(
-                                        f"PY_NMOLEC: EQUILJ (PFSAHA calc)={equilj_str}"
-                                    )
 
                         # CRITICAL: Fortran (line 4649) does NOT check for zero denominators:
                         #   EQUILJ(JMOL)=FRAC(J,NCOMP)/FRAC(J,1)*XNE(J)**ION
@@ -2374,25 +2320,10 @@ def nmolec_exact(
                         # Fortran does NOT apply CPFC corrections to PFSAHA molecules (lines 4544-4554
                         # are BEFORE label 35, so they're only in polynomial path)
                     else:
-                        if trace_pfsa:
-                            _append_nmolec_log(
-                                f"PY_NMOLEC: PFSAHA skipped for JMOL={jmol+1} "
-                                "(pfsaha_func is None); defaulting EQUILJ=1"
-                            )
                         equilj[jmol] = 1.0
                 else:
-                    if trace_pfsa:
-                        _append_nmolec_log(
-                            f"PY_NMOLEC: PFSAHA not applicable for JMOL={jmol+1} "
-                            f"(NCOMP={ncomp}); EQUILJ set to 1"
-                        )
                     equilj[jmol] = 1.0
             else:
-                if trace_pfsa:
-                    _append_nmolec_log(
-                        f"PY_NMOLEC: PFSAHA bypassed for JMOL={jmol+1} "
-                        f"(EQUIL(0)={equil[0, jmol]:.3E}); using polynomial path"
-                    )
                 # Use EQUIL polynomial
                 # CRITICAL: Match Fortran's ION calculation exactly (line 4510):
                 #   ION=(CODE(JMOL)-DBLE( INT(CODE(JMOL))))*100.+.5
@@ -2526,31 +2457,9 @@ def nmolec_exact(
         # This modifies the existing Newton loop rather than replacing it
         # The bounds are enforced in the XN update section below
         bounded_newton_active = use_bounded_newton
-        if bounded_newton_active and j == 0:
-            print(
-                "  BOUNDED NEWTON: Adding trust-region step limiting to Newton iteration"
-            )
 
         for iteration in range(max_iter):
-            trace_eq_full_now = _should_trace_eq_full(j, iteration)
-            trace_deq_full_now = _should_trace_deq_full(j, iteration)
             pending_solvit_call = solvit_call_counter + 1
-            trace_a9_active = (
-                TRACE_A9_ENABLED
-                and (j + 1 == TRACE_A9_LAYER)
-                and (pending_solvit_call == TRACE_A9_CALL)
-            )
-
-            # Detailed tracing: XN values at start of iteration
-            if _TRACE_XN_FULL and j == 0 and iteration < 3:  # First 3 iterations
-                print(f"    XN values: {xn[:nequa]}")
-                print(
-                    f"    XN stats: min={np.min(xn[:nequa]):.2e}, max={np.max(xn[:nequa]):.2e}, sum={np.sum(xn[:nequa]):.2e}"
-                )
-                if iteration == 0:
-                    print(
-                        f"    Initial XN: XNTOT/2 = {xntot/2:.2e}, X = XN(1)/10 = {xn[0]/10:.2e}"
-                    )
 
             # Set up equations EQ and Jacobian DEQ
             # DEQ is stored column-major (1D array): DEQ(K1) = DEQ(1, K) where K1 = NEQUA*K - NEQUA + 1
@@ -2633,8 +2542,6 @@ def nmolec_exact(
 
             # CRITICAL: DEQ(1,1) is only set through molecular terms!
             # If no molecules contain XN(1), DEQ(1,1) = 0, causing zero pivot
-            # Check if DEQ(1,1) is zero before molecular terms
-            deq11_before = deq[0] if trace_deq_full_now else None
 
             def _enforce_electron_coupling() -> None:
                 """Match Fortran relation DEQ(1,NEQUA) = -DEQ(NEQUA,NEQUA)."""
@@ -2644,37 +2551,6 @@ def nmolec_exact(
                 # updates; there is no extra coupling step.
                 return
 
-            # Detailed tracing: EQUILJ values
-            if _TRACE_EQUILJ and j == 0 and iteration == 0:
-                print(f"    Total molecules: {nummol}")
-                print(f"    EQUILJ values (first 20 molecules):")
-                for jmol in range(min(20, nummol)):
-                    code = code_mol[jmol]
-                    eq_val = equilj[jmol]
-                    if eq_val > 0:
-                        print(
-                            f"      Molecule {jmol}: CODE={code:.2f}, EQUILJ={eq_val:.2e}"
-                        )
-                    elif eq_val == 0:
-                        print(
-                            f"      Molecule {jmol}: CODE={code:.2f}, EQUILJ=0.0 (skipped)"
-                        )
-                    elif np.isinf(eq_val):
-                        print(f"      Molecule {jmol}: CODE={code:.2f}, EQUILJ=inf")
-                    elif np.isnan(eq_val):
-                        print(f"      Molecule {jmol}: CODE={code:.2f}, EQUILJ=nan")
-                # Summary statistics
-                finite_equilj = equilj[np.isfinite(equilj) & (equilj > 0)]
-                if len(finite_equilj) > 0:
-                    print(
-                        f"    EQUILJ stats: min={np.min(finite_equilj):.2e}, max={np.max(finite_equilj):.2e}, mean={np.mean(finite_equilj):.2e}"
-                    )
-                inf_count = np.sum(np.isinf(equilj))
-                nan_count = np.sum(np.isnan(equilj))
-                zero_count = np.sum(equilj == 0.0)
-                print(
-                    f"    EQUILJ counts: finite={len(finite_equilj)}, zero={zero_count}, inf={inf_count}, nan={nan_count}"
-                )
             def _record_nonfinite_deq(**info: Any) -> None:
                 nonlocal nonfinite_term_hits, nonfinite_d_hits
                 stage = str(info.get("stage", "unknown"))
@@ -2749,7 +2625,7 @@ def nmolec_exact(
                         electron_density_val=electron_density_val,
                     )
 
-            term_trace = _accumulate_molecules_atlas7(
+            _ = _accumulate_molecules_atlas7(
                 eq=eq,
                 deq=deq,
                 xn=xn,
@@ -2778,110 +2654,10 @@ def nmolec_exact(
                 electron_idx=electron_idx,
             )
 
-            # Detailed tracing: Print TERM values
-            if _TRACE_TERM and term_trace is not None:
-                print(f"    TERM values (first 20 molecules):")
-                for jmol, code, term_before, term_after, locj1, locj2 in term_trace:
-                    print(
-                        f"      Molecule {jmol}: CODE={code:.2f}, EQUILJ={term_before:.2e}, TERM={term_after:.2e}, components={locj2-locj1+1}"
-                    )
-                print(f"    EQ(0) (total particles, RHS before solve) = {eq[0]:.2e}")
-                print(f"    XNTOT = {xntot:.2e}")
-                print(
-                    f"    EQ(0) should be ≈ 0 at solution (EQ(0) = -XNTOT + sum(XN) + sum(TERM))"
-                )
-
-            # Check DEQ(1,1) after molecular terms
-            if trace_deq_full_now and deq11_before is not None:
-                deq11_after = deq[0]
-                if abs(deq11_after) < 1e-10:
-                    print(
-                        f"  WARNING: DEQ(1,1) is still very small after molecular terms!"
-                    )
-                    print(f"    This will cause zero pivot in SOLVIT!")
-
-            if trace_deq_full_now:
-                print("PY_NMOLEC: DEQ diagonal elements (DEQ(K,K)):")
-                for k in range(nequa):
-                    kk = k * nequa1  # FIXED: Must match initialization kk = k * nequa1
-                    deq_val = deq[kk]
-                    print(f"  DEQ({k+1:2d},{k+1:2d})={deq_val:13.4E}")
-
-                # Also print DEQ row 1 (DEQ(1,K)) for comparison with Fortran
-                print("PY_NMOLEC: DEQ row 1 (DEQ(1,K)):")
-                for k in range(nequa):
-                    k1 = k * nequa  # 0-based index for DEQ(1, k+1)
-                    deq_val = (
-                        deq[k1] if k > 0 else deq[0]
-                    )  # k=0 uses deq[0], k>0 uses k*nequa
-                    print(f"  DEQ( 1,{k+1:2d})={deq_val:13.4E}")
-
-                # Print all DEQ off-diagonal elements (DEQ(M,K) where M != K)
-                # This helps verify the full matrix matches Fortran
-                print("PY_NMOLEC: DEQ off-diagonal elements (DEQ(M,K) where M != K):")
-                off_diag_count = 0
-                for m in range(nequa):
-                    for k in range(nequa):
-                        if m != k:  # Off-diagonal only
-                            mk = m + k * nequa  # DEQ(m, k) in column-major storage
-                            deq_val = deq[mk]
-                            # Only print non-zero values to reduce output
-                            if abs(deq_val) > 1e-20:
-                                print(f"  DEQ({m+1:2d},{k+1:2d})={deq_val:13.4E}")
-                                off_diag_count += 1
-                                if off_diag_count >= 50:  # Limit output
-                                    print(
-                                        f"  ... (showing first 50 non-zero off-diagonal elements)"
-                                    )
-                                    break
-                    if off_diag_count >= 50:
-                        break
-
             # Solve linear system: DEQ * delta_XN = EQ
             # Use SOLVIT algorithm (Gaussian elimination with complete pivoting)
             # From atlas7v_1.for lines 1200-1262
             # SOLVIT modifies DEQ and EQ in-place
-
-            # Fortran prints DEQ row 1 BEFORE SOLVIT at line 4811-4819
-            # Fortran prints for layer J=1 (1-based) = Python layer j=0 (0-based), iteration 0
-            if trace_eq_full_now:
-                print("PY_NMOLEC: Before SOLVIT call")
-                print(f"PY_NMOLEC: Layer {j} iteration {iteration}")
-                print(f"PY_NMOLEC: EQ[0]={eq[0]:13.4E} DEQ[0,0]={deq[0]:13.4E}")
-                # Print full EQ vector BEFORE SOLVIT for comparison with Fortran
-                print("PY_NMOLEC: EQ vector (RHS) BEFORE SOLVIT:")
-                for kk in range(nequa):
-                    print(f"  EQ({kk+1:2d})={eq[kk]:13.4E}")
-                print("PY_NMOLEC: DEQ row 1 (DEQ(1,K)) BEFORE SOLVIT:")
-                for kk in range(nequa):
-                    k1 = kk * nequa if kk > 0 else 0  # 0-based index for DEQ(1, kk+1)
-                    print(f"  DEQ( 1,{kk+1:2d})={deq[k1]:13.4E}")
-
-            # CRITICAL: Check 1D DEQ array before reshape (for iteration 0 and 2)
-            if trace_deq_full_now:
-                deq_has_inf = np.any(np.isinf(deq[:neqneq]))
-                deq_has_nan = np.any(np.isnan(deq[:neqneq]))
-                print(f"    deq[0] = {deq[0]:.2e}")
-                print(f"    deq[nequa] = {deq[nequa]:.2e} (should be DEQ[0, 1])")
-                print(f"    deq[6*nequa] = {deq[6*nequa]:.2e} (should be DEQ[0, 6])")
-                print(
-                    f"    deq[6*nequa+6] = {deq[6*nequa+6]:.2e} (should be DEQ[6, 6])"
-                )
-                print(f"    DEQ has Inf? {deq_has_inf}, has NaN? {deq_has_nan}")
-                if deq_has_inf:
-                    inf_indices = np.where(np.isinf(deq[:neqneq]))[0]
-                    print(f"    🔴 DEQ contains Inf at {len(inf_indices)} positions!")
-                    print(f"    First 10 Inf indices: {inf_indices[:10]}")
-                    # Check which matrix positions these correspond to
-                    for idx in inf_indices[:5]:
-                        row = idx % nequa
-                        col = idx // nequa
-                        print(f"      deq[{idx}] = Inf → DEQ[{row}, {col}] = Inf")
-                if iteration == 2:
-                    print(f"    First 10 values: {deq[:10]}")
-                    print(
-                        f"    Values at nequa intervals: {[deq[k*nequa] for k in range(min(5, nequa))]}"
-                    )
 
             # CRITICAL: DEQ is stored column-major (Fortran order)
             # numpy reshape defaults to C-order (row-major), so we need order='F'
@@ -2899,59 +2675,7 @@ def nmolec_exact(
                     )
                 nonfinite_d_hits += 1
 
-            if _TRACE_SOLVIT_DETAILED and j == 1 and iteration == 0:
-                print(
-)
-                if eq[0] > 1e70:
-                    print(
-                        f"    🔴 WARNING: eq[0]={eq[0]:.6e} is HUGE before eq_copy creation!"
-                    )
-                if np.isnan(eq[0]):
-                    print(
-                        f"    🔴 CRITICAL: eq[0] is NaN! Checking xntot, gas_pressure[{j}], tk[{j}]:"
-                    )
-                    print(f"      xntot = {xntot:.6e}")
-                    print(f"      gas_pressure[{j}] = {gas_pressure[j]:.6e}")
-                    print(f"      tk[{j}] = {tk[j]:.6e}")
-                    print(f"      eq id = {id(eq)}")
-                    print(
-                        f"      Checking if eq was modified after reinitialization..."
-                    )
-                    # Check if eq[0] was set correctly at line 634
-                    expected_eq0 = -gas_pressure[j] / tk[j]
-                    print(
-                        f"      Expected eq[0] = -gas_pressure[{j}]/tk[{j}] = {expected_eq0:.6e}"
-                    )
-                    print(f"      Actual eq[0] = {eq[0]:.6e}")
-                    # Check if xn contains NaN (which would propagate to eq[0])
-                    xn_nan_count = np.sum(np.isnan(xn[:nequa]))
-                    print(
-                        f"      xn contains {xn_nan_count} NaN values (out of {nequa})"
-                    )
-                    if xn_nan_count > 0:
-                        xn_nan_indices = np.where(np.isnan(xn[:nequa]))[0]
-                        print(
-                            f"      NaN indices in xn: {xn_nan_indices[:10]}"
-                        )  # First 10
-                        print(
-                            f"      This explains why eq[0] is NaN - it accumulates NaN from xn!"
-                        )
-
             eq_copy = eq.copy()
-
-            trace_layer_before_solvit = j in _TRACE_SOLVIT_LAYERS
-
-            if _TRACE_SOLVIT_DETAILED and j == 0 and iteration == 0:
-                print("PY_NMOLEC: DEQ column 0 (a[k, 0]) BEFORE SOLVIT:")
-                for kk in range(nequa):
-                    print(
-                        f"  a[{kk:2d}, 0] = {deq_2d[kk, 0]:13.4E} (should be -xab[{kk}] for k>0)"
-                    )
-                # Also check what xab values are
-                print("PY_NMOLEC: XAB values (for comparison):")
-                for kk in range(min(10, nequa)):
-                    if kk < len(xab):
-                        print(f"  xab[{kk}] = {xab[kk]:13.4E}")
 
             # Option 2: Add small perturbation to DEQ[0,0] to prevent exact zero
             # CRITICAL: DEQ[0,0] starts at 0.0 and never accumulates molecular contributions
@@ -2967,110 +2691,6 @@ def nmolec_exact(
                 # Scale-relative perturbation: machine epsilon * matrix size * max entry
                 perturbation = max(1e-12, eps * nequa * deq_max)
                 deq_2d[0, 0] += perturbation
-                if _TRACE_SOLVIT_DETAILED and j == 0 and iteration == 0:
-                    print(
-)
-
-            # Detailed tracing: DEQ matrix before SOLVIT
-            if _TRACE_SOLVIT_DETAILED and j == 0 and iteration == 0:
-                print(
-)
-                print(f"    DEQ matrix shape: {deq_2d.shape}")
-                print(f"    DEQ matrix has inf? {np.any(np.isinf(deq_2d))}")
-                print(f"    DEQ matrix has nan? {np.any(np.isnan(deq_2d))}")
-                finite_mask = np.isfinite(deq_2d)
-                if np.any(finite_mask):
-                    print(
-                        f"    DEQ matrix max abs: {np.max(np.abs(deq_2d[finite_mask])):.2e}"
-                    )
-                    print(
-                        f"    DEQ matrix min abs (finite): {np.min(np.abs(deq_2d[finite_mask])):.2e}"
-                    )
-                    # Count very large values
-                    large_mask = np.abs(deq_2d[finite_mask]) > 1e30
-                    print(
-                        f"    DEQ matrix values > 1e30: {np.sum(large_mask)} out of {np.sum(finite_mask)}"
-                    )
-                    # Count zeros
-                    zero_mask = deq_2d[finite_mask] == 0.0
-                    print(
-                        f"    DEQ matrix zeros: {np.sum(zero_mask)} out of {np.sum(finite_mask)}"
-                    )
-                    # Count very small values (potential cancellation)
-                    small_mask = (np.abs(deq_2d[finite_mask]) < 1e-10) & (
-                        deq_2d[finite_mask] != 0.0
-                    )
-                    print(
-                        f"    DEQ matrix very small (<1e-10, non-zero): {np.sum(small_mask)}"
-                    )
-                    # Print non-zero DEQ values (first 20)
-                    nonzero_mask = (deq_2d != 0.0) & finite_mask
-                    if np.any(nonzero_mask):
-                        nonzero_indices = np.where(nonzero_mask)
-                        print(f"    DEQ non-zero values (first 20):")
-                        for idx in range(min(20, len(nonzero_indices[0]))):
-                            i, k = nonzero_indices[0][idx], nonzero_indices[1][idx]
-                            print(f"      DEQ[{i}, {k}] = {deq_2d[i, k]:.2e}")
-                else:
-                    print(f"    DEQ matrix: all inf/nan")
-                print(f"    EQ (RHS) has inf? {np.any(np.isinf(eq_copy))}")
-                print(f"    EQ (RHS) has nan? {np.any(np.isnan(eq_copy))}")
-                finite_eq = np.isfinite(eq_copy)
-                if np.any(finite_eq):
-                    print(
-                        f"    EQ (RHS) max abs: {np.max(np.abs(eq_copy[finite_eq])):.2e}"
-                    )
-                    print(f"    EQ (RHS) values: {eq_copy[:nequa]}")
-                else:
-                    print(f"    EQ (RHS): all inf/nan")
-                print(f"    XN (current): {xn[:nequa]}")
-                # Print first few rows/cols of DEQ matrix
-                print(f"    DEQ[0:5, 0:5]:")
-                for i in range(min(5, nequa)):
-                    row_str = " ".join(
-                        [
-                            (
-                                f"{deq_2d[i, k]:.2e}"
-                                if np.isfinite(deq_2d[i, k])
-                                else "inf" if np.isinf(deq_2d[i, k]) else "nan"
-                            )
-                            for k in range(min(5, nequa))
-                        ]
-                    )
-                    print(f"      [{row_str}]")
-                # CRITICAL: Check row 0 specifically
-                print(f"    Row 0 detailed check:")
-                row0_nonzero = [k for k in range(nequa) if abs(deq_2d[0, k]) > 1e-10]
-                row0_sum = np.sum(np.abs(deq_2d[0, :]))
-                print(f"      Non-zero elements: {len(row0_nonzero)} out of {nequa}")
-                if len(row0_nonzero) > 0:
-                    print(f"      Non-zero positions: {row0_nonzero[:10]}")
-                    print(f"      Values: {[deq_2d[0, k] for k in row0_nonzero[:10]]}")
-                print(f"      Sum of absolute values: {row0_sum:.2e}")
-                print(f"      Max absolute value: {np.max(np.abs(deq_2d[0, :])):.2e}")
-                if np.any(deq_2d[0, :] != 0):
-                    print(
-                        f"      Min absolute value (non-zero): {np.min(np.abs(deq_2d[0, deq_2d[0, :] != 0])):.2e}"
-                    )
-                else:
-                    print(f"      Min absolute value (non-zero): all zero")
-                # Print row with largest values
-                row_maxes = np.max(np.abs(deq_2d), axis=1)
-                max_row_idx = np.argmax(row_maxes)
-                print(
-                    f"    Row {max_row_idx} (largest max abs): max={row_maxes[max_row_idx]:.2e}"
-                )
-                print(f"      Values: {deq_2d[max_row_idx, :]}")
-
-                # CRITICAL: Save DEQ matrix state for comparison
-                # This will help identify where values differ from Fortran
-                import synthe_py.tools.nmolec_exact as nmolec_module
-
-                if not hasattr(nmolec_module, "_deq_saved"):
-                    nmolec_module._deq_saved = deq_2d.copy()
-                    nmolec_module._eq_saved = eq_copy.copy()
-                    nmolec_module._xn_saved = xn[:nequa].copy()
-                    print(f"    Saved DEQ matrix state for comparison")
 
             # CRITICAL: Align with Fortran behavior
             # Fortran does NOT check for NaN/Inf before SOLVIT
@@ -3091,107 +2711,6 @@ def nmolec_exact(
                     eq=eq,
                     nequa=nequa,
                 )
-
-            # Check DEQ(1,1) for ALL layers to verify it stays zero
-            if trace_eq_full_now:
-                deq11_val = deq_2d[0, 0]
-                if j < 10 or abs(deq11_val) > 1e-10:
-                    print(
-                        f"PY_NMOLEC: Layer {j:3d} Before SOLVIT: EQ[0]={eq_copy[0]:12.4e} DEQ[0,0]={deq11_val:12.4e}"
-                    )
-
-            if _TRACE_SOLVIT_DETAILED and j == 0 and iteration == 0:
-                print("PY_NMOLEC: DEQ diagonal elements (DEQ(K,K)) BEFORE SOLVIT:")
-                for kk in range(nequa):
-                    print(f"  DEQ({kk+1:2d},{kk+1:2d})={deq_2d[kk, kk]:12.4E}")
-                print("PY_NMOLEC: DEQ row 1 (DEQ(1,K)) BEFORE SOLVIT:")
-                for kk in range(nequa):
-                    line = f"  DEQ( 1,{kk+1:2d})={deq_2d[0, kk]:12.4E}\n"
-                    print(line.rstrip())
-                if idequa[nequa - 1] == 100:  # Electrons included
-                    # CRITICAL: DEQ(1,22) is at row 1, col 22 in 1-based (row 1, col 22 in 0-based)
-                    # deq_2d[0, 22] = deq[0 + 22*23] = deq[506] (wrong!)
-                    # deq_2d[1, 22] = deq[1 + 22*23] = deq[507] (correct!)
-                    # OR use deq[1 + (nequa-1)*nequa] = deq[507] directly
-                    k1_electrons = 1 + (nequa - 1) * nequa
-                    deq_1_22 = deq[k1_electrons]  # Use direct index to avoid confusion
-                    deq_22_22 = deq_2d[nequa - 1, nequa - 1]
-                    print(
-                        f"PY_NMOLEC: DEQ(1,22) = {deq_1_22:.6e}, DEQ(22,22) = {deq_22_22:.6e}"
-                    )
-                    print(
-                        f"PY_NMOLEC: DEQ(1,22) / DEQ(22,22) = {deq_1_22 / deq_22_22 if deq_22_22 != 0 else 'inf':.6e}"
-                    )
-                    print(
-                        f"PY_NMOLEC: Expected: DEQ(1,22) = -DEQ(22,22) (like Fortran DEQ(1,23) = -DEQ(23,23))"
-                    )
-                    if abs(deq_1_22 + deq_22_22) > 1e-5 * abs(deq_22_22):
-                        print(
-                            f"  ⚠️  WARNING: DEQ(1,22) != -DEQ(22,22)! Difference = {abs(deq_1_22 + deq_22_22):.6e}"
-                        )
-
-                # CRITICAL: Compare DEQ(7,7) and DEQ(9,9) - Fortran selects (9,9), Python selects (7,7)
-                print(
-                    "PY_NMOLEC: Critical comparison (Fortran selects 9,9, Python selects 7,7):"
-                )
-                if nequa > 7:
-                    print(f"  DEQ(7,7)={deq_2d[7, 7]:12.4e}")
-                if nequa > 9:
-                    print(f"  DEQ(9,9)={deq_2d[9, 9]:12.4e}")
-                    if nequa > 7:
-                        ratio_79 = (
-                            deq_2d[7, 7] / deq_2d[9, 9] if deq_2d[9, 9] != 0 else 0
-                        )
-                        print(f"  Ratio DEQ(7,7)/DEQ(9,9)={ratio_79:.6f}")
-                        if ratio_79 > 1.0:
-                            print(
-                                f"    ⚠️  Python's DEQ(7,7) > DEQ(9,9) - explains why Python selects (7,7)"
-                            )
-                        else:
-                            print(
-                                f"    ✅ Python's DEQ(7,7) < DEQ(9,9) - but Python still selects (7,7)?"
-                            )
-                # Find maximum diagonal element
-                max_diag_val = -1
-                max_diag_idx = -1
-                print("PY_NMOLEC: All diagonal elements:")
-                for kk in range(nequa):
-                    diag_val = abs(deq_2d[kk, kk])
-                    print(
-                        f"  DEQ({kk+1},{kk+1})={deq_2d[kk, kk]:13.4E} (abs={diag_val:.4e})"
-                    )
-                    if diag_val > max_diag_val:
-                        max_diag_val = diag_val
-                        max_diag_idx = kk
-                print(
-                    f"PY_NMOLEC: Maximum diagonal element: DEQ({max_diag_idx+1},{max_diag_idx+1})={max_diag_val:.4e}"
-                )
-                print(
-                    f"PY_NMOLEC: Python should select ({max_diag_idx},{max_diag_idx}) [0-based] = ({max_diag_idx+1},{max_diag_idx+1}) [1-based] if pivot search is correct"
-                )
-                # Also check what the actual maximum element in the entire matrix is
-                max_elem_val = -1
-                max_elem_row = -1
-                max_elem_col = -1
-                for jj in range(nequa):
-                    for kk in range(nequa):
-                        elem_val = abs(deq_2d[jj, kk])
-                        if elem_val > max_elem_val:
-                            max_elem_val = elem_val
-                            max_elem_row = jj
-                            max_elem_col = kk
-                print(
-                    f"PY_NMOLEC: Maximum element in entire matrix: DEQ({max_elem_row+1},{max_elem_col+1})={max_elem_val:.4e}"
-                )
-                if max_elem_row != max_diag_idx or max_elem_col != max_diag_idx:
-                    print(
-                        f"  ⚠️  WARNING: Maximum element is NOT on diagonal! Maximum diagonal is DEQ({max_diag_idx+1},{max_diag_idx+1}), but maximum element is DEQ({max_elem_row+1},{max_elem_col+1})"
-                    )
-                deq11_val = deq_2d[0, 0]
-                if abs(deq11_val) > 1e-10:
-                    print(
-                        f"  ⚠️  WARNING: DEQ(1,1) is non-zero! This should be 0.0 to match Fortran!"
-                    )
 
             solvit_call_counter += 1
             current_call_idx = solvit_call_counter
@@ -3294,14 +2813,6 @@ def nmolec_exact(
                     iteration,
                     delta_xn[:nequa],
                 )
-            if trace_eq_full_now and delta_xn is not None:
-                print(f"PY_NMOLEC: After SOLVIT, EQ[0]={delta_xn[0]:12.4e}")
-                # Print DEQ row 1 AFTER SOLVIT (matrix has been modified by Gaussian elimination)
-                print("PY_NMOLEC: DEQ row 1 (DEQ(1,K)) AFTER SOLVIT:")
-                for kk in range(nequa):
-                    line = f"  DEQ( 1,{kk+1:2d})={matrix_for_solvit[0, kk]:12.4E}\n"
-                    print(line.rstrip())
-
             # CRITICAL: SOLVIT should never return None now - it continues even with zero pivot
             # But keep this check for safety
             if delta_xn is None:
@@ -3333,15 +2844,6 @@ def nmolec_exact(
                     eq_vec=eq,
                     xn_vec=xn,
                 )
-
-            if _TRACE_XN_FULL and j == 0 and iteration == 0:
-                print(f"    EQ (solution from SOLVIT) = {eq}")
-                print(f"    XN (before update) = {xn[:nequa]}")
-                print(f"    Matrix condition: {np.linalg.cond(matrix_for_solvit):.2e}")
-                print(f"    EQ[0] (solution for XN(1)) = {eq[0]:.6e}")
-                print(f"    XN[0] (current XN(1)) = {xn[0]:.6e}")
-                xneq_print = _stable_subtract(xn[0], eq[0])
-                print(f"    XNEQ = XN[0] - EQ[0] = {xneq_print:.6e}")
 
             # Update XN and check convergence
             # From atlas7v_1.for lines 3806-3824
@@ -3499,28 +3001,6 @@ def nmolec_exact(
                         scale_after=scale,
                         damping_applied=damping_applied,
                         scale_modified=scale_modified,
-                    )
-
-            # When tracing mismatch with Fortran (ITER=4 vs ITER=24), dump all ratios
-            if _TRACE_RATIO and j == 0 and (iteration + 1) in _TRACE_ITERATIONS:
-                for k_dump in range(nequa):
-                    xn_val = xn[k_dump]
-                    eq_val = eq[k_dump]
-                    if xn_val != 0.0:
-                        ratio_val = abs(_div_preserving_precision(eq_val, xn_val))
-                    else:
-                        ratio_val = float("inf")
-                    print(
-                        "PY_RATIO: iter={iter:3d} k={k:2d} "
-                        "ratio={ratio:.17E} EQ={eq_val:.17E} XN={xn_val:.17E} "
-                        "EQOLD={eqold:.17E}".format(
-                            iter=iteration + 1,
-                            k=k_dump + 1,
-                            ratio=ratio_val,
-                            eq_val=eq_val,
-                            xn_val=xn_val,
-                            eqold=eqold[k_dump],
-                        )
                     )
 
             iteration_one_based = iteration + 1

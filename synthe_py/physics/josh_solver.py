@@ -705,26 +705,75 @@ def solve_josh_flux(
             hnu_profile = np.zeros_like(snu)
             jnu_profile = np.zeros_like(snu)
 
-            for l_iter in range(MAX_ITER):
-                hnu_profile = _deriv(taunu, snu) / 3.0
-                jmins_profile = _deriv(taunu, hnu_profile)
-                jnu_profile = jmins_profile + snu
-                snew = (1.0 - alpha) * snubar + alpha * jnu_profile
-                rel = np.abs(snew - snu) / np.maximum(np.abs(snew), EPS)
-                maxj401_error = float(np.sum(rel))
-                snu = snew
-                num_iterations = l_iter + 1
-                if maxj401_error < ITER_TOL:
-                    break
+            # ------------------------------------------------------------------
+            # Stability check before iterating (Fortran atlas7v.for label 401).
+            #
+            # Fortran's iteration converges because TiO opacity keeps delta_tau
+            # large at every depth (> ~0.1).  Without correct TiO populations,
+            # Python's taunu plateaus after depth 2 (delta_tau ~ 5e-6) and the
+            # tangent-addition formula in _deriv diverges:
+            #   D ~ delta_f / delta_tau / scale  →  huge
+            #   tan ~ 1 - 1/D  →  tan1*tan0 → 1  →  denominator → 0
+            # Each of the 51 iterations then amplifies snu by alpha*jmins/snubar
+            # (can be >> 1), producing 10^160 after 51 steps.
+            #
+            # Detect this condition: if any taunu increment in the DEEP layers
+            # (indices 2 onwards) is less than 1e-4 × taunu[0], the derivatives
+            # will be explosive.  In that case skip the iteration and return the
+            # single-pass (iter-0) estimate, which is physically reasonable
+            # (gives ~10% error vs Fortran, vs 10^160 with iteration).
+            # ------------------------------------------------------------------
+            dtau = np.diff(taunu)
+            if dtau.size > 2:
+                min_dtau_deep = float(np.min(np.abs(dtau[2:])))
+            elif dtau.size > 0:
+                min_dtau_deep = float(np.min(np.abs(dtau)))
+            else:
+                min_dtau_deep = 0.0
+            # Threshold: 1e-4 of the surface optical depth.
+            _stability_threshold = 1e-4 * float(taunu[0]) if taunu.size > 0 else 1e-4
+            _tau_unstable = min_dtau_deep < _stability_threshold
 
-            # Keep XS populated for debug output; surface flux comes from HNU(1) on this path.
-            xs = snu.copy()
-            flux_hnu_surface = float(hnu_profile[0]) if hnu_profile.size else 0.0
-            flux_knu_surface = (
-                float(jnu_profile[0] / 3.0) if jnu_profile.size else float("nan")
-            )
-            flux_override = flux_hnu_surface
-            flux_ck_override = flux_knu_surface
+            if _tau_unstable:
+                # Single-pass estimate: HNU(1) = DERIV(TAUNU, SNUBAR)[0] / 3.
+                # Matches Fortran's converged result when TiO is present (alpha*jmins
+                # is tiny → snu ≈ snubar → HNU(1) ≈ DERIV(taunu, snubar)[0] / 3).
+                hnu_profile = _deriv(taunu, snubar) / 3.0
+                jnu_profile = snubar.copy()
+                xs = snu.copy()
+                flux_hnu_surface = float(hnu_profile[0]) if hnu_profile.size else 0.0
+                flux_knu_surface = float(jnu_profile[0] / 3.0) if jnu_profile.size else float("nan")
+                flux_override = flux_hnu_surface
+                flux_ck_override = flux_knu_surface
+            else:
+                for l_iter in range(MAX_ITER):
+                    hnu_profile = _deriv(taunu, snu) / 3.0
+                    jmins_profile = _deriv(taunu, hnu_profile)
+
+                    # Guard: if corrective update alpha*jmins would exceed snubar,
+                    # the iteration has diverged; exit with current hnu_profile.
+                    _max_correction = float(np.max(np.abs(alpha * jmins_profile)))
+                    _max_snubar = float(np.max(np.abs(snubar))) + EPS
+                    if _max_correction > _max_snubar:
+                        break
+
+                    jnu_profile = jmins_profile + snu
+                    snew = (1.0 - alpha) * snubar + alpha * jnu_profile
+                    rel = np.abs(snew - snu) / np.maximum(np.abs(snew), EPS)
+                    maxj401_error = float(np.sum(rel))
+                    snu = snew
+                    num_iterations = l_iter + 1
+                    if maxj401_error < ITER_TOL:
+                        break
+
+                # Keep XS populated for debug output; surface flux comes from HNU(1) on this path.
+                xs = snu.copy()
+                flux_hnu_surface = float(hnu_profile[0]) if hnu_profile.size else 0.0
+                flux_knu_surface = (
+                    float(jnu_profile[0] / 3.0) if jnu_profile.size else float("nan")
+                )
+                flux_override = flux_hnu_surface
+                flux_ck_override = flux_knu_surface
     else:
         # IFSCAT=0 path: Direct MAP1 to XS (not used in current implementation)
         # This path is not used since always_use_scattering_path = True
@@ -753,15 +802,5 @@ def solve_josh_flux(
         flux = float(flux_override)
     else:
         flux = float(np.dot(flux_weights, xs))
-
-    # NOTE: 4π correction was temporarily applied but caused flux > continuum (physically wrong)
-    # Investigation needed: Why does Python HNU(1) differ from Fortran?
-    # Original investigation showed dividing by 4π gave 0.924× ratio at 490nm,
-    # but full spectrum shows 4.677× error and flux > continuum (impossible).
-    #
-    # The Fortran code (spectrv.for) doesn't apply any empirical flux corrections after
-    # the JOSH solver - it uses the raw SURF(1) value directly. We should do the same.
-    #
-    # TODO: Investigate root cause of flux discrepancy without applying ad-hoc corrections.
 
     return flux

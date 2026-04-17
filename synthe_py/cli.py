@@ -49,7 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat wavelengths as air instead of vacuum",
     )
     parser.add_argument(
-        "--cutoff", type=float, default=1e-3, help="Opacity cutoff factor"
+        "--cutoff", type=float, default=1e-3,
+        help=(
+            "Opacity cutoff factor.  KAPMIN = CUTOFF * CONTINUUM filters out lines and "
+            "wing steps whose opacity falls below this fraction of the local continuum.  "
+            "Fortran SYNBEG tfort.93 uses CUTOFF=0.001.  Default 0.001 matches Fortran."
+        ),
     )
     parser.add_argument(
         "--linout", type=int, default=30, help="Line output control flag"
@@ -86,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
             "If omitted, ../kurucz/molecules next to the pykurucz repo is used when present."
         ),
     )
-    parser.set_defaults(include_tio=True, include_h2o=True)
+    parser.set_defaults(include_tio=True, include_h2o=False)
     parser.add_argument(
         "--no-tio",
         dest="include_tio",
@@ -94,10 +99,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exclude Schwenke TiO binary line list (default: include if binary exists).",
     )
     parser.add_argument(
+        "--h2o",
+        dest="include_h2o",
+        action="store_true",
+        help=(
+            "Include Partridge-Schwenke H2O binary line list. "
+            "Disabled by default: the Fortran reference tfort.12 has H2O records "
+            "with broken NBUFF values (all out-of-range), so Fortran synthe.for "
+            "processes zero H2O lines."
+        ),
+    )
+    parser.add_argument(
         "--no-h2o",
         dest="include_h2o",
         action="store_false",
-        help="Exclude Partridge-Schwenke H2O binary line list (default: include if binary exists).",
+        help="Exclude Partridge-Schwenke H2O binary line list (this is already the default).",
     )
     parser.add_argument(
         "--tio-bin",
@@ -117,7 +133,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-workers",
         type=int,
         default=None,
-        help="Number of parallel workers for radiative transfer (default: auto-detect, use 1 for sequential)",
+        help=(
+            "Parallel workers for synthesis (metal line accumulation, RT when parallel). "
+            "Default: all logical CPUs for maximum throughput; use 1 for sequential debugging."
+        ),
     )
     parser.add_argument(
         "--nlte", action="store_true", help="Enable NLTE line source handling"
