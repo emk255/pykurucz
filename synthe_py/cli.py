@@ -74,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-molecular-lines",
         action="store_true",
         help=(
-            "Disable molecular line opacity: skip auto-discovered ../kurucz/molecules "
+            "Disable molecular line opacity: skip auto-discovered data/molecules "
             "and ignore --molecules-dir."
         ),
     )
@@ -87,8 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help=(
             "Directory containing Kurucz ASCII molecular .dat/.asc files "
-            "(e.g. kurucz/molecules/). Can be repeated for multiple directories. "
-            "If omitted, ../kurucz/molecules next to the pykurucz repo is used when present."
+            "(e.g. data/molecules/). Can be repeated for multiple directories. "
+            "If omitted, data/molecules/ inside the pykurucz repo is used when present "
+            "(populated by scripts/setup_data.sh)."
         ),
     )
     parser.set_defaults(include_tio=True, include_h2o=False)

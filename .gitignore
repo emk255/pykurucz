@@ -15,3 +15,18 @@ results/
 logs/
 synthe_py/out/
 lines/.py_line_cache/
+
+# data/ — large binary/executable files populated by scripts/setup_data.sh
+# Small text files (molecules.new, *.dat in lines/, spectrv_std.input) ARE tracked.
+data/lines/*.bin
+data/lines/*.partaa
+data/lines/*.partab
+data/lines/*.partac
+data/molecules/tio/*.bin
+data/molecules/h2o/*.bin
+data/molecules/*.dat
+data/molecules/*.asc
+data/bin_macos/
+data/bin_linux/
+data/synthe/linelists_full/tfort.*
+data/src/atlas12.for

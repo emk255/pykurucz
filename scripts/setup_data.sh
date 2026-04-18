@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# scripts/setup_data.sh
+# scripts/setup_data.sh — DEVELOPER / LAB MACHINES ONLY
 #
-# Populate pykurucz/data/ from a kurucz/ source directory, making pykurucz
-# fully self-contained (no sibling kurucz/ repo required at runtime).
+# Populate pykurucz/data/ by copying files from an existing Kurucz data tree.
+# Requires local access to a kurucz directory (e.g. tingyuansen/kurucz clone).
+#
+# External / public users: download the release tarball instead.
+# See data/README.md for instructions.
 #
 # Usage:
-#   bash scripts/setup_data.sh                     # source = ../kurucz (default)
 #   bash scripts/setup_data.sh --source /path/to/kurucz
+#   bash scripts/setup_data.sh                     # default: ../kurucz (sibling dir)
 #   bash scripts/setup_data.sh --source /path/to/kurucz --no-synthe
 #   bash scripts/setup_data.sh --dry-run
 #
 # Flags:
 #   --source DIR    Path to the kurucz repository or data directory.
-#                   Default: ../kurucz (sibling directory).
-#   --no-synthe     Skip the 13 GB synthe/linelists_full/ tfort.* files.
-#                   Use this if you only need the pure Python pipeline
-#                   (pykurucz.py) and not run_e2e_pipeline.py's Fortran SYNTHE branch.
+#                   Default: ../kurucz (sibling directory — lab convention only).
+#   --no-synthe     Skip the ~13 GB synthe/linelists_full/ tfort.* files.
+#                   Use when you only need the Python pipeline (not Fortran SYNTHE).
 #   --dry-run       Print what would be copied without actually copying.
 #
-# After running this script, pykurucz.py and all tools use data/ by default.
-# The data/ large files are git-ignored (see .gitignore); only small text
-# files (molecules.new, *.dat in lines/, spectrv_std.input) are tracked.
+# After running, pykurucz.py and all tools use data/ by default.
+# Large files are git-ignored (see .gitignore); only small text files are tracked.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 

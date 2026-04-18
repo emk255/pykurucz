@@ -9,17 +9,23 @@ import numpy as np
 
 
 def discover_default_molecular_line_directories() -> List[Path]:
-    """Return ``../kurucz/molecules`` next to the pykurucz repo root if it exists.
+    """Return ``data/molecules`` inside the pykurucz repo if it exists.
 
-    Matches a common layout: clone ``tingyuansen/kurucz`` and ``tingyuansen/pykurucz``
-    as sibling directories so ``all_kurucz/kurucz/molecules`` sits beside ``pykurucz/``.
-    If the directory is missing, returns an empty list (atomic-line synthesis only).
+    The data/ directory is populated by running ``scripts/setup_data.sh`` once.
+    Falls back to the sibling ``../kurucz/molecules`` layout for backwards
+    compatibility. If neither is present, returns an empty list (atomic-line
+    synthesis only).
     """
 
     pykurucz_root = Path(__file__).resolve().parent.parent
-    candidate = (pykurucz_root.parent / "kurucz" / "molecules").resolve()
-    if candidate.is_dir():
+    # Preferred: self-contained data/ tree inside pykurucz
+    candidate = (pykurucz_root / "data" / "molecules").resolve()
+    if candidate.is_dir() and any(candidate.iterdir()):
         return [candidate]
+    # Fallback: sibling kurucz/ repo (legacy layout)
+    fallback = (pykurucz_root.parent / "kurucz" / "molecules").resolve()
+    if fallback.is_dir():
+        return [fallback]
     return []
 
 

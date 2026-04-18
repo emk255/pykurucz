@@ -1,21 +1,31 @@
 #!/usr/bin/env python
-"""End-to-end spectrum synthesis: stellar parameters -> synthetic spectrum.
+"""End-to-end Python spectrum synthesis: stellar parameters → synthetic spectrum.
 
-Combines the ATLAS12 neural network emulator (kurucz-a1) with synthe_py
-to go directly from (Teff, logg, [M/H], [alpha/M]) to a synthetic
-spectrum — entirely in Python, no Fortran required.
+Pipeline (the only supported flow):
 
-The emulator predicts the closest atmospheric structure for the 4 global
-stellar parameters.  Individual element abundances can be overridden in
-the resulting .atm file (the atmospheric *structure* is approximate for
-the nearest 4-parameter model, but the *line opacities* in SYNTHE will
-use the exact abundances you specify).
+    Teff / logg / [M/H] / [α/M]
+        └─► kurucz-a1 emulator  ──► warm-start .atm
+                                 └─► atlas_py.cli (1 iteration, MOLECULES ON)
+                                     └─► iterated .atm
+                                         └─► synthe_py.cli
+                                             └─► .spec
 
-Note: synthe_py is a standalone SYNTHE reimplementation that works with
-any .atm file.  This script is a convenience wrapper that generates the
-atmosphere first.  A full Python reimplementation of ATLAS12 (which would
-self-consistently solve for atmospheric structure at arbitrary abundances)
-is the next step.
+The emulator plays the same role as READ DECK6 in the Fortran pipeline: it
+supplies the starting layer structure so that atlas_py converges quickly
+rather than starting from a grey approximation.  atlas_py is always run to
+self-consistently iterate the atmospheric structure with the same physics as
+Fortran ATLAS12 (MOLECULES ON) — skipping it would silently diverge from
+Fortran parity and is therefore not offered as an option.
+
+This module also exposes the building blocks for the same flow as
+public helpers so that other tools (e.g. run_e2e_pipeline.py) can reuse them
+without duplicating the subprocess plumbing:
+
+    emulator_warmstart_atm(...)  -> Path    # stellar params → warm-start .atm
+    run_atlas_py(...)            -> Path    # warm-start .atm → iterated .atm
+    run_synthe_py(...)           -> Path    # iterated .atm → .spec
+
+Requires the self-contained ``data/`` tree (run ``scripts/setup_data.sh`` once).
 
 Usage:
     python pykurucz.py --teff 5770 --logg 4.44
@@ -29,6 +39,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -241,7 +252,315 @@ def write_atm_file(path: Path, teff: float, logg: float,
         f.write('\n'.join(lines))
 
 
-# ── End-to-end pipeline ─────────────────────────────────────────────────
+# ── Shared pipeline helpers ─────────────────────────────────────────────
+#
+# The three public helpers below are the canonical Python-pipeline building
+# blocks.  ``synthesize()`` chains them, and run_e2e_pipeline.py imports them
+# directly so that both user-facing and validation runs go through the exact
+# same code paths.
+
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _default_kurucz_root() -> Path:
+    """Self-contained data tree populated by ``scripts/setup_data.sh``."""
+    return _REPO_ROOT / "data"
+
+
+def _ensure_gfpred_assembled(gfpred_bin: Path) -> None:
+    """Assemble ``gfpred29dec2014.bin`` from split parts if not yet present."""
+    if gfpred_bin.exists():
+        return
+    parts = [
+        gfpred_bin.with_name(gfpred_bin.name + ".partaa"),
+        gfpred_bin.with_name(gfpred_bin.name + ".partab"),
+        gfpred_bin.with_name(gfpred_bin.name + ".partac"),
+    ]
+    missing = [p for p in parts if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing gfpred parts: " + ", ".join(str(p) for p in missing)
+            + "\nRun scripts/setup_data.sh to populate data/lines/."
+        )
+    gfpred_bin.parent.mkdir(parents=True, exist_ok=True)
+    with gfpred_bin.open("wb") as out:
+        for part in parts:
+            out.write(part.read_bytes())
+
+
+def _run_streaming(
+    cmd: list[str],
+    *,
+    cwd: Optional[Path] = None,
+    log_handle=None,
+) -> None:
+    """Stream merged stdout/stderr from *cmd* into *log_handle* line-by-line.
+
+    Runs child Python with ``PYTHONUNBUFFERED=1`` so INFO / ``Timing:`` logs
+    appear live instead of being buffered until process exit.
+    """
+    env = {**os.environ}
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    proc = subprocess.Popen(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        bufsize=1,
+    )
+    chunks: list[str] = []
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            chunks.append(line)
+            if log_handle is not None:
+                log_handle.write(line)
+                log_handle.flush()
+    proc.wait()
+    if proc.returncode != 0:
+        output = "".join(chunks)
+        raise RuntimeError(
+            f"Command failed ({proc.returncode}): {' '.join(cmd)}\n{output}"
+        )
+
+
+def emulator_warmstart_atm(
+    dest: Path,
+    *,
+    teff: float,
+    logg: float,
+    mh: float = 0.0,
+    am: float = 0.0,
+    vturb: float = 2.0,
+    abundances: Optional[Dict[int, float]] = None,
+) -> Path:
+    """Predict a warm-start atmosphere with kurucz-a1 and write it to *dest*.
+
+    The emulator is queried with effective ``[M/H]`` and ``[α/M]`` derived
+    from *abundances* (when provided) via :func:`derive_emulator_params`.
+    The resulting 9-column layer structure is written as a Kurucz-format
+    ``.atm`` file that atlas_py (and the Fortran pipeline) can consume as a
+    READ DECK6 starting point.
+    """
+    try:
+        import torch  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyTorch is required for the kurucz-a1 emulator. "
+            "Install with: pip install torch"
+        ) from exc
+
+    from emulator import load_emulator
+
+    eff_mh, eff_am = derive_emulator_params(mh, am, abundances)
+    emulator = load_emulator()
+    data_9col = emulator.predict_atmosphere_data(teff, logg, eff_mh, eff_am, vturb)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    write_atm_file(
+        dest, teff, logg, data_9col, vturb,
+        mh=mh, am=am, individual=abundances,
+    )
+    return dest
+
+
+def run_atlas_py(
+    input_atm: Path,
+    output_atm: Path,
+    *,
+    log_path: Path,
+    kurucz_root: Optional[Path] = None,
+    iterations: int = 1,
+    fort12_bin: Optional[Path] = None,
+) -> Path:
+    """Run ``atlas_py.cli`` on *input_atm* and write iterated output to *output_atm*.
+
+    ``--enable-molecules`` is always passed to match the Fortran deck, which
+    always includes ``MOLECULES ON``.  The molecular opacity path would
+    silently diverge otherwise (validated: this was the root cause of the
+    90% Na D discrepancy for cool stars before the flag was added).
+
+    Parameters
+    ----------
+    input_atm:
+        Starting atmosphere.  For the standard flow this is the emulator
+        warm-start written by :func:`emulator_warmstart_atm`.
+    output_atm:
+        Destination ``.atm`` file for the iterated atmosphere.
+    log_path:
+        File receiving combined stdout+stderr from ``atlas_py.cli``.
+    kurucz_root:
+        Data tree containing ``lines/`` and ``molecules/`` binaries.
+        Defaults to ``data/`` inside this repo.
+    iterations:
+        Number of outer atlas_py iterations (default 1; matches the
+        validated single-iteration Fortran parity pipeline).
+    fort12_bin:
+        Optional Fortran ``fort12`` line-selection binary to replay for
+        exact parity with a previous Fortran ATLAS run.  Used only by the
+        validation harness — unused in the user-facing flow.
+    """
+    root = (kurucz_root or _default_kurucz_root()).resolve()
+    lines_dir = root / "lines"
+    mol_dir = root / "molecules"
+
+    gfpred_bin = lines_dir / "gfpred29dec2014.bin"
+    lowobs_bin = lines_dir / "lowobsat12.bin"
+    hilines_bin = lines_dir / "hilines.bin"
+    diatomics_bin = lines_dir / "diatomicspacksrt.bin"
+    tio_bin = mol_dir / "tio" / "schwenke.bin"
+    h2o_bin = mol_dir / "h2o" / "h2ofastfix.bin"
+    nltelinobsat12_bin = lines_dir / "nltelinobsat12.bin"
+    molecules_new = lines_dir / "molecules.new"
+
+    _ensure_gfpred_assembled(gfpred_bin)
+    for p in (lowobs_bin, hilines_bin, molecules_new):
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Required atlas_py binary not found: {p}\n"
+                "Run scripts/setup_data.sh to populate data/."
+            )
+
+    output_atm.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "atlas_py.cli",
+        str(input_atm.resolve()),
+        "--output-atm", str(output_atm),
+        "--iterations", str(iterations),
+        "--fort11", str(gfpred_bin),
+        "--fort111", str(lowobs_bin),
+        "--fort21", str(hilines_bin),
+        "--fort31", str(diatomics_bin),
+        "--fort41", str(tio_bin),
+        "--fort51", str(h2o_bin),
+        "--nlteline-bin", str(nltelinobsat12_bin),
+        "--enable-molecules",
+        "--molecules", str(molecules_new),
+    ]
+    if fort12_bin is not None and fort12_bin.exists():
+        cmd.extend(["--line-selection-bin", str(fort12_bin)])
+
+    with log_path.open("w", encoding="utf-8") as logf:
+        try:
+            _run_streaming(cmd, cwd=_REPO_ROOT, log_handle=logf)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"atlas_py.cli failed. See log: {log_path}\n{exc}"
+            ) from exc
+    return output_atm
+
+
+def run_synthe_py(
+    atm: Path,
+    *,
+    spec: Path,
+    npz: Path,
+    log_path: Path,
+    wl_start: float = 300.0,
+    wl_end: float = 1800.0,
+    resolution: float = 300_000.0,
+    n_workers: Optional[int] = None,
+    kurucz_root: Optional[Path] = None,
+    use_molecular_lines: bool = True,
+    include_tio: bool = True,
+    include_h2o: bool = True,
+) -> Path:
+    """Convert *atm* to NPZ and run ``synthe_py.cli`` to produce *spec*.
+
+    Two stages are executed and logged into *log_path* with timing markers:
+      1. ``synthe_py/tools/convert_atm_to_npz.py`` — populations, molecular
+         equilibrium, continuous opacity → ``.npz``.
+      2. ``synthe_py.cli`` — line opacity + radiative transfer → ``.spec``.
+
+    Parameters mirror the user-visible knobs of the CLI (wavelength window,
+    resolution, molecular-line toggles).  ``kurucz_root`` defaults to the
+    self-contained ``data/`` tree; its ``molecules/`` subdirectory is passed
+    as ``--molecules-dir`` so that Schwenke TiO and Partridge–Schwenke H₂O
+    line lists are picked up consistently with the Fortran pipeline.
+    """
+    root = (kurucz_root or _default_kurucz_root()).resolve()
+    line_list = _REPO_ROOT / "lines" / "gfallvac.latest"
+    atlas_tables = _REPO_ROOT / "synthe_py" / "data" / "atlas_tables.npz"
+    if not line_list.exists():
+        raise FileNotFoundError(f"Missing Python line list: {line_list}")
+    if not atlas_tables.exists():
+        raise FileNotFoundError(f"Missing atlas tables: {atlas_tables}")
+
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    npz.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cpu = os.cpu_count() or 1
+    workers = n_workers if n_workers is not None else cpu
+
+    with log_path.open("w", encoding="utf-8") as logf:
+        logf.write(
+            "======================================================================\n"
+            "pykurucz.run_synthe_py — streaming log (line-buffered)\n"
+            f"  atm:  {atm}\n"
+            f"  npz:  {npz}\n"
+            f"  spec: {spec}\n"
+            f"  wl:   {wl_start:.1f}–{wl_end:.1f} nm  R={resolution:.0f}  "
+            f"workers={workers}\n"
+            "======================================================================\n\n"
+        )
+        logf.flush()
+
+        t0 = time.perf_counter()
+        logf.write("==== STEP: convert_atm_to_npz START ====\n"); logf.flush()
+        _run_streaming(
+            [
+                sys.executable, "-u",
+                str(_REPO_ROOT / "synthe_py" / "tools" / "convert_atm_to_npz.py"),
+                str(atm.resolve()),
+                str(npz.resolve()),
+                "--atlas-tables", str(atlas_tables.resolve()),
+            ],
+            cwd=_REPO_ROOT,
+            log_handle=logf,
+        )
+        logf.write(
+            f"==== STEP: convert_atm_to_npz END wall={time.perf_counter() - t0:.3f}s ====\n\n"
+        )
+        logf.flush()
+
+        cmd = [
+            sys.executable, "-u", "-m", "synthe_py.cli",
+            str(atm.resolve()),
+            str(line_list.resolve()),
+            "--npz", str(npz.resolve()),
+            "--spec", str(spec.resolve()),
+            "--wl-start", str(wl_start),
+            "--wl-end", str(wl_end),
+            "--resolution", str(resolution),
+            "--n-workers", str(workers),
+            "--log-level", "INFO",
+        ]
+        mol_dir = root / "molecules"
+        if not use_molecular_lines:
+            cmd.append("--no-molecular-lines")
+        elif mol_dir.is_dir():
+            cmd.extend(["--molecules-dir", str(mol_dir)])
+        if use_molecular_lines:
+            if not include_tio:
+                cmd.append("--no-tio")
+            if not include_h2o:
+                cmd.append("--no-h2o")
+
+        t1 = time.perf_counter()
+        logf.write("==== STEP: synthe_py.cli START ====\n"); logf.flush()
+        _run_streaming(cmd, cwd=_REPO_ROOT, log_handle=logf)
+        logf.write(
+            f"==== STEP: synthe_py.cli END wall={time.perf_counter() - t1:.3f}s ====\n"
+        )
+        logf.flush()
+
+    return spec
+
+
+# ── End-to-end orchestrator (user-facing) ───────────────────────────────
 
 def synthesize(
     teff: float,
@@ -254,28 +573,24 @@ def synthesize(
     resolution: float = 300_000.0,
     abundances: Optional[Dict[int, float]] = None,
     output_dir: Optional[str] = None,
+    use_molecular_lines: bool = True,
+    include_tio: bool = True,
+    include_h2o: bool = True,
+    atlas_iterations: int = 1,
+    n_workers: Optional[int] = None,
 ) -> Path:
     """Generate a synthetic spectrum from stellar parameters.
 
-    This is the main entry point for end-to-end synthesis:
-      1. Predict atmospheric structure with the kurucz-a1 neural network
-         emulator, using the 4 global parameters (Teff, logg, [M/H],
-         [alpha/M]) to find the closest atmospheric model.
-      2. Write a Kurucz-format .atm file with the requested abundances
-         (including any individual element overrides).
-      3. Convert to .npz (atmosphere preprocessing: populations,
-         molecular equilibrium, continuous opacity).
-      4. Run synthe_py spectrum synthesis.
+    Runs the canonical Python pipeline:
 
-    The emulator predicts atmospheric *structure* (T, P, etc. vs depth)
-    for the nearest 4-parameter model.  When individual abundances are
-    provided, [M/H] and [alpha/M] for the emulator are derived from
-    the specified abundances (Fe as the metallicity proxy, average of
-    alpha elements O/Ne/Mg/Si/S/Ca/Ti for [alpha/M]).  The exact
-    individual abundances are written into the .atm abundance table
-    and used by SYNTHE for line opacities.  For self-consistent
-    treatment of non-standard abundances in the atmospheric structure
-    itself, a full ATLAS12 iteration would be needed (future work).
+        emulator → warm-start .atm → atlas_py (1 iter, MOLECULES ON) →
+        iterated .atm → convert_atm_to_npz → synthe_py.cli → .spec
+
+    The emulator provides the starting layer structure (same role as
+    READ DECK6 in the Fortran pipeline); atlas_py then self-consistently
+    iterates the atmospheric structure with the same physics as Fortran
+    ATLAS12 so that the downstream SYNTHE spectrum stays in parity with
+    Fortran-generated references.
 
     Parameters
     ----------
@@ -284,52 +599,47 @@ def synthesize(
     logg : float
         Surface gravity (log10 cgs).
     mh : float
-        Overall metallicity [M/H] (default: 0.0, solar).  Scales all
-        metals uniformly.  When --abund is used without --mh, this
-        stays at 0 (solar baseline); only the specified elements change.
+        Overall metallicity [M/H] (default 0.0, solar).
     am : float
-        Alpha enhancement [alpha/M] (default: 0.0).  Additional offset
-        applied to alpha elements (O, Ne, Mg, Si, S, Ca, Ti) on top
-        of [M/H].
+        Alpha enhancement [alpha/M] (default 0.0).
     vturb : float
-        Microturbulent velocity in km/s (default: 2.0).
+        Microturbulent velocity in km/s (default 2.0).
     wl_start, wl_end : float
-        Wavelength range in nanometers (default: 300-1800 nm).
+        Wavelength range in nanometres (default 300–1800 nm).
     resolution : float
-        Resolving power lambda/delta_lambda (default: 300,000).
+        Resolving power lambda/delta_lambda (default 300 000).
     abundances : dict, optional
         Individual element offsets {Z: dex_offset_from_solar}.
-        E.g. {26: -1.0, 6: +0.5} to set [Fe/H]=-1.0 and [C/H]=+0.5.
-        These override the [M/H]/[alpha/M] scaling for those elements.
     output_dir : str, optional
-        Directory for output files. Defaults to results/.
+        Directory for output files. Defaults to ``results/``.
+    use_molecular_lines : bool
+        Pass molecular catalogs to synthe_py.cli (default True).
+    include_tio, include_h2o : bool
+        Include Schwenke TiO / Partridge–Schwenke H₂O (default True).
+    atlas_iterations : int
+        Number of atlas_py outer iterations (default 1, matching the
+        validated single-iteration Fortran parity pipeline).
+    n_workers : int, optional
+        Worker count for synthe_py.cli (default: all logical CPUs).
 
     Returns
     -------
     Path
-        Path to the output .spec file.
+        Path to the output ``.spec`` file.
     """
-    repo_root = Path(__file__).resolve().parent
-
     if output_dir is None:
-        output_dir = str(repo_root / "results")
+        output_dir = str(_REPO_ROOT / "results")
     output_path = Path(output_dir)
 
     npz_dir = output_path / "npz"
     spec_dir = output_path / "spec"
     log_dir = output_path / "logs"
     atm_dir = output_path / "atm"
-    for d in [npz_dir, spec_dir, log_dir, atm_dir]:
+    for d in (npz_dir, spec_dir, log_dir, atm_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # Derive effective [M/H] and [alpha/M] for the emulator from
-    # individual abundances (if any).  Fe -> [M/H] proxy, average of
-    # alpha elements -> [alpha/M] proxy.
     eff_mh, eff_am = derive_emulator_params(mh, am, abundances)
 
-    # Warn if parameters are outside the emulator's training range
-    # (Li et al. 2025: Teff 2500-50000, logg -1 to 5.5,
-    #  [Fe/H] -4 to +1.46, [alpha/Fe] -0.2 to +0.62)
     warnings = []
     if not (2500 <= teff <= 50000):
         warnings.append(f"Teff={teff:.0f} K outside training range [2500, 50000]")
@@ -347,17 +657,21 @@ def synthesize(
         print("           with synthesize_from_atm.py instead.")
 
     stem = f"t{int(teff):05d}g{logg:.2f}_mh{eff_mh:+.2f}_am{eff_am:+.2f}"
+    warmstart_atm = atm_dir / f"{stem}_warmstart.atm"
     atm_path = atm_dir / f"{stem}.atm"
     npz_path = npz_dir / f"{stem}.npz"
     spec_path = spec_dir / f"{stem}_{int(wl_start)}_{int(wl_end)}.spec"
-    log_path = log_dir / f"{stem}_{int(wl_start)}_{int(wl_end)}.log"
+    atlas_log = log_dir / f"{stem}_atlas.log"
+    synthe_log = log_dir / f"{stem}_synthe_{int(wl_start)}_{int(wl_end)}.log"
 
-    # ── Stage 1: Predict atmosphere with kurucz-a1 emulator ──────────
-    print("[1/3] Predicting atmosphere with kurucz-a1 emulator...")
+    # ── Stage 1: Emulator warm-start ────────────────────────────────────
+    print("[1/3] Predicting warm-start atmosphere with kurucz-a1 emulator...")
     print(f"      Teff={teff:.0f} K, logg={logg:.2f}, vturb={vturb:.1f} km/s")
     if abundances:
-        overrides = ', '.join(
-            f'[{ELEM_SYM.get(z, f"Z={z}")}/H]={v:+.2f}' for z, v in sorted(abundances.items()))
+        overrides = ", ".join(
+            f'[{ELEM_SYM.get(z, f"Z={z}")}/H]={v:+.2f}'
+            for z, v in sorted(abundances.items())
+        )
         print(f"      Individual abundances: {overrides}")
         if eff_mh != mh or eff_am != am:
             print(f"      Derived emulator params: [M/H]={eff_mh:+.2f}, [alpha/M]={eff_am:+.2f}")
@@ -367,65 +681,57 @@ def synthesize(
         print(f"      [M/H]={mh:+.2f}, [alpha/M]={am:+.2f}")
 
     try:
-        import torch  # noqa: F401
-    except ImportError:
-        print("ERROR: PyTorch is required for the ATLAS12 emulator.")
-        print("       Install with: pip install torch")
+        emulator_warmstart_atm(
+            warmstart_atm,
+            teff=teff, logg=logg, mh=mh, am=am, vturb=vturb,
+            abundances=abundances,
+        )
+    except RuntimeError as exc:
+        print(f"ERROR in emulator: {exc}")
+        sys.exit(1)
+    print(f"      Warm-start: {warmstart_atm}")
+
+    # ── Stage 2: atlas_py iteration ─────────────────────────────────────
+    print(f"[2/3] Running atlas_py ({atlas_iterations} iteration(s), MOLECULES ON)...")
+    try:
+        run_atlas_py(
+            input_atm=warmstart_atm,
+            output_atm=atm_path,
+            log_path=atlas_log,
+            iterations=atlas_iterations,
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"ERROR in atlas_py: {exc}")
+        sys.exit(1)
+    print(f"      Iterated atmosphere: {atm_path}")
+    print(f"      Log: {atlas_log}")
+
+    # ── Stage 3: synthe_py ──────────────────────────────────────────────
+    print(
+        f"[3/3] Running synthe_py ({wl_start:.0f}–{wl_end:.0f} nm, "
+        f"R={resolution:.0f})..."
+    )
+    try:
+        run_synthe_py(
+            atm_path,
+            spec=spec_path,
+            npz=npz_path,
+            log_path=synthe_log,
+            wl_start=wl_start,
+            wl_end=wl_end,
+            resolution=resolution,
+            n_workers=n_workers,
+            use_molecular_lines=use_molecular_lines,
+            include_tio=include_tio,
+            include_h2o=include_h2o,
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"ERROR in synthe_py: {exc}. See log: {synthe_log}")
         sys.exit(1)
 
-    from emulator import load_emulator
-
-    emulator = load_emulator()
-    data_9col = emulator.predict_atmosphere_data(teff, logg, eff_mh, eff_am, vturb)
-
-    write_atm_file(atm_path, teff, logg, data_9col, vturb,
-                   mh=mh, am=am, individual=abundances)
-    print(f"      Atmosphere: {atm_path}")
-
-    # ── Stage 2: Convert .atm to .npz ────────────────────────────────
-    print("[2/3] Converting atmosphere to NPZ...")
-    atlas_tables = repo_root / "synthe_py" / "data" / "atlas_tables.npz"
-
-    cmd_convert = [
-        sys.executable,
-        str(repo_root / "synthe_py" / "tools" / "convert_atm_to_npz.py"),
-        str(atm_path), str(npz_path),
-        "--atlas-tables", str(atlas_tables),
-    ]
-    result = subprocess.run(cmd_convert, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"ERROR in convert_atm_to_npz:\n{result.stderr}")
-        sys.exit(1)
     print(f"      NPZ: {npz_path}")
-
-    # ── Stage 3: Run synthe_py ────────────────────────────────────────
-    print(f"[3/3] Running synthe_py ({wl_start:.0f}-{wl_end:.0f} nm, R={resolution:.0f})...")
-    line_list = repo_root / "lines" / "gfallvac.latest"
-    cache_dir = repo_root / "synthe_py" / "out" / "line_cache"
-    n_workers = os.cpu_count() or 1
-
-    cmd_synthe = [
-        sys.executable, "-m", "synthe_py.cli",
-        str(atm_path), str(line_list),
-        "--npz", str(npz_path),
-        "--spec", str(spec_path),
-        "--wl-start", str(wl_start),
-        "--wl-end", str(wl_end),
-        "--resolution", str(resolution),
-        "--n-workers", str(n_workers),
-        "--cache", str(cache_dir),
-        "--log-level", "INFO",
-    ]
-
-    with open(log_path, "w") as logf:
-        proc = subprocess.run(cmd_synthe, stdout=logf, stderr=subprocess.STDOUT)
-
-    if proc.returncode != 0:
-        print(f"ERROR: synthe_py failed. See log: {log_path}")
-        sys.exit(1)
-
     print(f"      Spectrum: {spec_path}")
-    print(f"      Log: {log_path}")
+    print(f"      Log: {synthe_log}")
     print(f"\nDone! Output: {spec_path}")
     return spec_path
 
@@ -434,9 +740,13 @@ def synthesize(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="End-to-end spectrum synthesis: stellar parameters -> synthetic spectrum",
+        description="Python spectrum synthesis: stellar parameters → synthetic spectrum",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Pipeline (always):
+  kurucz-a1 emulator → warm-start .atm → atlas_py (MOLECULES ON) →
+  iterated .atm → convert_atm_to_npz → synthe_py.cli → .spec
+
 Examples:
   # Solar-type star, full wavelength range
   python pykurucz.py --teff 5770 --logg 4.44
@@ -451,7 +761,7 @@ Examples:
   # Hot B star, optical only
   python pykurucz.py --teff 15000 --logg 4.0 --wl-start 350 --wl-end 700
 
-  # Quick low-resolution run
+  # Low-resolution run
   python pykurucz.py --teff 5770 --logg 4.44 --resolution 50000
 
 Notes:
@@ -460,20 +770,16 @@ Notes:
   --abund sets individual element offsets relative to solar (Asplund).
     e.g. --abund Fe:-1.0 means [Fe/H] = -1.0 dex below solar.
 
-  These can be combined:
-    --mh -1.0 --abund C:+0.5   # all metals at -1 dex, but [C/H]=+0.5
-    --abund Fe:-1.0             # only Fe changes, rest stay solar
-
   For the emulator's atmospheric structure prediction:
     - [M/H] is proxied by Fe: if --abund Fe is given, [M/H] ~ [Fe/H]_eff
     - [alpha/M] is the mean offset of alpha elements (O,Ne,Mg,Si,S,Ca,Ti)
     - Unspecified elements follow the --mh/--am scaling
 
   The exact abundances (solar + offsets) are written into the .atm file
-  and used by SYNTHE for line opacities.
+  and used by both atlas_py and synthe_py.
 
-  A full Python ATLAS12 that self-consistently solves for atmospheric
-  structure at arbitrary abundances is planned as future work.
+  If you already have a .atm file from another source and want to skip both
+  the emulator and atlas_py, use synthesize_from_atm.py instead.
 """,
     )
     parser.add_argument("--teff", type=float, required=True,
@@ -501,6 +807,24 @@ Notes:
                         help="Resolving power (default: 300000)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: results/)")
+    parser.add_argument(
+        "--no-molecular-lines",
+        action="store_true",
+        default=False,
+        help="Atomic GFALL lines only (disable molecular line lists).",
+    )
+    parser.add_argument(
+        "--no-tio",
+        action="store_true",
+        default=False,
+        help="Exclude Schwenke TiO lines when molecular data are enabled.",
+    )
+    parser.add_argument(
+        "--no-h2o",
+        action="store_true",
+        default=False,
+        help="Exclude Partridge-Schwenke H2O lines when molecular data are enabled.",
+    )
     args = parser.parse_args()
 
     individual = None
@@ -518,6 +842,9 @@ Notes:
         resolution=args.resolution,
         abundances=individual,
         output_dir=args.output_dir,
+        use_molecular_lines=not args.no_molecular_lines,
+        include_tio=not args.no_tio,
+        include_h2o=not args.no_h2o,
     )
 
 

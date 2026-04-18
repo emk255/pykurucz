@@ -252,12 +252,15 @@ def find_molecular_data_file(search_paths: Optional[list[Path]] = None) -> Optio
         Path to molecular data file if found, None otherwise
     """
     if search_paths is None:
-        # Default search paths
+        _repo_root = Path(__file__).resolve().parents[2]
+        # Default search paths — prefer self-contained data/lines/, then repo lines/,
+        # then sibling kurucz/ (legacy layout)
         search_paths = [
+            _repo_root / "data" / "lines" / "molecules.dat",
+            _repo_root / "lines" / "molecules.dat",
+            _repo_root.parent / "kurucz" / "lines" / "molecules.dat",
             Path("lines/molecules.dat"),
             Path("synthe/lines/molecules.dat"),
-            Path("kurucz/lines/molecules.dat"),
-            Path(__file__).parent.parent.parent / "lines" / "molecules.dat",
         ]
     
     for path in search_paths:

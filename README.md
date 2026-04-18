@@ -57,7 +57,7 @@ This project is dedicated to the memory of <strong>Robert L. Kurucz</strong> (19
 
 # pyKurucz — Pure Python Stellar Spectrum Synthesis
 
-**A ground-truth reimplementation of Kurucz's SYNTHE in pure Python** — atomic-line synthesis validated to sub-0.01% agreement with the original Fortran; molecular lines use the same Fortran-grounded path and are **on by default** when a sibling `kurucz/molecules/` tree is present (TiO/H₂O binaries are included if the files exist). Use `--no-molecular-lines` for atomic-only runs. No Fortran compiler needed. Just Python, NumPy, SciPy, and Numba.
+**A ground-truth reimplementation of Kurucz's SYNTHE in pure Python** — atomic-line synthesis validated to sub-0.01% agreement with the original Fortran; molecular lines use the same Fortran-grounded path and are **on by default** when `data/molecules/` is populated (TiO/H₂O binaries are included if the files exist). Use `--no-molecular-lines` for atomic-only runs. No Fortran compiler needed. Just Python, NumPy, SciPy, and Numba.
 
 **Authors:** Elliot M. Kim (Cornell) and Yuan-Sen Ting (The Ohio State), building on the original Fortran codes by Robert L. Kurucz (CfA/Harvard & Smithsonian).
 
@@ -70,12 +70,27 @@ pip install -r requirements.txt
 mkdir -p results
 ```
 
-**Synthesize from an existing atmosphere file** (no PyTorch needed):
+**Populate the self-contained data directory** (copies line/molecule binaries and Fortran executables from a local kurucz data source — only needed once):
 
 ```bash
-# Try it now with a bundled sample atmosphere
-python synthe_py/tools/convert_atm_to_npz.py samples/at12_aaaaa_t08250g4.00.atm results/model.npz
-python -m synthe_py.cli samples/at12_aaaaa_t08250g4.00.atm lines/gfallvac.latest \
+# If you have a sibling kurucz/ repo (default source):
+bash scripts/setup_data.sh
+
+# Or point to any other copy of the kurucz data:
+bash scripts/setup_data.sh --source /path/to/kurucz
+
+# Skip the 13 GB SYNTHE line lists if you only need the Python pipeline:
+bash scripts/setup_data.sh --no-synthe
+```
+
+This copies everything into `data/` inside the repo. The large binary files are git-ignored; only small text files (`molecules.new`, `molecules.dat`, `continua.dat`, `he1tables.dat`, `spectrv_std.input`) are tracked.
+
+**Synthesize from an existing atmosphere file** (no PyTorch needed; `data/` required only for molecular/GFALL paths you enable):
+
+```bash
+# Replace paths with your ATLAS12-format .atm and GFALL line list
+python synthe_py/tools/convert_atm_to_npz.py path/to/model.atm results/model.npz
+python -m synthe_py.cli path/to/model.atm lines/gfallvac.latest \
     --npz results/model.npz --spec results/output.spec --wl-start 500 --wl-end 510
 ```
 
@@ -93,19 +108,20 @@ Both produce a `.spec` file with wavelength, flux, and continuum columns. Use a 
 
 Bob Kurucz's codes — ATLAS, SYNTHE, DFSYNTHE, WIDTH, BALMER — together with his atomic and molecular line lists, form one of the most consequential software ecosystems in astrophysics. They have been used to analyze spectra from nearly every major telescope and spectroscopic survey for decades, accumulating tens of thousands of citations. But the original Fortran codebase, developed continuously since the 1960s, is increasingly difficult to compile, install, modify, and integrate with modern workflows.
 
-pyKurucz is a line-by-line numerical reimplementation — not a wrapper around Fortran — ensuring that this extraordinary body of work remains accessible, extensible, and usable for the next generation of astronomers. The core is faithful SYNTHE-class spectrum synthesis from a model atmosphere, including **molecular line opacity** loaded automatically from a sibling `kurucz/molecules/` directory when present (with Schwenke TiO and Partridge–Schwenke H₂O if the binaries are there). Override with `--molecules-dir` or switch off with `--no-molecular-lines`.
+pyKurucz is a line-by-line numerical reimplementation — not a wrapper around Fortran — ensuring that this extraordinary body of work remains accessible, extensible, and usable for the next generation of astronomers. The core is faithful SYNTHE-class spectrum synthesis from a model atmosphere, including **molecular line opacity** loaded automatically from `data/molecules/` when populated via `bash scripts/setup_data.sh` (with Schwenke TiO and Partridge–Schwenke H₂O if the binaries are there). Override with `--molecules-dir` or switch off with `--no-molecular-lines`.
 
 
 ## Two modes of operation
 
-Spectrum synthesis requires a **model atmosphere** as input — a description of how temperature, pressure, and density vary with depth in the star. `synthe_py` is agnostic about where that atmosphere comes from. This repository offers two ways to supply one:
+Spectrum synthesis requires a **model atmosphere** as input — a description of how temperature, pressure, and density vary with depth in the star. `synthe_py` is agnostic about where that atmosphere comes from. This repository offers two entry points:
 
-| | Mode A | Mode B |
+| | Mode A (`synthesize_from_atm.py`) | Mode B (`pykurucz.py`) |
 |---|---|---|
-| **Input** | Your own `.atm` file | Stellar parameters ($T_{\text{eff}}$, $\log g$, [M/H], [α/M]) |
-| **Atmosphere source** | Pre-computed (ATLAS12, MARCS, PHOENIX, etc.) | Neural network emulator (kurucz-a1) |
-| **Dependencies** | Core only | Core + PyTorch |
-| **Best for** | Full control, non-standard abundances, outside emulator range | Quick exploration, no pre-computed atmosphere available |
+| **Input** | Your own `.atm` file | Stellar parameters (Teff, logg, [M/H], [α/M]) |
+| **Atmosphere source** | Pre-computed (ATLAS12, MARCS, PHOENIX, etc.) | Emulator warm-start → `atlas_py` self-consistent iteration |
+| **Dependencies** | Core only | Core + PyTorch + `data/` (populated via `scripts/setup_data.sh`) |
+| **Atmosphere physics** | Exact (whatever generated the `.atm`) | Full Python ATLAS12 (Fortran-parity) |
+| **Best for** | Full control, outside emulator range, or reusing an external atmosphere | End-to-end synthesis straight from stellar parameters |
 
 ### Mode A examples
 
@@ -113,7 +129,7 @@ Spectrum synthesis requires a **model atmosphere** as input — a description of
 # Step 1: Preprocess the atmosphere (populations, molecular equilibrium, opacities)
 python synthe_py/tools/convert_atm_to_npz.py your_model.atm results/your_model.npz
 
-# Step 2: Run synthesis (molecular lines default ON if ../kurucz/molecules exists;
+# Step 2: Run synthesis (molecular lines default ON if data/molecules/ is populated;
 # TiO/H2O load when schwenke.bin / h2ofastfix.bin are found — use --no-tio / --no-h2o to skip)
 python -m synthe_py.cli your_model.atm lines/gfallvac.latest \
     --npz results/your_model.npz --spec results/your_model.spec \
@@ -132,6 +148,17 @@ python -m synthe_py.cli your_model.atm lines/gfallvac.latest \
 
 ### Mode B examples
 
+`pykurucz.py` runs a single canonical pipeline:
+
+```
+kurucz-a1 emulator ──► warm-start .atm ──► atlas_py (MOLECULES ON)
+                                     └──► iterated .atm ──► synthe_py ──► .spec
+```
+
+The emulator plays the same role as `READ DECK6` in the Fortran pipeline: it supplies the starting layer structure so that `atlas_py` converges quickly rather than starting from a grey approximation. `atlas_py` then self-consistently iterates the atmospheric structure with the same physics as Fortran ATLAS12 (always `MOLECULES ON`, matching the Fortran deck), so the downstream SYNTHE spectrum stays in parity with Fortran references.
+
+Requires `data/` to be populated once via `bash scripts/setup_data.sh`.
+
 ```bash
 # Solar-type star, full wavelength range
 python pykurucz.py --teff 5770 --logg 4.44
@@ -145,7 +172,7 @@ python pykurucz.py --teff 5770 --logg 4.44 --abund C:+0.5 --abund Fe:-1.0
 # Optical only, lower resolution (faster)
 python pykurucz.py --teff 5770 --logg 4.44 --wl-start 400 --wl-end 700 --resolution 50000
 
-# Cool-star run (molecular lines default on if ../kurucz/molecules exists)
+# Cool star (molecular lines default on when data/molecules/ is populated)
 python pykurucz.py --teff 4000 --logg 4.5
 
 # Turn off molecular lines or specific binaries
@@ -153,9 +180,21 @@ python pykurucz.py --teff 5770 --logg 4.44 --no-molecular-lines
 python pykurucz.py --teff 4000 --logg 4.5 --no-tio --no-h2o
 ```
 
-The emulator is trained on 104,269 ATLAS12 models ($T_{\text{eff}}$ 2,500–50,000 K, $\log g$ −1.0–5.5, [M/H] −4.0–+1.5, [α/M] −0.2–+0.6). Outside this range, the code warns you — use Mode A instead.
+The emulator is trained on 104,269 ATLAS12 models ($T_{\text{eff}}$ 2,500–50,000 K, $\log g$ −1.0–5.5, [M/H] −4.0–+1.5, [α/M] −0.2–+0.6). Outside this range the emulator warm-start becomes unreliable and the code warns you — use Mode A instead with an externally computed atmosphere.
 
-> **Note**: The emulator approximates the nearest 4-parameter atmospheric model. It cannot self-consistently iterate the atmosphere for arbitrary abundance patterns. If your science depends on this, use **Mode A** with an atmosphere from the full ATLAS12 or another atmosphere code.
+**Output layout** (under `results/` or `--output-dir`):
+```
+atm/<stem>_warmstart.atm   emulator prediction (READ DECK6 for atlas_py)
+atm/<stem>.atm             atlas_py iterated atmosphere
+npz/<stem>.npz             preprocessed populations / opacity tables
+spec/<stem>_<wl0>_<wl1>.spec   final spectrum
+logs/<stem>_atlas.log          atlas_py.cli log
+logs/<stem>_synthe_<wl0>_<wl1>.log   convert_atm_to_npz + synthe_py.cli log
+```
+
+`<stem>` is `t{Teff:05d}g{logg:.2f}_mh{eff_mh:+.2f}_am{eff_am:+.2f}`.
+
+If you need to skip both the emulator and `atlas_py` (e.g. you already have a `.atm` from another source), use Mode A (`synthesize_from_atm.py`) directly.
 
 
 ## What `synthe_py` does under the hood
@@ -185,47 +224,52 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
 ## How the pipeline works
 
 ```
-  MODE A (own .atm)              MODE B (emulator)
- ──────────────────         ───────────────────────────
-                            Stellar parameters
-  Your .atm file            (Teff, logg, [M/H], [alpha/M])
-  (from ATLAS12,                     │
-   MARCS, PHOENIX,                   v
-   or any source)           [kurucz-a1 emulator]
-        │                   (predicts atmospheric
-        │                    structure)
-        │                            │
-        │                    generated .atm file
-        │                   (+ optional abundance
-        │                     overrides via --abund)
-        │                            │
-        └────────────┬───────────────┘
-                     │
-                     v
-          [convert_atm_to_npz.py]
-          (populations, molecular equil.,
-           continuous opacity coefficients)
-                     │
-                     v
-              [synthe_py.cli]
-          (line-by-line radiative transfer;
-           molecular catalogs + TiO/H2O by default when data exist)
-                     │
-                     v
-                 .spec file
-          (wavelength, flux, continuum)
+  MODE A (own .atm)                       MODE B (stellar parameters)
+ ──────────────────                ───────────────────────────────────
+                                    Teff, logg, [M/H], [α/M]
+  Your .atm file                              │
+  (from ATLAS12,                              v
+   MARCS, PHOENIX,                   [kurucz-a1 emulator]
+   or any source)                    (warm-start atmosphere)
+        │                                     │
+        │                              warm-start .atm
+        │                                     │
+        │                                     v
+        │                              [atlas_py.cli]
+        │                          (Python ATLAS12 iteration,
+        │                              MOLECULES ON)
+        │                                     │
+        │                              iterated .atm
+        │                           (+ optional abundance
+        │                             overrides via --abund)
+        │                                     │
+        └────────────────┬────────────────────┘
+                         │
+                         v
+              [convert_atm_to_npz.py]
+              (populations, molecular equil.,
+               continuous opacity coefficients)
+                         │
+                         v
+                  [synthe_py.cli]
+              (line-by-line radiative transfer;
+               molecular catalogs + TiO/H2O by default when data exist)
+                         │
+                         v
+                     .spec file
+              (wavelength, flux, continuum)
 ```
 
-**Stage 1 — Atmosphere**: Mode A reads your `.atm` file directly. Mode B runs the kurucz-a1 emulator to generate one.
+**Stage 1 — Atmosphere**: Mode A reads your `.atm` file directly. Mode B runs the kurucz-a1 emulator for a warm-start and then iterates it with `atlas_py` (full Python ATLAS12, `MOLECULES ON`) to stay in parity with Fortran ATLAS12 output.
 
 **Stage 2 — Preprocessing** (`convert_atm_to_npz.py`): Reads the `.atm` file and computes Saha–Boltzmann populations, molecular equilibrium (~300 species), continuous opacity coefficients (H⁻, H I, He, metals, scattering), and Doppler widths at each atmospheric layer.
 
 **Stage 3 — Synthesis** (`synthe_py.cli`): The core loop. For each wavelength point: evaluate continuum opacity, search atomic and (by default) molecular line lists when catalogs are available, compute profiles, solve the transfer equation. Outputs wavelength, $F_\lambda$, and $F_{\text{cont}}$.
 
 
-## Individual element abundances (Mode B only)
+## Individual element abundances (Mode B)
 
-When using the emulator (Mode B) and specifying individual element abundances via `--abund`, values are **dex offsets relative to Asplund solar** (e.g., `Fe:-1.0` means [Fe/H] = −1.0). The script automatically derives the best-matching 4-parameter model for the emulator:
+When using `pykurucz.py` (Mode B) and specifying individual element abundances via `--abund`, values are **dex offsets relative to Asplund solar** (e.g., `Fe:-1.0` means [Fe/H] = −1.0). The script automatically derives the best-matching 4-parameter model for the emulator warm-start:
 
 - **[M/H]**: proxied by the Fe offset (if given): $[\text{M/H}] \approx [\text{Fe/H}]$
 - **[α/M]**: computed as the average offset of alpha elements (O, Ne, Mg, Si, S, Ca, Ti) relative to the derived [M/H]
@@ -284,29 +328,73 @@ Pre-extracted from the original Fortran binary data arrays:
 
 ### Sample atmospheres and Fortran references
 
-- `samples/` — 5 ATLAS12 `.atm` files spanning 2500–44000 K for testing
-- `fortran_specs/` — pre-computed Fortran SYNTHE spectra for the same models (LFS), for validation
+Bundled `.atm` samples and matching `fortran_specs/` references may be distributed via **release assets** (same idea as the `data/` tarball) so the git repository stays small. For validation, use any ATLAS12-format `.atm` with `synthesize_from_atm.py` / `compare_spectra.py`, or run `run_e2e_pipeline.py` from stellar parameters.
+
+
+## End-to-end pipeline validation (`run_e2e_pipeline.py`)
+
+`run_e2e_pipeline.py` is the Fortran ↔ Python parity harness. Given stellar parameters, it uses the **same pipeline as `pykurucz.py`** on the Python side and runs Fortran ATLAS+SYNTHE on the same emulator warm-start, then (when `--mode both`) compares normalized flux $F/F_{\rm cont}$ across the wavelength window.
+
+Flow per case:
+
+```
+(teff, logg, [M/H])                                  results/<case>/
+    └─► emulator ──► warm-start .atm ──┬──►  inputs/emulator_warmstart.atm
+                                       │
+                                       ├──► Fortran ATLAS → Fortran SYNTHE
+                                       │        fortran/fortran_iter1.atm
+                                       │        fortran/fortran_synthe_<wl>.spec
+                                       │
+                                       └──► Python  ATLAS → Python  SYNTHE
+                                                python/python_iter1.atm
+                                                python/python_synthe_<wl>.spec
+```
+
+Both branches consume the identical emulator warm-start `.atm` — no external atmosphere library is needed.
+
+**Defaults you usually want:** `--mode both` (full parity check), Python SYNTHE using **all logical CPUs** (omit `--n-workers`), wavelength **300–1800 nm**. Use `--wipe` to clear a case directory before re-running.
+
+**`--mode` vs `--force-rerun*`** — these do not overlap. `--mode` chooses *which* pipelines run: `fortran` only, `python` only, or `both` (run both and validate). The `--force-rerun` flags only matter when outputs already exist under `results/`: they force recomputation instead of skipping. `--force-rerun` sets both Fortran and Python reruns; use `--force-rerun-python` or `--force-rerun-fortran` to refresh one side only.
+
+**`--norm-frac-threshold`** — when `--mode both`, a case **passes** only if, at every wavelength in the range, the absolute difference between Python and Fortran normalized flux stays below this value. Default `0.10` means 10% max error (the project validation bar). Lower it for stricter checks.
+
+```bash
+# Single case — runs both Fortran and Python from the same emulator warm-start
+python run_e2e_pipeline.py --teff 5770 --logg 4.44 --mh 0.0 --wipe
+
+# Batch — reads e2e_batch_cases.txt (one "TEFF LOGG MH" per line)
+python run_e2e_pipeline.py --batch --wipe
+
+# Re-run every existing results/t*_g*_mh*/ folder (params parsed from names)
+python run_e2e_pipeline.py --batch --batch-from-results --force-rerun
+
+# Python-only iteration while debugging a code change
+python run_e2e_pipeline.py --teff 5770 --logg 4.44 --mh 0 --mode python
+```
+
+**Other flags** (use when needed): `--wl-start` / `--wl-end` (nm), `--kurucz-root` (override `data/`), `--batch-manifest` (path to an alternative batch manifest), `--n-workers` (override default all-CPU parallelism for Python SYNTHE), `--no-smoke-gate` (keep going past a failing first case in batch). See `python run_e2e_pipeline.py --help`.
+
+A summary JSON is written to `results/validation_summary_e2e_{wl}.json` after a batch run.
 
 
 ## Reproducing the validation
 
 ```bash
-# Run synthesis for all 5 sample atmospheres
-for atm in samples/*.atm; do
+# Example: loop over your own .atm files (same stem for model.spec vs reference.spec)
+for atm in path/to/atmospheres/*.atm; do
     python synthesize_from_atm.py "$atm"
 done
 
-# Compare against Fortran reference spectra
-for atm in samples/*.atm; do
+for atm in path/to/atmospheres/*.atm; do
     stem=$(basename "$atm" .atm)
     python synthe_py/tools/compare_spectra.py \
-        results/spec/${stem}_300_1800.spec \
-        fortran_specs/${stem}.spec \
+        "results/spec/${stem}_300_1800.spec" \
+        "path/to/fortran_specs/${stem}.spec" \
         --range 300 1800 --top 5
 done
 
-# Generate comparison figures
-python joss/generate_joss_figures.py
+# Optional: JOSS figures (if joss/ is present)
+# python joss/generate_joss_figures.py
 ```
 
 
@@ -314,8 +402,9 @@ python joss/generate_joss_figures.py
 
 ```
 pykurucz/
-├── pykurucz.py                     # End-to-end: stellar params -> spectrum
+├── pykurucz.py                     # End-to-end (Mode B): stellar params -> emulator -> atlas_py -> synthe_py -> spectrum
 ├── synthesize_from_atm.py          # Mode A helper: .atm file -> spectrum
+├── run_e2e_pipeline.py             # Full pipeline validation: Fortran+Python ATLAS/SYNTHE
 ├── requirements.txt                # Core dependencies (Python 3.10+)
 ├── LICENSE                         # MIT License
 │
@@ -333,9 +422,8 @@ pykurucz/
 │   ├── emulator.py                 # Prediction interface
 │   └── normalization.py            # Input/output normalization
 │
-├── lines/                          # Atomic/molecular input data
-├── samples/                        # Sample ATLAS12 atmospheres (.atm)
-├── fortran_specs/                  # Fortran reference spectra for validation
+├── lines/                          # Atomic/molecular input data (GFALL etc.; may symlink to data/)
+├── data/README.md                  # Explains large runtime files under data/ (binaries git-ignored)
 │
 └── joss/                           # JOSS paper and figures
     ├── paper.md
@@ -377,33 +465,34 @@ python synthe_py/tools/convert_atm_to_npz.py <atm_file> <output.npz>
 python -m synthe_py.cli <atm_file> lines/gfallvac.latest --npz <output.npz> --spec <output.spec> [options]
 ```
 
-**Molecular line behavior (default on):** If you omit `--molecules-dir`, the code looks for `../kurucz/molecules` next to the pykurucz repo (same layout as cloning [tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) beside this repo). TiO and H₂O are included by default when the Schwenke / Partridge–Schwenke binaries are present under that tree. Use `--no-molecular-lines` for atomic-only synthesis; `--no-tio` / `--no-h2o` to drop specific species. **`--molecules-dir DIR`** (repeatable) overrides the search paths; **`--tio-bin`** / **`--h2o-bin`** set explicit binary paths.
+**Molecular line behavior (default on):** If you omit `--molecules-dir`, the code looks for `data/molecules/` inside the pykurucz repo (populated by `bash scripts/setup_data.sh`). TiO and H₂O are included by default when the Schwenke / Partridge–Schwenke binaries are present. Use `--no-molecular-lines` for atomic-only synthesis; `--no-tio` / `--no-h2o` to drop specific species. **`--molecules-dir DIR`** (repeatable) overrides the search paths; **`--tio-bin`** / **`--h2o-bin`** set explicit binary paths.
 
 
 ## Dependencies
 
-**Core** (both modes): NumPy, SciPy, Numba, Matplotlib — Python 3.10+
+**Core** (all modes): NumPy, SciPy, Numba, Matplotlib — Python 3.10+
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**Mode B only** (emulator): PyTorch
+**Mode B** (emulator + atlas_py + synthe_py): PyTorch, plus the `data/` tree populated once.
 
 ```bash
 pip install torch
+bash scripts/setup_data.sh
 ```
 
 
 ## Current limitations and roadmap
 
-pyKurucz reimplements the SYNTHE synthesis path in Python — atomic lines throughout, **molecular lines by default** when the standard Kurucz-family `molecules/` tree is available next to the repo (TiO/H₂O binaries used if present). Clone [tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) alongside pykurucz or pass `--molecules-dir`; use `--no-molecular-lines` for GFALL-only runs. Remaining gaps are mostly about breadth of physics (NLTE, geometry) and workflow (external atmosphere codes for self-consistency).
+pyKurucz reimplements the SYNTHE synthesis path in Python — atomic lines throughout, **molecular lines by default** when `data/molecules/` is populated via `bash scripts/setup_data.sh` (TiO/H₂O binaries used if present). Use `--no-molecular-lines` for GFALL-only runs. Remaining gaps are mostly about breadth of physics (NLTE, geometry) and workflow (external atmosphere codes for self-consistency).
 
 ### What works today
 
 - Full atomic line synthesis from any `.atm` file (Mode A)
 - **Molecular line synthesis** from Kurucz ASCII catalogs (auto `../kurucz/molecules` or `--molecules-dir`), Schwenke TiO and Partridge–Schwenke H₂O when binaries exist — opt out with `--no-molecular-lines` / `--no-tio` / `--no-h2o`
-- Neural network atmosphere emulator for end-to-end synthesis (Mode B)
+- End-to-end synthesis from stellar parameters (Mode B): **emulator warm-start → atlas_py (Python ATLAS12, `MOLECULES ON`) → synthe_py**, for Fortran-faithful self-consistent atmospheres
 - All continuous opacity sources (H⁻, H I, He I/II, metals, Rayleigh, Thomson), including cool-star COOLOP molecular continuum (CH, OH, H₂) when populations are present
 - Voigt line profiles with van der Waals, Stark, and radiative broadening
 - Dedicated hydrogen Stark-broadened (Balmer/Lyman) and helium tabulated profiles
@@ -443,7 +532,7 @@ If you use pyKurucz in your research, please cite the JOSS paper:
 }
 ```
 
-If you use the kurucz-a1 atmosphere emulator (Mode B), please also cite:
+If you use the kurucz-a1 atmosphere emulator (the warm-start stage of Mode B), please also cite:
 
 ```bibtex
 @article{li2025kurucza1,

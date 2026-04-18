@@ -1,16 +1,35 @@
 # `data/` — runtime binaries and Fortran assets
 
-This directory is **not** fully tracked in git. Large line-list binaries, molecule tables, optional Fortran SYNTHE line files (`synthe/linelists_full/tfort.*`, ~13 GB), and executables are listed in `.gitignore`.
+This directory is **not** fully tracked in git. Large line-list binaries, molecule tables, optional Fortran SYNTHE line files (`synthe/linelists_full/tfort.*`, ~13 GB), and Fortran executables are excluded via `.gitignore`. Git LFS is intentionally not used — the files are too large for LFS bandwidth quotas to be practical at public scale.
 
-## Populate `data/` (two equivalent ways)
+## How to populate `data/`
 
-1. **From a local Kurucz tree** (development / lab machines):
+### Option A — Download the release bundle (external users, recommended)
 
-   ```bash
-   bash scripts/setup_data.sh
-   # or: bash scripts/setup_data.sh --source /path/to/kurucz
-   ```
+A versioned `pykurucz-data-*.tar.xz` archive is distributed with each GitHub Release. Download it, verify the SHA-256 printed on the release page, then extract **at the repository root**:
 
-2. **From a published tarball** (reproducibility / external users): download the release asset built with `scripts/package_data_for_release.sh`, verify the published SHA-256, then extract **at the repository root** so you have `./data/lines/`, `./data/molecules/`, etc.
+```bash
+# Replace URL and filename with the one from the release page
+curl -L -O https://github.com/emk255/pykurucz/releases/download/vX.Y.Z/pykurucz-data-X.Y.Z.tar.xz
+shasum -a 256 pykurucz-data-X.Y.Z.tar.xz   # compare against release notes
+tar -xJf pykurucz-data-X.Y.Z.tar.xz        # extracts ./data/... at repo root
+```
 
-After either path, the code expects the same layout under `data/` that `setup_data.sh` would create.
+> **Note:** The first public data bundle has not been released yet. Check the
+> [Releases page](https://github.com/emk255/pykurucz/releases) for availability.
+> If no bundle is posted, use Option B or contact the authors.
+
+### Option B — Copy from a local Kurucz data tree (developers / lab machines)
+
+If you already have a Kurucz data directory on disk (e.g. from
+[tingyuansen/kurucz](https://github.com/tingyuansen/kurucz)):
+
+```bash
+bash scripts/setup_data.sh --source /path/to/kurucz
+# omit --source if ../kurucz sits next to this repo (default)
+```
+
+Use `--no-synthe` to skip the ~13 GB Fortran SYNTHE line lists if you only need the Python synthesis path.
+
+After either option, the code expects the same layout:
+`data/lines/`, `data/molecules/`, `data/bin_macos/` or `data/bin_linux/`, `data/synthe/` (optional).
