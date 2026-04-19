@@ -70,20 +70,16 @@ pip install -r requirements.txt
 mkdir -p results
 ```
 
-**Populate the self-contained data directory** (copies line/molecule binaries and Fortran executables from a local kurucz data source — only needed once):
+**Download the data directory** (line-list binaries and molecule tables — only needed once, ~7 GB):
 
 ```bash
-# If you have a sibling kurucz/ repo (default source):
-bash scripts/setup_data.sh
-
-# Or point to any other copy of the kurucz data:
-bash scripts/setup_data.sh --source /path/to/kurucz
-
-# Skip the 13 GB SYNTHE line lists if you only need the Python pipeline:
-bash scripts/setup_data.sh --no-synthe
+pip install dvc dvc-gdrive
+dvc pull
 ```
 
-This copies everything into `data/` inside the repo. The large binary files are git-ignored; only small text files (`molecules.new`, `molecules.dat`, `continua.dat`, `he1tables.dat`, `spectrv_std.input`) are tracked.
+This pulls `data/lines/` and `data/molecules/` from Google Drive via [DVC](https://dvc.org). No authentication needed — the folder is publicly readable. See `data/README.md` for the full file layout.
+
+> If you already have a local Kurucz data tree on disk, you can populate `data/` without DVC: `bash scripts/setup_data.sh --source /path/to/kurucz`
 
 **Synthesize from an existing atmosphere file** (no PyTorch needed; `data/` required only for molecular/GFALL paths you enable):
 

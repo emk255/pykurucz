@@ -1,35 +1,48 @@
 # `data/` — runtime binaries and Fortran assets
 
-This directory is **not** fully tracked in git. Large line-list binaries, molecule tables, optional Fortran SYNTHE line files (`synthe/linelists_full/tfort.*`, ~13 GB), and Fortran executables are excluded via `.gitignore`. Git LFS is intentionally not used — the files are too large for LFS bandwidth quotas to be practical at public scale.
+Large binary files (line lists, molecule tables) are tracked with
+[DVC](https://dvc.org) and stored on Google Drive. They are **not** stored in
+git. Git LFS is not used — the files are too large for LFS bandwidth quotas
+to be practical at public scale.
 
-## How to populate `data/`
-
-### Option A — Download the release bundle (external users, recommended)
-
-A versioned `pykurucz-data-*.tar.xz` archive is distributed with each GitHub Release. Download it, verify the SHA-256 printed on the release page, then extract **at the repository root**:
+## Get the data (all users)
 
 ```bash
-# Replace URL and filename with the one from the release page
-curl -L -O https://github.com/emk255/pykurucz/releases/download/vX.Y.Z/pykurucz-data-X.Y.Z.tar.xz
-shasum -a 256 pykurucz-data-X.Y.Z.tar.xz   # compare against release notes
-tar -xJf pykurucz-data-X.Y.Z.tar.xz        # extracts ./data/... at repo root
+pip install dvc dvc-gdrive
+dvc pull
 ```
 
-> **Note:** The first public data bundle has not been released yet. Check the
-> [Releases page](https://github.com/emk255/pykurucz/releases) for availability.
-> If no bundle is posted, use Option B or contact the authors.
+This downloads `data/lines/` (~4.5 GB) and `data/molecules/` (~2.8 GB) from
+the shared Google Drive folder. No authentication is required — the folder is
+publicly readable.
 
-### Option B — Copy from a local Kurucz data tree (developers / lab machines)
+After `dvc pull`, the layout under `data/` matches what the code expects:
 
-If you already have a Kurucz data directory on disk (e.g. from
-[tingyuansen/kurucz](https://github.com/tingyuansen/kurucz)):
+```
+data/
+├── lines/
+│   ├── gfpred29dec2014.bin          # Kurucz GFALL predicted lines (fort.11)
+│   ├── hilines.bin                  # High-excitation lines (fort.21)
+│   ├── diatomicspacksrt.bin         # Diatomic molecular lines
+│   ├── lowobsat12.bin               # Observed low lines (fort.111)
+│   └── nltelinobsat12.bin           # NLTE lines
+└── molecules/
+    ├── tio/
+    │   ├── schwenke.bin             # Schwenke TiO line list
+    │   └── eschwenke.bin
+    ├── h2o/
+    │   └── h2ofastfix.bin           # Partridge-Schwenke H2O line list
+    └── [*.dat / *.asc molecule catalogs]
+```
+
+## For developers with a local Kurucz tree
+
+If you already have a Kurucz data directory on disk, you can populate `data/`
+without DVC:
 
 ```bash
 bash scripts/setup_data.sh --source /path/to/kurucz
-# omit --source if ../kurucz sits next to this repo (default)
 ```
 
-Use `--no-synthe` to skip the ~13 GB Fortran SYNTHE line lists if you only need the Python synthesis path.
-
-After either option, the code expects the same layout:
-`data/lines/`, `data/molecules/`, `data/bin_macos/` or `data/bin_linux/`, `data/synthe/` (optional).
+Fortran-only files (executables, SYNTHE `tfort.*` line lists, `atlas12.for`)
+are not distributed via DVC and are not needed for the Python pipeline.

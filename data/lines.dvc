@@ -1,0 +1,6 @@
+outs:
+- md5: 10f177c74b9c546436b3335e395d0581.dir
+  size: 4694783830
+  nfiles: 10
+  hash: md5
+  path: lines
