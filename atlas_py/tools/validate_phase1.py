@@ -30,22 +30,21 @@ def _default_kurucz_root() -> Path:
 
 
 def _ensure_gfpred_assembled(gfpred_bin: Path) -> None:
-    """Assemble split gfpred binary if needed."""
+    """Verify that gfpred29dec2014.bin is present; raise a helpful error if not.
+
+    The name is kept for backward compatibility with existing callers.
+    The file is distributed as a single binary via scripts/download_data.py
+    (pulled from Google Drive); the previous split-parts assembly is no
+    longer needed.
+    """
     if gfpred_bin.exists():
         return
-    parts = [
-        gfpred_bin.with_name(gfpred_bin.name + ".partaa"),
-        gfpred_bin.with_name(gfpred_bin.name + ".partab"),
-        gfpred_bin.with_name(gfpred_bin.name + ".partac"),
-    ]
-    missing = [p for p in parts if not p.exists()]
-    if missing:
-        missing_str = ", ".join(str(p) for p in missing)
-        raise FileNotFoundError(f"Missing gfpred parts: {missing_str}")
-    gfpred_bin.parent.mkdir(parents=True, exist_ok=True)
-    with gfpred_bin.open("wb") as out:
-        for part in parts:
-            out.write(part.read_bytes())
+    raise FileNotFoundError(
+        f"Required atlas_py binary not found: {gfpred_bin}\n"
+        "Run `python scripts/download_data.py` to populate data/, or "
+        "`bash scripts/setup_data.sh --source /path/to/kurucz` if you have a "
+        "local Kurucz tree."
+    )
 
 
 def _run(cmd: list[str], env: dict[str, str] | None = None) -> str:

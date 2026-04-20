@@ -70,16 +70,25 @@ pip install -r requirements.txt
 mkdir -p results
 ```
 
-**Download the data directory** (line-list binaries and molecule tables — only needed once, ~7 GB):
+**Download the data directory** (line-list binaries and molecule tables — only needed once):
 
 ```bash
-pip install huggingface_hub
-python scripts/download_data.py
+pip install -r requirements.txt
+python scripts/download_data.py                 # full data (~5.2 GB)
+# or, if you don't need atlas_py atmosphere iteration:
+python scripts/download_data.py --synthe-only   # ~1.3 GB, enough for synthesis
 ```
 
-This downloads `data/lines/` and `data/molecules/` from the public [HuggingFace dataset](https://huggingface.co/datasets/elliotk19/pykurucz-data). No login, no OAuth, no Google account needed. See `data/README.md` for the full file layout.
+This pulls the data from a public Google Drive folder via `gdown` (no login, no OAuth, no tokens). Two files are fetched:
 
-> If you already have a local Kurucz data tree on disk, you can populate `data/` without downloading from HuggingFace: `bash scripts/setup_data.sh --source /path/to/kurucz` (developers/lab machines only — not needed for normal use).
+- `pykurucz-data-synthe-v1.0.tar.gz` (1.3 GB compressed, ~3.3 GB extracted) — atomic line lists and all molecular catalogs (TiO Schwenke, H2O Partridge-Schwenke, VO, CN, C2, CO, H2, ...) used by `synthe_py`.
+- `gfpred29dec2014.bin` (3.9 GB) — Kurucz 29-Dec-2014 predicted atomic line list, used by `atlas_py` for full atmosphere iteration (optional for `synthe_py`).
+
+SHA256 is verified automatically. See [data/README.md](data/README.md) for the full file layout.
+
+> If you already have a local Kurucz data tree on disk, you can populate `data/` without hitting Google Drive: `bash scripts/setup_data.sh --source /path/to/kurucz` (developers/lab machines only — not needed for normal use).
+>
+> Google Drive has a per-file download quota (~190 requests/day). If you hit "Quota exceeded", wait 24 hours or use `scripts/setup_data.sh` from a local tree.
 
 **Synthesize from an existing atmosphere file** (no PyTorch needed; requires `python scripts/download_data.py` for line list and molecule data):
 
@@ -289,7 +298,7 @@ Each `.spec` file has three whitespace-delimited columns: `wavelength(nm)  F_lam
 
 ## Input data
 
-Small physics tables and code are in the repository. Large binary data (line lists, molecule tables) are distributed via HuggingFace Hub — run `python scripts/download_data.py` once to populate `data/`.
+Small physics tables and code are in the repository. Large binary data (line lists, molecule tables) are distributed via a public Google Drive folder — run `python scripts/download_data.py` once to populate `data/`.
 
 ### Line list (`data/lines/` — from `python scripts/download_data.py`)
 
@@ -440,10 +449,11 @@ python -m synthe_py.cli <atm_file> data/lines/gfallvac.latest --npz <output.npz>
 pip install -r requirements.txt
 ```
 
-**End-to-end pipeline** (emulator + atlas_py + synthe_py): PyTorch, plus the `data/` tree populated once via HuggingFace.
+**End-to-end pipeline** (emulator + atlas_py + synthe_py): PyTorch, plus the `data/` tree populated once from Google Drive.
 
 ```bash
-pip install torch huggingface_hub
+pip install torch
+pip install -r requirements.txt
 python scripts/download_data.py
 ```
 

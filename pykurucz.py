@@ -267,27 +267,6 @@ def _default_kurucz_root() -> Path:
     return _REPO_ROOT / "data"
 
 
-def _ensure_gfpred_assembled(gfpred_bin: Path) -> None:
-    """Assemble ``gfpred29dec2014.bin`` from split parts if not yet present."""
-    if gfpred_bin.exists():
-        return
-    parts = [
-        gfpred_bin.with_name(gfpred_bin.name + ".partaa"),
-        gfpred_bin.with_name(gfpred_bin.name + ".partab"),
-        gfpred_bin.with_name(gfpred_bin.name + ".partac"),
-    ]
-    missing = [p for p in parts if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            "Missing gfpred parts: " + ", ".join(str(p) for p in missing)
-            + "\nRun scripts/setup_data.sh to populate data/lines/."
-        )
-    gfpred_bin.parent.mkdir(parents=True, exist_ok=True)
-    with gfpred_bin.open("wb") as out:
-        for part in parts:
-            out.write(part.read_bytes())
-
-
 def _run_streaming(
     cmd: list[str],
     *,
@@ -413,12 +392,13 @@ def run_atlas_py(
     nltelinobsat12_bin = lines_dir / "nltelinobsat12.bin"
     molecules_new = lines_dir / "molecules.new"
 
-    _ensure_gfpred_assembled(gfpred_bin)
-    for p in (lowobs_bin, hilines_bin, molecules_new):
+    for p in (gfpred_bin, lowobs_bin, hilines_bin, molecules_new):
         if not p.exists():
             raise FileNotFoundError(
                 f"Required atlas_py binary not found: {p}\n"
-                "Run scripts/setup_data.sh to populate data/."
+                "Run `python scripts/download_data.py` to populate data/, or "
+                "`bash scripts/setup_data.sh --source /path/to/kurucz` if you "
+                "have a local Kurucz tree."
             )
 
     output_atm.parent.mkdir(parents=True, exist_ok=True)

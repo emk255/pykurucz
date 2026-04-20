@@ -13,7 +13,7 @@ python-dateutil==2.9.0.post0
 scipy==1.17.0
 six==1.17.0
 
-huggingface_hub>=0.23
+gdown>=5.1
 
 # Optional: needed only for the ATLAS12 emulator (pykurucz.py end-to-end mode)
 # torch

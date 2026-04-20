@@ -1,26 +1,34 @@
 # `data/` — runtime binaries and line-list assets
 
-Large binary files (line lists, molecule tables) are hosted on
-[HuggingFace Hub](https://huggingface.co/datasets/elliotk19/pykurucz-data).
-They are **not** stored in git. No authentication is required — the dataset is
-publicly accessible.
+Large binary files (line lists, molecule tables) are hosted on a public Google
+Drive folder. They are **not** stored in git. No authentication is required —
+the files are shared as "Anyone with the link – Viewer".
 
 ## Get the data (all users)
 
 ```bash
-pip install huggingface_hub
-python scripts/download_data.py
+pip install -r requirements.txt
+python scripts/download_data.py                 # full data (~5.2 GB)
+# or, if you don't need atlas_py atmosphere iteration:
+python scripts/download_data.py --synthe-only   # ~1.3 GB, enough for synthesis
 ```
 
-This downloads `data/lines/` (~4.5 GB) and `data/molecules/` (~2.8 GB).
-No login, no OAuth, no Google account needed.
+Two files are fetched via `gdown`:
 
-After the download, the layout under `data/` matches what the code expects:
+| File | Size | Used by |
+|---|---|---|
+| `pykurucz-data-synthe-v1.0.tar.gz` | 1.3 GB (→ 3.3 GB extracted) | `synthe_py` |
+| `gfpred29dec2014.bin` | 3.9 GB | `atlas_py` (optional) |
+
+SHA256 is verified automatically after each download. The synthe tarball is
+extracted into `data/lines/` and `data/molecules/` and then deleted.
+
+### Resulting layout
 
 ```
 data/
 ├── lines/
-│   ├── gfpred29dec2014.bin          # Kurucz GFALL predicted lines (fort.11) ~3.9 GB
+│   ├── gfpred29dec2014.bin          # Kurucz GFPRED predicted lines (fort.11) ~3.9 GB
 │   ├── hilines.bin                  # High-excitation lines (fort.21)
 │   ├── diatomicspacksrt.bin         # Diatomic molecular lines
 │   ├── lowobsat12.bin               # Observed low lines (fort.111)
@@ -38,10 +46,21 @@ data/
     └── [*.dat / *.asc molecule catalogs]
 ```
 
+## Google Drive quota
+
+Google Drive enforces a per-file download cap of roughly 190 requests per
+24 hours per public file. For a typical academic release this is more than
+enough, but if you hit a `Quota exceeded` error the downloader will print a
+clear message. Options:
+
+1. Wait 24 hours and retry.
+2. If you have a local Kurucz data tree, populate `data/` without going
+   through Google Drive (see below).
+
 ## For developers with a local Kurucz tree
 
 If you already have a Kurucz data directory on disk, you can populate `data/`
-without downloading from HuggingFace:
+without hitting Google Drive:
 
 ```bash
 bash scripts/setup_data.sh --source /path/to/kurucz
