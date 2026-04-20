@@ -73,15 +73,15 @@ mkdir -p results
 **Download the data directory** (line-list binaries and molecule tables — only needed once, ~7 GB):
 
 ```bash
-pip install dvc dvc-gdrive
-dvc pull
+pip install huggingface_hub
+python scripts/download_data.py
 ```
 
-This pulls `data/lines/` and `data/molecules/` from Google Drive via [DVC](https://dvc.org). A standard Google OAuth browser flow opens on first use — no sharing permission or Drive account with special access is required. See `data/README.md` for the full file layout.
+This downloads `data/lines/` and `data/molecules/` from the public [HuggingFace dataset](https://huggingface.co/datasets/elliotk19/pykurucz-data). No login, no OAuth, no Google account needed. See `data/README.md` for the full file layout.
 
-> If you already have a local Kurucz data tree on disk, you can populate `data/` without DVC: `bash scripts/setup_data.sh --source /path/to/kurucz` (developers/lab machines only — not needed for normal use).
+> If you already have a local Kurucz data tree on disk, you can populate `data/` without downloading from HuggingFace: `bash scripts/setup_data.sh --source /path/to/kurucz` (developers/lab machines only — not needed for normal use).
 
-**Synthesize from an existing atmosphere file** (no PyTorch needed; requires `dvc pull` for line list and molecule data):
+**Synthesize from an existing atmosphere file** (no PyTorch needed; requires `python scripts/download_data.py` for line list and molecule data):
 
 ```bash
 # Replace paths with your ATLAS12-format .atm
@@ -104,7 +104,7 @@ Both produce a `.spec` file with wavelength, flux, and continuum columns. Use a 
 
 Bob Kurucz's codes — ATLAS, SYNTHE, DFSYNTHE, WIDTH, BALMER — together with his atomic and molecular line lists, form one of the most consequential software ecosystems in astrophysics. They have been used to analyze spectra from nearly every major telescope and spectroscopic survey for decades, accumulating tens of thousands of citations. But the original Fortran codebase, developed continuously since the 1960s, is increasingly difficult to compile, install, modify, and integrate with modern workflows.
 
-pyKurucz is a line-by-line numerical reimplementation — not a wrapper around Fortran — ensuring that this extraordinary body of work remains accessible, extensible, and usable for the next generation of astronomers. The core is faithful SYNTHE-class spectrum synthesis from a model atmosphere, including **molecular line opacity** loaded automatically from `data/molecules/` after `dvc pull` (with Schwenke TiO and Partridge–Schwenke H₂O). Override with `--molecules-dir` or switch off with `--no-molecular-lines`.
+pyKurucz is a line-by-line numerical reimplementation — not a wrapper around Fortran — ensuring that this extraordinary body of work remains accessible, extensible, and usable for the next generation of astronomers. The core is faithful SYNTHE-class spectrum synthesis from a model atmosphere, including **molecular line opacity** loaded automatically from `data/molecules/` after running `python scripts/download_data.py` (with Schwenke TiO and Partridge–Schwenke H₂O). Override with `--molecules-dir` or switch off with `--no-molecular-lines`.
 
 
 ## Two modes of operation
@@ -115,7 +115,7 @@ Spectrum synthesis requires a **model atmosphere** as input — a description of
 |---|---|---|
 | **Input** | Your own `.atm` file | Stellar parameters (Teff, logg, [M/H], [α/M]) |
 | **Atmosphere source** | Pre-computed (ATLAS12, MARCS, PHOENIX, etc.) | Emulator warm-start → `atlas_py` self-consistent iteration |
-| **Dependencies** | Core only | Core + PyTorch + `data/` (populated via `dvc pull`) |
+| **Dependencies** | Core only | Core + PyTorch + `data/` (populated via `python scripts/download_data.py`) |
 | **Atmosphere physics** | Exact (whatever generated the `.atm`) | Full Python ATLAS12 (Fortran-parity) |
 | **Best for** | Full control, outside emulator range, or reusing an external atmosphere | End-to-end synthesis straight from stellar parameters |
 
@@ -153,7 +153,7 @@ kurucz-a1 emulator ──► warm-start .atm ──► atlas_py (MOLECULES ON)
 
 The emulator plays the same role as `READ DECK6` in the Fortran pipeline: it supplies the starting layer structure so that `atlas_py` converges quickly rather than starting from a grey approximation. `atlas_py` then self-consistently iterates the atmospheric structure with the same physics as Fortran ATLAS12 (always `MOLECULES ON`, matching the Fortran deck), so the downstream SYNTHE spectrum stays in parity with Fortran references.
 
-Requires `data/` to be populated once via `dvc pull` (see Quick start above).
+Requires `data/` to be populated once via `python scripts/download_data.py` (see Quick start above).
 
 ```bash
 # Solar-type star, full wavelength range
@@ -199,7 +199,7 @@ The heart of this repository is **`synthe_py/`** — a pure Python reimplementat
 
 1. **Continuum opacity** — H⁻ bound-free/free-free (the dominant source in Sun-like stars), H I bound-free (Karsas & Latter cross-sections), He I/II, metal photoionization, Rayleigh scattering (H, He, H₂), Thomson scattering — interpolated from pre-tabulated arrays following the original KAPP subroutine logic. For cool atmospheres, the COOLOP path also adds CH, OH, and H₂ collisional opacity when molecular populations from equilibrium are available.
 2. **Line opacity — atomic** — every transition in the Kurucz GFALL catalog (~1.3 million lines) near the current wavelength contributes a **Voigt profile** (thermal Doppler + van der Waals + Stark + radiative broadening). Hydrogen Balmer/Lyman lines get dedicated Stark-broadened profiles (HPROF4); helium lines use tabulated BCS/Griem/Dimitrijević profiles.
-3. **Line opacity — molecular** — Kurucz ASCII molecular catalogs (e.g. CH, OH, CO, CN, C₂, MgH, …) from `data/molecules/` (populated by `dvc pull`) or explicit `--molecules-dir`, plus Schwenke TiO and Partridge–Schwenke H₂O when enabled (default on; binaries skipped quietly if missing). Use `--no-molecular-lines`, `--no-tio`, or `--no-h2o` to disable. Molecular lines use the same opacity accumulation and radiative-transfer loop as atoms, with populations tied to the **NELION** dispatch and molecular equilibrium (NMOLEC-class solver) from preprocessing.
+3. **Line opacity — molecular** — Kurucz ASCII molecular catalogs (e.g. CH, OH, CO, CN, C₂, MgH, …) from `data/molecules/` (populated by `python scripts/download_data.py`) or explicit `--molecules-dir`, plus Schwenke TiO and Partridge–Schwenke H₂O when enabled (default on; binaries skipped quietly if missing). Use `--no-molecular-lines`, `--no-tio`, or `--no-h2o` to disable. Molecular lines use the same opacity accumulation and radiative-transfer loop as atoms, with populations tied to the **NELION** dispatch and molecular equilibrium (NMOLEC-class solver) from preprocessing.
 4. **Radiative transfer** — the JOSH solver integrates the transfer equation on a fixed log-τ grid with parabolic optical depth quadrature and Lambda iteration for scattering, yielding both line+continuum $F_\lambda$ and continuum-only $F_{\rm cont}$.
 
 Plus supporting physics: Saha–Boltzmann populations with detailed partition functions, molecular equilibrium for ~300 species, and Doppler widths at every atmospheric layer.
@@ -289,11 +289,11 @@ Each `.spec` file has three whitespace-delimited columns: `wavelength(nm)  F_lam
 
 ## Input data
 
-Small physics tables and code are in the repository. Large binary data (line lists, molecule tables) are distributed via DVC — run `dvc pull` once to populate `data/`.
+Small physics tables and code are in the repository. Large binary data (line lists, molecule tables) are distributed via HuggingFace Hub — run `python scripts/download_data.py` once to populate `data/`.
 
-### Line list (`data/lines/` — from `dvc pull`)
+### Line list (`data/lines/` — from `python scripts/download_data.py`)
 
-All files below live under `data/lines/` after `dvc pull`:
+All files below live under `data/lines/` after running `python scripts/download_data.py`:
 
 | File | Description |
 |------|-------------|
@@ -303,9 +303,9 @@ All files below live under `data/lines/` after `dvc pull`:
 | `molecules.dat` | Dissociation energies and equilibrium constants for ~300 molecular species |
 | `he1tables.dat` | Tabulated helium line broadening profiles |
 
-### Molecule tables (`data/molecules/` — from `dvc pull`)
+### Molecule tables (`data/molecules/` — from `python scripts/download_data.py`)
 
-TiO (Schwenke) and H₂O (Partridge–Schwenke) binary line lists (~2.8 GB total) are downloaded via `dvc pull` and loaded automatically when present.
+TiO (Schwenke) and H₂O (Partridge–Schwenke) binary line lists (~2.8 GB total) are downloaded and loaded automatically when present.
 
 ### Physics tables (`synthe_py/data/` — in-repo)
 
@@ -384,7 +384,7 @@ pykurucz/
 │   ├── emulator.py                 # Prediction interface
 │   └── normalization.py            # Input/output normalization
 │
-├── data/                           # Large runtime binaries — populated via `dvc pull`
+├── data/                           # Large runtime binaries — populated via `python scripts/download_data.py`
 │   ├── lines/                      # Atomic line lists (gfpred29dec2014.bin, gfallvac.latest, …)
 │   ├── molecules/                  # Molecular line lists (TiO, H₂O binaries)
 │   └── README.md                   # Describes the layout and how to obtain the files
@@ -429,7 +429,7 @@ python synthe_py/tools/convert_atm_to_npz.py <atm_file> <output.npz>
 python -m synthe_py.cli <atm_file> data/lines/gfallvac.latest --npz <output.npz> --spec <output.spec> [options]
 ```
 
-**Molecular line behavior (default on):** If you omit `--molecules-dir`, the code looks for `data/molecules/` inside the pykurucz repo (populated by `dvc pull`). TiO and H₂O are included by default when the Schwenke / Partridge–Schwenke binaries are present. Use `--no-molecular-lines` for atomic-only synthesis; `--no-tio` / `--no-h2o` to drop specific species. **`--molecules-dir DIR`** (repeatable) overrides the search paths; **`--tio-bin`** / **`--h2o-bin`** set explicit binary paths.
+**Molecular line behavior (default on):** If you omit `--molecules-dir`, the code looks for `data/molecules/` inside the pykurucz repo (populated by `python scripts/download_data.py`). TiO and H₂O are included by default when the Schwenke / Partridge–Schwenke binaries are present. Use `--no-molecular-lines` for atomic-only synthesis; `--no-tio` / `--no-h2o` to drop specific species. **`--molecules-dir DIR`** (repeatable) overrides the search paths; **`--tio-bin`** / **`--h2o-bin`** set explicit binary paths.
 
 
 ## Dependencies
@@ -440,22 +440,22 @@ python -m synthe_py.cli <atm_file> data/lines/gfallvac.latest --npz <output.npz>
 pip install -r requirements.txt
 ```
 
-**End-to-end pipeline** (emulator + atlas_py + synthe_py): PyTorch, plus the `data/` tree populated once via DVC.
+**End-to-end pipeline** (emulator + atlas_py + synthe_py): PyTorch, plus the `data/` tree populated once via HuggingFace.
 
 ```bash
-pip install torch dvc dvc-gdrive
-dvc pull
+pip install torch huggingface_hub
+python scripts/download_data.py
 ```
 
 
 ## Current limitations and roadmap
 
-pyKurucz reimplements both the ATLAS12 atmosphere stage (`atlas_py`) and the SYNTHE synthesis stage (`synthe_py`) in pure Python — atomic lines throughout, **molecular lines by default** when `data/molecules/` is populated via `dvc pull` (TiO/H₂O binaries used if present). Use `--no-molecular-lines` for GFALL-only runs. Remaining gaps are mostly about breadth of physics (NLTE, geometry) and workflow (external atmosphere codes for self-consistency).
+pyKurucz reimplements both the ATLAS12 atmosphere stage (`atlas_py`) and the SYNTHE synthesis stage (`synthe_py`) in pure Python — atomic lines throughout, **molecular lines by default** when `data/molecules/` is populated via `python scripts/download_data.py` (TiO/H₂O binaries used if present). Use `--no-molecular-lines` for GFALL-only runs. Remaining gaps are mostly about breadth of physics (NLTE, geometry) and workflow (external atmosphere codes for self-consistency).
 
 ### What works today
 
 - Full atomic line synthesis from any `.atm` file
-- **Molecular line synthesis** — Schwenke TiO and Partridge–Schwenke H₂O from `data/molecules/` (via `dvc pull`), plus Kurucz ASCII molecular catalogs; opt out with `--no-molecular-lines` / `--no-tio` / `--no-h2o`
+- **Molecular line synthesis** — Schwenke TiO and Partridge–Schwenke H₂O from `data/molecules/` (via `python scripts/download_data.py`), plus Kurucz ASCII molecular catalogs; opt out with `--no-molecular-lines` / `--no-tio` / `--no-h2o`
 - End-to-end synthesis from stellar parameters: **emulator warm-start → `atlas_py` (Python ATLAS12, `MOLECULES ON`) → `synthe_py`**, for Fortran-faithful self-consistent atmospheres
 - Full Python ATLAS12 atmosphere iteration (`atlas_py`): opacity, convection, equation of state, and temperature correction fully reimplemented
 - All continuous opacity sources (H⁻, H I, He I/II, metals, Rayleigh, Thomson), including cool-star COOLOP molecular continuum (CH, OH, H₂) when populations are present
@@ -474,7 +474,7 @@ pyKurucz reimplements both the ATLAS12 atmosphere stage (`atlas_py`) and the SYN
 
 ## Relation to tingyuansen/kurucz
 
-[tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) provides the original Fortran ATLAS12 + SYNTHE pipeline with pre-compiled binaries, plus the kurucz-a1 emulator. **This repository** (`pykurucz`) is a self-contained Python reimplementation of both ATLAS12 (`atlas_py`) and SYNTHE (`synthe_py`), including molecular lines via `data/molecules/` populated by `dvc pull`. No local clone of the `kurucz` repo is needed at runtime. Use the `kurucz` repo if you need Fortran tools or want to run the original Fortran pipeline for ground-truth comparison.
+[tingyuansen/kurucz](https://github.com/tingyuansen/kurucz) provides the original Fortran ATLAS12 + SYNTHE pipeline with pre-compiled binaries, plus the kurucz-a1 emulator. **This repository** (`pykurucz`) is a self-contained Python reimplementation of both ATLAS12 (`atlas_py`) and SYNTHE (`synthe_py`), including molecular lines via `data/molecules/` populated by `python scripts/download_data.py`. No local clone of the `kurucz` repo is needed at runtime. Use the `kurucz` repo if you need Fortran tools or want to run the original Fortran pipeline for ground-truth comparison.
 
 
 ## License

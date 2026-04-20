@@ -20,6 +20,9 @@ lines/.py_line_cache/
 run_e2e_pipeline.py
 scripts/package_data_for_release.sh
 
+# DVC internals (no longer used — data is on HuggingFace Hub)
+.dvc/
+
 # data/ — large binary/executable files populated by scripts/setup_data.sh
 # Small text files (molecules.new, *.dat in lines/, spectrv_std.input) ARE tracked.
 data/lines/*.bin

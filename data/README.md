@@ -1,31 +1,34 @@
-# `data/` — runtime binaries and Fortran assets
+# `data/` — runtime binaries and line-list assets
 
-Large binary files (line lists, molecule tables) are tracked with
-[DVC](https://dvc.org) and stored on Google Drive. They are **not** stored in
-git. Git LFS is not used — the files are too large for LFS bandwidth quotas
-to be practical at public scale.
+Large binary files (line lists, molecule tables) are hosted on
+[HuggingFace Hub](https://huggingface.co/datasets/elliotk19/pykurucz-data).
+They are **not** stored in git. No authentication is required — the dataset is
+publicly accessible.
 
 ## Get the data (all users)
 
 ```bash
-pip install dvc dvc-gdrive
-dvc pull
+pip install huggingface_hub
+python scripts/download_data.py
 ```
 
-This downloads `data/lines/` (~4.5 GB) and `data/molecules/` (~2.8 GB) from
-the shared Google Drive folder. No authentication is required — the folder is
-publicly readable.
+This downloads `data/lines/` (~4.5 GB) and `data/molecules/` (~2.8 GB).
+No login, no OAuth, no Google account needed.
 
-After `dvc pull`, the layout under `data/` matches what the code expects:
+After the download, the layout under `data/` matches what the code expects:
 
 ```
 data/
 ├── lines/
-│   ├── gfpred29dec2014.bin          # Kurucz GFALL predicted lines (fort.11)
+│   ├── gfpred29dec2014.bin          # Kurucz GFALL predicted lines (fort.11) ~3.9 GB
 │   ├── hilines.bin                  # High-excitation lines (fort.21)
 │   ├── diatomicspacksrt.bin         # Diatomic molecular lines
 │   ├── lowobsat12.bin               # Observed low lines (fort.111)
-│   └── nltelinobsat12.bin           # NLTE lines
+│   ├── nltelinobsat12.bin           # NLTE lines
+│   ├── continua.dat                 # Bound-free absorption edges
+│   ├── molecules.dat                # Dissociation energies / equilibrium constants
+│   ├── molecules.new                # Extended molecule list for ATLAS12
+│   └── he1tables.dat                # Helium broadening tables
 └── molecules/
     ├── tio/
     │   ├── schwenke.bin             # Schwenke TiO line list
@@ -38,11 +41,11 @@ data/
 ## For developers with a local Kurucz tree
 
 If you already have a Kurucz data directory on disk, you can populate `data/`
-without DVC:
+without downloading from HuggingFace:
 
 ```bash
 bash scripts/setup_data.sh --source /path/to/kurucz
 ```
 
 Fortran-only files (executables, SYNTHE `tfort.*` line lists, `atlas12.for`)
-are not distributed via DVC and are not needed for the Python pipeline.
+are not needed for the Python pipeline.
