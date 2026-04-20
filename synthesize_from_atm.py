@@ -33,6 +33,21 @@ def main():
                         help="Resolving power (default: 300000)")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="Output directory (default: results/)")
+    parser.add_argument(
+        "--no-molecular-lines",
+        action="store_true",
+        help="Forward to synthe_py.cli: atomic lines only.",
+    )
+    parser.add_argument(
+        "--no-tio",
+        action="store_true",
+        help="Forward to synthe_py.cli: exclude Schwenke TiO.",
+    )
+    parser.add_argument(
+        "--no-h2o",
+        action="store_true",
+        help="Forward to synthe_py.cli: exclude Partridge-Schwenke H2O.",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -80,6 +95,12 @@ def main():
         "--n-workers", str(n_workers),
         "--log-level", "INFO",
     ]
+    if args.no_molecular_lines:
+        cmd_synthe.append("--no-molecular-lines")
+    if args.no_tio:
+        cmd_synthe.append("--no-tio")
+    if args.no_h2o:
+        cmd_synthe.append("--no-h2o")
 
     with open(log_out, "w") as log_f:
         for cmd in (cmd_convert, cmd_synthe):

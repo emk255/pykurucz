@@ -95,7 +95,7 @@ SHA256 is verified automatically. See [data/README.md](data/README.md) for the f
 ```bash
 # Replace paths with your ATLAS12-format .atm
 python synthe_py/tools/convert_atm_to_npz.py path/to/model.atm results/model.npz
-python -m synthe_py.cli path/to/model.atm data/lines/gfallvac.latest \
+python -m synthe_py.cli path/to/model.atm lines/gfallvac.latest \
     --npz results/model.npz --spec results/output.spec --wl-start 500 --wl-end 510
 ```
 
@@ -394,7 +394,7 @@ pykurucz/
 │   └── normalization.py            # Input/output normalization
 │
 ├── data/                           # Large runtime binaries — populated via `python scripts/download_data.py`
-│   ├── lines/                      # Atomic line lists (gfpred29dec2014.bin, gfallvac.latest, …)
+│   ├── lines/                      # ATLAS line-list binaries (gfpred29dec2014.bin, hilines.bin, …)
 │   ├── molecules/                  # Molecular line lists (TiO, H₂O binaries)
 │   └── README.md                   # Describes the layout and how to obtain the files
 │
@@ -435,7 +435,7 @@ python pykurucz.py --teff <Teff> --logg <logg> [options]
 
 ```bash
 python synthe_py/tools/convert_atm_to_npz.py <atm_file> <output.npz>
-python -m synthe_py.cli <atm_file> data/lines/gfallvac.latest --npz <output.npz> --spec <output.spec> [options]
+python -m synthe_py.cli <atm_file> lines/gfallvac.latest --npz <output.npz> --spec <output.spec> [options]
 ```
 
 **Molecular line behavior (default on):** If you omit `--molecules-dir`, the code looks for `data/molecules/` inside the pykurucz repo (populated by `python scripts/download_data.py`). TiO and H₂O are included by default when the Schwenke / Partridge–Schwenke binaries are present. Use `--no-molecular-lines` for atomic-only synthesis; `--no-tio` / `--no-h2o` to drop specific species. **`--molecules-dir DIR`** (repeatable) overrides the search paths; **`--tio-bin`** / **`--h2o-bin`** set explicit binary paths.
