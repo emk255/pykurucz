@@ -86,10 +86,6 @@ This pulls the data from a public Google Drive folder via `gdown` (no login, no 
 
 SHA256 is verified automatically. See [data/README.md](data/README.md) for the full file layout.
 
-> If you already have a local Kurucz data tree on disk, you can populate `data/` without hitting Google Drive: `bash scripts/setup_data.sh --source /path/to/kurucz` (developers/lab machines only — not needed for normal use).
->
-> Google Drive has a per-file download quota (~190 requests/day). If you hit "Quota exceeded", wait 24 hours or use `scripts/setup_data.sh` from a local tree.
-
 **Synthesize from an existing atmosphere file** (no PyTorch needed; requires `python scripts/download_data.py` for line list and molecule data):
 
 ```bash

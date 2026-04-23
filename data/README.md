@@ -56,15 +56,3 @@ clear message. Options:
 1. Wait 24 hours and retry.
 2. If you have a local Kurucz data tree, populate `data/` without going
    through Google Drive (see below).
-
-## For developers with a local Kurucz tree
-
-If you already have a Kurucz data directory on disk, you can populate `data/`
-without hitting Google Drive:
-
-```bash
-bash scripts/setup_data.sh --source /path/to/kurucz
-```
-
-Fortran-only files (executables, SYNTHE `tfort.*` line lists, `atlas12.for`)
-are not needed for the Python pipeline.
