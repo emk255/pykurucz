@@ -575,7 +575,7 @@ def synthesize(
 
     Runs the canonical Python pipeline:
 
-        emulator → warm-start .atm → atlas_py (1 iter, MOLECULES ON) →
+        emulator → warm-start .atm → atlas_py (MOLECULES ON) →
         iterated .atm → convert_atm_to_npz → synthe_py.cli → .spec
 
     The emulator provides the starting layer structure (same role as
@@ -609,8 +609,8 @@ def synthesize(
     include_tio, include_h2o : bool
         Include Schwenke TiO / Partridge–Schwenke H₂O (default True).
     atlas_iterations : int
-        Number of atlas_py outer iterations (default 1, matching the
-        validated single-iteration Fortran parity pipeline).
+        Number of atlas_py outer iterations (default 1 for quick runs; use
+        30 to match the full Fortran-style validation pipeline).
     n_workers : int, optional
         Worker count for synthe_py.cli (default: all logical CPUs).
 
@@ -756,6 +756,9 @@ Examples:
   # Low-resolution run
   python pykurucz.py --teff 5770 --logg 4.44 --resolution 50000
 
+  # Full ATLAS-style iteration count used in end-to-end Fortran validation
+  python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 30
+
 Notes:
   --mh scales ALL metals uniformly (like [Fe/H] in a standard grid).
   --am adds an extra offset to alpha elements on top of --mh.
@@ -797,6 +800,15 @@ Notes:
                         help="End wavelength in nm (default: 1800)")
     parser.add_argument("--resolution", type=float, default=300_000.0,
                         help="Resolving power (default: 300000)")
+    parser.add_argument(
+        "--atlas-iterations",
+        type=int,
+        default=1,
+        help=(
+            "Number of atlas_py atmosphere iterations (default: 1 for quick runs; "
+            "use 30 for the full Fortran-style validation/convergence path)."
+        ),
+    )
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: results/)")
     parser.add_argument(
@@ -818,6 +830,9 @@ Notes:
         help="Exclude Partridge-Schwenke H2O lines when molecular data are enabled.",
     )
     args = parser.parse_args()
+    atlas_iterations = int(args.atlas_iterations)
+    if atlas_iterations < 1:
+        parser.error("--atlas-iterations must be >= 1")
 
     individual = None
     if args.abund:
@@ -832,6 +847,7 @@ Notes:
         wl_start=args.wl_start,
         wl_end=args.wl_end,
         resolution=args.resolution,
+        atlas_iterations=atlas_iterations,
         abundances=individual,
         output_dir=args.output_dir,
         use_molecular_lines=not args.no_molecular_lines,

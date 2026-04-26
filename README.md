@@ -57,7 +57,7 @@ This project is dedicated to the memory of <strong>Robert L. Kurucz</strong> (19
 
 # pyKurucz — Pure Python Stellar Spectrum Synthesis
 
-**A ground-truth reimplementation of Kurucz's ATLAS12 and SYNTHE in pure Python** — full atmosphere iteration (`atlas_py`) and spectrum synthesis (`synthe_py`) validated to Fortran parity; molecular lines use the same Fortran-grounded path and are **on by default** when `data/molecules/` is populated (TiO/H₂O binaries are included if the files exist). Use `--no-molecular-lines` for atomic-only runs. No Fortran compiler needed. Just Python, NumPy, SciPy, and Numba.
+**A ground-truth reimplementation of Kurucz's ATLAS12 and SYNTHE in pure Python** — atmosphere iteration (`atlas_py`) and spectrum synthesis (`synthe_py`) validated against Fortran end-to-end spectra; molecular lines use the same Fortran-grounded path and are **on by default** when `data/molecules/` is populated (TiO/H₂O binaries are included if the files exist). Use `--no-molecular-lines` for atomic-only runs. No Fortran compiler needed. Just Python, NumPy, SciPy, and Numba.
 
 **Authors:** Elliot M. Kim (Cornell) and Yuan-Sen Ting (The Ohio State), building on the original Fortran codes by Robert L. Kurucz (CfA/Harvard & Smithsonian).
 
@@ -100,6 +100,9 @@ python -m synthe_py.cli path/to/model.atm lines/gfallvac.latest \
 ```bash
 pip install torch
 python pykurucz.py --teff 5770 --logg 4.44 --wl-start 500 --wl-end 510
+
+# Full ATLAS-style atmosphere iteration count used in validation
+python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 30
 ```
 
 Both produce a `.spec` file with wavelength, flux, and continuum columns. Use a narrow wavelength range (like 500–510 nm above) for a quick first run; the full 300–1800 nm range is slower but covers the complete optical+NIR.
@@ -156,13 +159,16 @@ kurucz-a1 emulator ──► warm-start .atm ──► atlas_py (MOLECULES ON)
                                      └──► iterated .atm ──► synthe_py ──► .spec
 ```
 
-The emulator plays the same role as `READ DECK6` in the Fortran pipeline: it supplies the starting layer structure so that `atlas_py` converges quickly rather than starting from a grey approximation. `atlas_py` then self-consistently iterates the atmospheric structure with the same physics as Fortran ATLAS12 (always `MOLECULES ON`, matching the Fortran deck), so the downstream SYNTHE spectrum stays in parity with Fortran references.
+The emulator plays the same role as `READ DECK6` in the Fortran pipeline: it supplies the starting layer structure so that `atlas_py` converges quickly rather than starting from a grey approximation. `atlas_py` then self-consistently iterates the atmospheric structure with the same physics as Fortran ATLAS12 (always `MOLECULES ON`, matching the Fortran deck), so the downstream SYNTHE spectrum stays in parity with Fortran references. The CLI defaults to one atmosphere iteration for quick exploratory runs; use `--atlas-iterations 30` for the full Fortran-style validation/convergence path.
 
 Requires `data/` to be populated once via `python scripts/download_data.py` (see Quick start above).
 
 ```bash
 # Solar-type star, full wavelength range
 python pykurucz.py --teff 5770 --logg 4.44
+
+# Same star with the full ATLAS-style iteration count
+python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 30
 
 # Metal-poor K giant with alpha enhancement
 python pykurucz.py --teff 4500 --logg 2.0 --mh -1.5 --am 0.3
@@ -211,7 +217,7 @@ Plus supporting physics: Saha–Boltzmann populations with detailed partition fu
 
 ### Validated against the Fortran original
 
-Both codes were run with identical inputs: same `.atm` files, same line list, same wavelength range (300–1800 nm), same resolution (R=300,000).
+Both codes were run with identical inputs: same `.atm` files, same line list, same wavelength range (300–1800 nm), same resolution (R=300,000). The end-to-end `atlas_py` + `synthe_py` validation uses normalized flux (`F/F_cont`) as the scientific comparison target; recent 30-iteration checks across six stellar atmospheres passed with no wavelength exceeding the `0.10` outlier threshold.
 
 | Model | $T_{\text{eff}}$ | $\log g$ | Type | Median Δ | 95th pctl | 99th pctl |
 |-------|-------|-------|------|----------|-----------|-----------|
@@ -261,7 +267,7 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
               (wavelength, flux, continuum)
 ```
 
-**Stage 1 — Atmosphere**: Mode A reads your `.atm` file directly. Mode B runs the kurucz-a1 emulator for a warm-start and then iterates it with `atlas_py` (full Python ATLAS12, `MOLECULES ON`) to stay in parity with Fortran ATLAS12 output.
+**Stage 1 — Atmosphere**: Mode A reads your `.atm` file directly. Mode B runs the kurucz-a1 emulator for a warm-start and then iterates it with `atlas_py` (full Python ATLAS12, `MOLECULES ON`). The default is one iteration for faster exploratory runs; pass `--atlas-iterations 30` when you want the full Fortran-style iteration count used in end-to-end validation.
 
 **Stage 2 — Preprocessing** (`convert_atm_to_npz.py`): Reads the `.atm` file and computes Saha–Boltzmann populations, molecular equilibrium (~300 species), continuous opacity coefficients (H⁻, H I, He, metals, scattering), and Doppler widths at each atmospheric layer.
 
