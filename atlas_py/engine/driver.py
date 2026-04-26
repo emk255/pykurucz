@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 import re
+import time
 from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 from ..config import AtlasConfig
@@ -447,6 +451,9 @@ def _apply_deck_to_atm_abundances(atm: AtlasAtmosphere, deck: AtlasDeck) -> None
 def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     """Run one or more atlas_py iterations and write output `.atm`."""
 
+    _t_total = time.perf_counter()
+    _t_stage = time.perf_counter()
+
     atm = load_atm(cfg.inputs.atmosphere_path)
     state = _runtime_from_atm(atm)
     itemp_cache: Dict[str, int] = {"pops_itemp": -1}
@@ -584,8 +591,32 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
         if _ifpres_meta is not None:
             ifpres = int(_ifpres_meta)
 
+    tcst = init_tcorr(atm.layers)
+    itemp_counter = 0
+    _require_line_opacity_inputs(cfg=cfg, ifop=ifop)
+    tables = load_atlas_tables()
+    selected_line_records = None
+    nlteline_records = None
+    fort12_path = cfg.inputs.line_selection_path
+    if ifop[14] == 1:
+        if fort12_path is None:
+            import tempfile
+            _tmp = tempfile.NamedTemporaryFile(
+                suffix="_fort12.bin", delete=False, prefix="atlas_py_"
+            )
+            fort12_path = Path(_tmp.name)
+            _tmp.close()
+        elif fort12_path.exists():
+            selected_line_records = read_selected_lines(fort12_path)
+    if ifop[16] == 1:
+        nlteline_records = read_nlteline_records(cfg.inputs.nlteline_path)
+
     for iter_idx in range(numits):
-        itemp = iter_idx + 1
+        iter_no = iter_idx + 1
+        itemp_counter += iter_no
+        itemp = itemp_counter
+        _t_stage = time.perf_counter()
+        temp_before_iter = atm.temperature.copy()
         # Turbulence pressure update (atlas12.for TURB subroutine, lines 5199-5214).
         # When IFTURB=1: call TURB to recompute VTURB and PTURB each iteration.
         # When IFTURB=0: PTURB stays at initial model values (zero from CALCULATE).
@@ -648,509 +679,563 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             state=state,
         )
 
-    abross_out = atm.abross.copy()
-    tauros_out = None
-    accrad_out = atm.accrad.copy()
-    prad_out = None
-    flxrad_out = None
-    rjmins_out = None
-    rdabh_out = None
-    rdiagj_out = None
-    flxerr_out = None
-    flxdrv_out = None
-    dtflux_out = None
-    dtlamb_out = None
-    t1_out = None
-    flxcnv_out = None
-    vconv_out = None
-    grdadb_out = None
-    hscale_out = None
-    _require_line_opacity_inputs(cfg=cfg, ifop=ifop)
-    tables = load_atlas_tables()
-    adapter = _build_kapp_adapter(atm, state)
-    teff = teff_init
-    # Initialize TCORR state early so it can be passed to kapcont_baseline for XCONOP.
-    # On the first iteration the ROSSTAB table is empty (nross=0), so XCONOP returns
-    # 1.0 — matching Fortran behaviour: static ROSS(1)=0 → ROSSTAB=10.**0=1.0.
-    tcst = init_tcorr(atm.layers)
-    wave_nm, rco, acont_all, sigmac_all, scont_all = kapcont_baseline(
-        adapter=adapter,
-        teff=teff,
-        atlas_tables=tables,
-        ifop=ifop,
-        tcst=tcst,
-    )
-    if ifop[14] == 1:
-        if state.xnfdop is None or state.dopple is None:
-            raise ValueError("DOPPLE/XNFDOP arrays are required for LINOP1")
-        tabcont, _wavetab, i_wavetab = kapcont_table(
+        logger.info("Timing: setup (load + POPS + POPSALL + DOPPLER) in %.3fs", time.perf_counter() - _t_stage)
+        _t_stage = time.perf_counter()
+
+        abross_out = atm.abross.copy()
+        tauros_out = None
+        accrad_out = atm.accrad.copy()
+        prad_out = None
+        flxrad_out = None
+        rjmins_out = None
+        rdabh_out = None
+        rdiagj_out = None
+        flxerr_out = None
+        flxdrv_out = None
+        dtflux_out = None
+        dtlamb_out = None
+        t1_out = None
+        flxcnv_out = None
+        vconv_out = None
+        grdadb_out = None
+        hscale_out = None
+        adapter = _build_kapp_adapter(atm, state)
+        teff = teff_init
+        # Initialize TCORR state early so it can be passed to kapcont_baseline for XCONOP.
+        # On the first iteration the ROSSTAB table is empty (nross=0), so XCONOP returns
+        # 1.0 — matching Fortran behaviour: static ROSS(1)=0 → ROSSTAB=10.**0=1.0.
+        _t_sub = time.perf_counter()
+        wave_nm, rco, acont_all, sigmac_all, scont_all = kapcont_baseline(
             adapter=adapter,
-            temperature_k=np.asarray(atm.temperature, dtype=np.float64),
             teff=teff,
             atlas_tables=tables,
             ifop=ifop,
             tcst=tcst,
         )
-        # Resolve fort.12: use precomputed path or run Python SELECTLINES.
-        fort12_path = cfg.inputs.line_selection_path
-        if fort12_path is None:
-            import tempfile
-            _tmp = tempfile.NamedTemporaryFile(
-                suffix="_fort12.bin", delete=False, prefix="atlas_py_"
+        logger.info("Timing: kapcont_baseline continuum grid in %.3fs", time.perf_counter() - _t_sub)
+        if ifop[14] == 1:
+            if state.xnfdop is None or state.dopple is None:
+                raise ValueError("DOPPLE/XNFDOP arrays are required for LINOP1")
+            _t_sub = time.perf_counter()
+            tabcont, _wavetab, i_wavetab = kapcont_table(
+                adapter=adapter,
+                temperature_k=np.asarray(atm.temperature, dtype=np.float64),
+                teff=teff,
+                atlas_tables=tables,
+                ifop=ifop,
+                tcst=tcst,
             )
-            fort12_path = Path(_tmp.name)
-            _tmp.close()
-            run_selectlines(
-                xnfdop=np.asarray(state.xnfdop, dtype=np.float32),
-                tabcont=np.asarray(tabcont, dtype=np.float32),
-                iwavetab=np.asarray(i_wavetab, dtype=np.int64),
+            logger.info("Timing: KAPCONT tabulation in %.3fs", time.perf_counter() - _t_sub)
+            # Resolve fort.12: use precomputed path or run Python SELECTLINES.
+            if selected_line_records is None:
+                _t_sub = time.perf_counter()
+                run_selectlines(
+                    xnfdop=np.asarray(state.xnfdop, dtype=np.float32),
+                    tabcont=np.asarray(tabcont, dtype=np.float32),
+                    iwavetab=np.asarray(i_wavetab, dtype=np.int64),
+                    hckt=np.asarray(atm.hckt, dtype=np.float64),
+                    fort11_path=cfg.inputs.fort11_path,
+                    fort111_path=cfg.inputs.fort111_path,
+                    fort21_path=cfg.inputs.fort21_path,
+                    fort31_path=cfg.inputs.fort31_path,
+                    fort41_path=cfg.inputs.fort41_path,
+                    fort51_path=cfg.inputs.fort51_path,
+                    fort61_path=cfg.inputs.fort61_path,
+                    fort12_output=fort12_path,
+                )
+                selected_line_records = read_selected_lines(fort12_path)
+                logger.info("Timing: SELECTLINES/read fort.12 in %.3fs", time.perf_counter() - _t_sub)
+            records = selected_line_records
+            _t_sub = time.perf_counter()
+            line_state = linop1(
+                records=records,
+                wave_set_nm=np.asarray(wave_nm, dtype=np.float64),
+                i_wavetab=np.asarray(i_wavetab, dtype=np.int64),
+                tabcont=np.asarray(tabcont, dtype=np.float64),
+                temperature_k=np.asarray(atm.temperature, dtype=np.float64),
                 hckt=np.asarray(atm.hckt, dtype=np.float64),
-                fort11_path=cfg.inputs.fort11_path,
-                fort111_path=cfg.inputs.fort111_path,
-                fort21_path=cfg.inputs.fort21_path,
-                fort31_path=cfg.inputs.fort31_path,
-                fort41_path=cfg.inputs.fort41_path,
-                fort51_path=cfg.inputs.fort51_path,
-                fort61_path=cfg.inputs.fort61_path,
-                fort12_output=fort12_path,
+                xne=np.asarray(state.xne, dtype=np.float64),
+                xnf=np.asarray(state.xnf, dtype=np.float64),
+                xnfdop=np.asarray(state.xnfdop, dtype=np.float64),
+                dopple=np.asarray(state.dopple, dtype=np.float64),
+                nulo=1,
+                nuhi=int(wave_nm.size),
             )
-        records = read_selected_lines(fort12_path)
-        line_state = linop1(
-            records=records,
-            wave_set_nm=np.asarray(wave_nm, dtype=np.float64),
-            i_wavetab=np.asarray(i_wavetab, dtype=np.int64),
-            tabcont=np.asarray(tabcont, dtype=np.float64),
-            temperature_k=np.asarray(atm.temperature, dtype=np.float64),
-            hckt=np.asarray(atm.hckt, dtype=np.float64),
-            xne=np.asarray(state.xne, dtype=np.float64),
-            xnf=np.asarray(state.xnf, dtype=np.float64),
-            xnfdop=np.asarray(state.xnfdop, dtype=np.float64),
-            dopple=np.asarray(state.dopple, dtype=np.float64),
-            nulo=1,
-            nuhi=int(wave_nm.size),
-        )
-        xlines = line_state.xlines
-    else:
-        xlines = np.zeros((atm.layers, wave_nm.size), dtype=np.float32)
-    if ifop[16] == 1:
-        if state.xnfdop is None or state.dopple is None:
-            raise ValueError("DOPPLE/XNFDOP arrays are required for XLINOP")
-        nltelines = read_nlteline_records(cfg.inputs.nlteline_path)
-        tabcont_x, _wavetab_x, i_wavetab_x = kapcont_table(
-            adapter=adapter,
-            temperature_k=np.asarray(atm.temperature, dtype=np.float64),
-            teff=teff,
-            atlas_tables=tables,
-            ifop=ifop,
-            tcst=tcst,
-        )
-        xline_state = xlinop(
-            records=nltelines,
-            wave_set_nm=np.asarray(wave_nm, dtype=np.float64),
-            i_wavetab=np.asarray(i_wavetab_x, dtype=np.int64),
-            tabcont=np.asarray(tabcont_x, dtype=np.float64),
-            temperature_k=np.asarray(atm.temperature, dtype=np.float64),
-            hckt=np.asarray(atm.hckt, dtype=np.float64),
-            xne=np.asarray(state.xne, dtype=np.float64),
-            xnf=np.asarray(state.xnf, dtype=np.float64),
-            xnfp=np.asarray(state.xnfp, dtype=np.float64),
-            rho=np.asarray(state.rho, dtype=np.float64),
-            xnfdop=np.asarray(state.xnfdop, dtype=np.float64),
-            dopple=np.asarray(state.dopple, dtype=np.float64),
-            ifop15_enabled=(ifop[14] == 1),
-            base_xlines=np.asarray(xlines, dtype=np.float32),
-            nulo=1,
-            nuhi=int(wave_nm.size),
-        )
-        xlines = xline_state.xlines
-
-    freq_all = 2.99792458e17 / np.maximum(wave_nm, 1e-300)
-    hkt = np.asarray(atm.hkt, dtype=np.float64)
-    temp = np.asarray(atm.temperature, dtype=np.float64)
-    rhox = np.asarray(atm.rhox, dtype=np.float64)
-    n_layers = atm.layers
-    sigmal = np.zeros(n_layers, dtype=np.float64)
-    abross_work = np.zeros(n_layers, dtype=np.float64)
-
-    # HLINOP (IFOP(14)): precompute hydrogen line-wing opacity for all frequencies.
-    # Fortran atlas12.for line 5247: IF(IFOP(14).EQ.1)CALL HLINOP
-    # Returns ahline_all, shline_all of shape (n_layers, n_freq).
-    if ifop[13] == 1:  # IFOP(14) in Fortran (0-based Python index)
-        ehvkt_2d = np.exp(-np.outer(hkt, freq_all))           # (n_layers, n_freq)
-        stim_2d = np.maximum(1.0 - ehvkt_2d, 1e-300)
-        bnu_2d = 1.47439e-2 * ((freq_all / 1.0e15) ** 3)[None, :] * ehvkt_2d / stim_2d
-        adapter_hw = _build_kapp_adapter(atm, state)
-        ahline_all, shline_all = compute_hydrogen_wings(
-            adapter_hw, freq_all, bnu_2d, ehvkt_2d, stim_2d, hkt
-        )
-    else:
-        ahline_all = None
-        shline_all = None
-    _ = ross_step(
-        abross_work,
-        mode=1,
-        rcowt=0.0,
-        bnu=np.zeros(n_layers, dtype=np.float64),
-        freq_hz=0.0,
-        hkt=hkt,
-        temperature_k=temp,
-        stim=np.ones(n_layers, dtype=np.float64),
-        abtot=np.ones(n_layers, dtype=np.float64),
-        numnu=int(freq_all.size),
-        rhox=rhox,
-    )
-    flux = 5.6697e-5 / 12.5664 * teff**4
-    radst = init_radiap(n_layers)
-    # Reinitialise tcst for the frequency loop (was pre-created above for XCONOP;
-    # mode=1 call below resets its accumulators to zero regardless).
-    radiap_accumulate(
-        radst,
-        mode=1,
-        rcowt=0.0,
-        abtot=np.ones(n_layers, dtype=np.float64),
-        hnu=np.zeros(n_layers, dtype=np.float64),
-        jnu=np.zeros(n_layers, dtype=np.float64),
-        knu_surface=0.0,
-        flux=flux,
-        rhox=rhox,
-    )
-    tcorr_step(
-        tcst,
-        mode=1,
-        rcowt=0.0,
-        rhox=rhox,
-        abtot=np.ones(n_layers, dtype=np.float64),
-        hnu=np.zeros(n_layers, dtype=np.float64),
-        jmins=np.zeros(n_layers, dtype=np.float64),
-        taunu=np.zeros(n_layers, dtype=np.float64),
-        bnu=np.zeros(n_layers, dtype=np.float64),
-        freq_hz=0.0,
-        hkt=hkt,
-        temperature_k=temp,
-        stim=np.ones(n_layers, dtype=np.float64),
-        alpha=np.zeros(n_layers, dtype=np.float64),
-        flux=flux,
-        teff=teff,
-        numnu=int(freq_all.size),
-    )
-    # Initialize NLTE STATEQ accumulator if NLTE is active.
-    nlteon: int = 0
-    if deck is not None:
-        nlteon = deck.nlteon
-    stateq_acc = None
-    if nlteon == 1:
-        from ..physics.stateq import (
-            StateqAccumulator, stateq_init, stateq_accumulate, stateq_solve,
-        )
-        stateq_acc = StateqAccumulator(nrhox=n_layers)
-        stateq_init(stateq_acc, temp)
-    for inu in range(freq_all.size):
-        freq = float(freq_all[inu])
-        rcowt = float(rco[inu])
-        ehvkt = np.exp(-freq * hkt)
-        stim = np.maximum(1.0 - ehvkt, 1e-300)
-        freq15 = freq / 1.0e15
-        bnu = 1.47439e-2 * (freq15**3) * ehvkt / stim
-        acont = acont_all[:, inu]
-        sigmac = sigmac_all[:, inu]
-        scont = scont_all[:, inu]
-        alines = xlines[:, inu] * stim
-        # ALINE assembly: atlas12.for line 5260
-        # ALINE(J) = AHLINE(J) + ALINES(J) + AXLINE(J)
-        # AXLINE is zero (no separate NLTE-xline path in current driver).
-        if ahline_all is not None:
-            ahline = ahline_all[:, inu]
-            shline = shline_all[:, inu]
-            aline = ahline + alines
+            logger.info("Timing: LINOP1 kernel in %.3fs", time.perf_counter() - _t_sub)
+            xlines = line_state.xlines
         else:
-            ahline = np.zeros(n_layers, dtype=np.float64)
-            aline = alines.copy()
-        # SLINE assembly: atlas12.for lines 5261-5263
-        # SLINE(J) = BNU(J)
-        # IF(ALINE(J).GT.0.) SLINE(J)=(AHLINE*SHLINE+ALINES*BNU)/ALINE(J)
-        sline = bnu.copy()
-        mask = aline > 0.0
-        if np.any(mask) and ahline_all is not None:
-            sline[mask] = (
-                ahline[mask] * shline[mask] + alines[mask] * bnu[mask]
-            ) / aline[mask]
-        knu_log_path = os.getenv("ATLAS_KNU_LOG")
-        if knu_log_path and inu == 2213:
-            im1 = max(inu - 1, 0)
-            ip1 = min(inu + 1, wave_nm.size - 1)
-            with Path(knu_log_path).open("a", encoding="utf-8") as fh:
-                fh.write(
-                    f"DRI,{float(abtot:=np.maximum(acont[0] + aline[0] + sigmac[0] + sigmal[0], 1e-300)):.8e},"
-                    f"{float((sigmac[0] + sigmal[0]) / abtot):.8e},{float(acont[0]):.8e},{float(aline[0]):.8e},"
-                    f"{float(sigmac[0]):.8e},{float(sigmal[0]):.8e},{float(ahline[0] if ahline_all is not None else 0.0):.8e},"
-                    f"{float(alines[0]):.8e},{0.0:.8e}\n"
+            xlines = np.zeros((atm.layers, wave_nm.size), dtype=np.float32)
+        logger.info("Timing: kapcont_baseline in %.3fs", time.perf_counter() - _t_stage)
+        _t_stage = time.perf_counter()
+        if ifop[16] == 1:
+            if state.xnfdop is None or state.dopple is None:
+                raise ValueError("DOPPLE/XNFDOP arrays are required for XLINOP")
+            if ifop[14] != 1:
+                _t_sub = time.perf_counter()
+                tabcont, _wavetab, i_wavetab = kapcont_table(
+                    adapter=adapter,
+                    temperature_k=np.asarray(atm.temperature, dtype=np.float64),
+                    teff=teff,
+                    atlas_tables=tables,
+                    ifop=ifop,
+                    tcst=tcst,
                 )
-                fh.write(
-                    f"DRN,{int(im1):d},{float(wave_nm[im1]):.8e},{float(xlines[0, im1]):.8e},"
-                    f"{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
-                    f"{int(ip1):d},{float(wave_nm[ip1]):.8e},{float(xlines[0, ip1]):.8e},"
-                    f"{float(stim[0]):.8e}\n"
-                )
-        if knu_log_path and 2212 <= inu <= 2214:
-            with Path(knu_log_path).open("a", encoding="utf-8") as fh:
-                fh.write(
-                    f"DRW,{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
-                    f"{float(stim[0]):.8e},{float(alines[0]):.8e},{float(aline[0]):.8e}\n"
-                )
-        jres = josh_depth_profiles(
-            ifscat=1,
-            ifsurf=0,
-            acont=acont,
-            scont=scont,
-            aline=aline,
-            sline=sline,
-            sigmac=sigmac,
-            sigmal=sigmal,
+                logger.info("Timing: KAPCONT tabulation for XLINOP in %.3fs", time.perf_counter() - _t_sub)
+            _t_sub = time.perf_counter()
+            xline_state = xlinop(
+                records=nlteline_records,
+                wave_set_nm=np.asarray(wave_nm, dtype=np.float64),
+                i_wavetab=np.asarray(i_wavetab, dtype=np.int64),
+                tabcont=np.asarray(tabcont, dtype=np.float64),
+                temperature_k=np.asarray(atm.temperature, dtype=np.float64),
+                hckt=np.asarray(atm.hckt, dtype=np.float64),
+                xne=np.asarray(state.xne, dtype=np.float64),
+                xnf=np.asarray(state.xnf, dtype=np.float64),
+                xnfp=np.asarray(state.xnfp, dtype=np.float64),
+                rho=np.asarray(state.rho, dtype=np.float64),
+                xnfdop=np.asarray(state.xnfdop, dtype=np.float64),
+                dopple=np.asarray(state.dopple, dtype=np.float64),
+                ifop15_enabled=(ifop[14] == 1),
+                base_xlines=np.asarray(xlines, dtype=np.float32),
+                nulo=1,
+                nuhi=int(wave_nm.size),
+            )
+            logger.info("Timing: XLINOP kernel in %.3fs", time.perf_counter() - _t_sub)
+            xlines = xline_state.xlines
+
+        logger.info("Timing: LINOP (selectlines + line opacity) in %.3fs", time.perf_counter() - _t_stage)
+        _t_stage = time.perf_counter()
+
+        freq_all = 2.99792458e17 / np.maximum(wave_nm, 1e-300)
+        hkt = np.asarray(atm.hkt, dtype=np.float64)
+        temp = np.asarray(atm.temperature, dtype=np.float64)
+        rhox = np.asarray(atm.rhox, dtype=np.float64)
+        n_layers = atm.layers
+        sigmal = np.zeros(n_layers, dtype=np.float64)
+        abross_work = np.zeros(n_layers, dtype=np.float64)
+
+        # HLINOP (IFOP(14)): precompute hydrogen line-wing opacity for all frequencies.
+        # Fortran atlas12.for line 5247: IF(IFOP(14).EQ.1)CALL HLINOP
+        # Returns ahline_all, shline_all of shape (n_layers, n_freq).
+        if ifop[13] == 1:  # IFOP(14) in Fortran (0-based Python index)
+            ehvkt_2d = np.exp(-np.outer(hkt, freq_all))           # (n_layers, n_freq)
+            stim_2d = np.maximum(1.0 - ehvkt_2d, 1e-300)
+            bnu_2d = 1.47439e-2 * ((freq_all / 1.0e15) ** 3)[None, :] * ehvkt_2d / stim_2d
+            adapter_hw = _build_kapp_adapter(atm, state)
+            ahline_all, shline_all = compute_hydrogen_wings(
+                adapter_hw, freq_all, bnu_2d, ehvkt_2d, stim_2d, hkt
+            )
+        else:
+            ahline_all = None
+            shline_all = None
+        logger.info("Timing: hydrogen wings (HLINOP) in %.3fs", time.perf_counter() - _t_stage)
+        _t_stage = time.perf_counter()
+        _ = ross_step(
+            abross_work,
+            mode=1,
+            rcowt=0.0,
+            bnu=np.zeros(n_layers, dtype=np.float64),
+            freq_hz=0.0,
+            hkt=hkt,
+            temperature_k=temp,
+            stim=np.ones(n_layers, dtype=np.float64),
+            abtot=np.ones(n_layers, dtype=np.float64),
+            numnu=int(freq_all.size),
             rhox=rhox,
-            bnu=bnu,
-            freq_hz=freq,
-            wave_nm=float(wave_nm[inu]),
         )
-        # Fortran safety clamp (atlas12.for lines 355-376): if any HNU(J)<0
-        # after JOSH, clamp HNU, JNU, SNU to at least 1e-99 to prevent
-        # RADIAP from accumulating negative radiative accelerations.
-        if np.any(jres.hnu < 0.0):
-            jres.hnu[:] = np.maximum(jres.hnu, 1e-99)
-            jres.jnu[:] = np.maximum(jres.jnu, 1e-99)
-            jres.snu[:] = np.maximum(jres.snu, 1e-99)
+        flux = 5.6697e-5 / 12.5664 * teff**4
+        radst = init_radiap(n_layers)
+        # Reinitialise tcst for the frequency loop (was pre-created above for XCONOP;
+        # mode=1 call below resets its accumulators to zero regardless).
         radiap_accumulate(
             radst,
-            mode=2,
-            rcowt=rcowt,
-            abtot=jres.abtot,
-            hnu=jres.hnu,
-            jnu=jres.jnu,
-            knu_surface=jres.knu_surface,
-            freq_hz=freq,
-            wave_nm=float(wave_nm[inu]),
+            mode=1,
+            rcowt=0.0,
+            abtot=np.ones(n_layers, dtype=np.float64),
+            hnu=np.zeros(n_layers, dtype=np.float64),
+            jnu=np.zeros(n_layers, dtype=np.float64),
+            knu_surface=0.0,
             flux=flux,
             rhox=rhox,
         )
         tcorr_step(
             tcst,
-            mode=2,
-            rcowt=rcowt,
+            mode=1,
+            rcowt=0.0,
             rhox=rhox,
-            abtot=jres.abtot,
-            hnu=jres.hnu,
-            jmins=jres.jmins,
-            taunu=jres.taunu,
-            bnu=bnu,
-            freq_hz=freq,
+            abtot=np.ones(n_layers, dtype=np.float64),
+            hnu=np.zeros(n_layers, dtype=np.float64),
+            jmins=np.zeros(n_layers, dtype=np.float64),
+            taunu=np.zeros(n_layers, dtype=np.float64),
+            bnu=np.zeros(n_layers, dtype=np.float64),
+            freq_hz=0.0,
             hkt=hkt,
             temperature_k=temp,
-            stim=stim,
-            alpha=jres.alpha,
+            stim=np.ones(n_layers, dtype=np.float64),
+            alpha=np.zeros(n_layers, dtype=np.float64),
             flux=flux,
             teff=teff,
             numnu=int(freq_all.size),
         )
-        abross_work, _ = ross_step(
+        # Initialize NLTE STATEQ accumulator if NLTE is active.
+        nlteon: int = 0
+        if deck is not None:
+            nlteon = deck.nlteon
+        stateq_acc = None
+        if nlteon == 1:
+            from ..physics.stateq import (
+                StateqAccumulator, stateq_init, stateq_accumulate, stateq_solve,
+            )
+            stateq_acc = StateqAccumulator(nrhox=n_layers)
+            stateq_init(stateq_acc, temp)
+        logger.info("Timing: pre-loop setup (ROSS/RADIAP/TCORR init) in %.3fs", time.perf_counter() - _t_stage)
+        _t_stage = time.perf_counter()
+        for inu in range(freq_all.size):
+            freq = float(freq_all[inu])
+            rcowt = float(rco[inu])
+            ehvkt = np.exp(-freq * hkt)
+            stim = np.maximum(1.0 - ehvkt, 1e-300)
+            freq15 = freq / 1.0e15
+            bnu = 1.47439e-2 * (freq15**3) * ehvkt / stim
+            acont = acont_all[:, inu]
+            sigmac = sigmac_all[:, inu]
+            scont = scont_all[:, inu]
+            alines = xlines[:, inu] * stim
+            # ALINE assembly: atlas12.for line 5260
+            # ALINE(J) = AHLINE(J) + ALINES(J) + AXLINE(J)
+            # AXLINE is zero (no separate NLTE-xline path in current driver).
+            if ahline_all is not None:
+                ahline = ahline_all[:, inu]
+                shline = shline_all[:, inu]
+                aline = ahline + alines
+            else:
+                ahline = np.zeros(n_layers, dtype=np.float64)
+                aline = alines.copy()
+            # SLINE assembly: atlas12.for lines 5261-5263
+            # SLINE(J) = BNU(J)
+            # IF(ALINE(J).GT.0.) SLINE(J)=(AHLINE*SHLINE+ALINES*BNU)/ALINE(J)
+            sline = bnu.copy()
+            mask = aline > 0.0
+            if np.any(mask) and ahline_all is not None:
+                sline[mask] = (
+                    ahline[mask] * shline[mask] + alines[mask] * bnu[mask]
+                ) / aline[mask]
+            knu_log_path = os.getenv("ATLAS_KNU_LOG")
+            if knu_log_path and inu == 2213:
+                im1 = max(inu - 1, 0)
+                ip1 = min(inu + 1, wave_nm.size - 1)
+                with Path(knu_log_path).open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        f"DRI,{float(abtot:=np.maximum(acont[0] + aline[0] + sigmac[0] + sigmal[0], 1e-300)):.8e},"
+                        f"{float((sigmac[0] + sigmal[0]) / abtot):.8e},{float(acont[0]):.8e},{float(aline[0]):.8e},"
+                        f"{float(sigmac[0]):.8e},{float(sigmal[0]):.8e},{float(ahline[0] if ahline_all is not None else 0.0):.8e},"
+                        f"{float(alines[0]):.8e},{0.0:.8e}\n"
+                    )
+                    fh.write(
+                        f"DRN,{int(im1):d},{float(wave_nm[im1]):.8e},{float(xlines[0, im1]):.8e},"
+                        f"{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
+                        f"{int(ip1):d},{float(wave_nm[ip1]):.8e},{float(xlines[0, ip1]):.8e},"
+                        f"{float(stim[0]):.8e}\n"
+                    )
+            if knu_log_path and 2212 <= inu <= 2214:
+                with Path(knu_log_path).open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        f"DRW,{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
+                        f"{float(stim[0]):.8e},{float(alines[0]):.8e},{float(aline[0]):.8e}\n"
+                    )
+            jres = josh_depth_profiles(
+                ifscat=1,
+                ifsurf=0,
+                acont=acont,
+                scont=scont,
+                aline=aline,
+                sline=sline,
+                sigmac=sigmac,
+                sigmal=sigmal,
+                rhox=rhox,
+                bnu=bnu,
+                freq_hz=freq,
+                wave_nm=float(wave_nm[inu]),
+            )
+            # Fortran safety clamp (atlas12.for lines 355-376): if any HNU(J)<0
+            # after JOSH, clamp HNU, JNU, SNU to at least 1e-99 to prevent
+            # RADIAP from accumulating negative radiative accelerations.
+            if np.any(jres.hnu < 0.0):
+                jres.hnu[:] = np.maximum(jres.hnu, 1e-99)
+                jres.jnu[:] = np.maximum(jres.jnu, 1e-99)
+                jres.snu[:] = np.maximum(jres.snu, 1e-99)
+            radiap_accumulate(
+                radst,
+                mode=2,
+                rcowt=rcowt,
+                abtot=jres.abtot,
+                hnu=jres.hnu,
+                jnu=jres.jnu,
+                knu_surface=jres.knu_surface,
+                freq_hz=freq,
+                wave_nm=float(wave_nm[inu]),
+                flux=flux,
+                rhox=rhox,
+            )
+            tcorr_step(
+                tcst,
+                mode=2,
+                rcowt=rcowt,
+                rhox=rhox,
+                abtot=jres.abtot,
+                hnu=jres.hnu,
+                jmins=jres.jmins,
+                taunu=jres.taunu,
+                bnu=bnu,
+                freq_hz=freq,
+                hkt=hkt,
+                temperature_k=temp,
+                stim=stim,
+                alpha=jres.alpha,
+                flux=flux,
+                teff=teff,
+                numnu=int(freq_all.size),
+            )
+            abross_work, _ = ross_step(
+                abross_work,
+                mode=2,
+                rcowt=rcowt,
+                bnu=bnu,
+                freq_hz=freq,
+                hkt=hkt,
+                temperature_k=temp,
+                stim=stim,
+                abtot=jres.abtot,
+                numnu=int(freq_all.size),
+                rhox=rhox,
+            )
+            # STATEQ MODE=2: accumulate H photo-ionization rates at this frequency.
+            if stateq_acc is not None:
+                stateq_accumulate(
+                    stateq_acc,
+                    freq=freq,
+                    rcowt=rcowt,
+                    jnu=jres.jnu,
+                    hkt=hkt,
+                    temperature_k=temp,
+                )
+        logger.info("Timing: frequency loop (%d freqs) in %.3fs", freq_all.size, time.perf_counter() - _t_stage)
+        _t_stage = time.perf_counter()
+        abross_out, tauros_out = ross_step(
             abross_work,
-            mode=2,
-            rcowt=rcowt,
-            bnu=bnu,
-            freq_hz=freq,
+            mode=3,
+            rcowt=0.0,
+            bnu=np.zeros(n_layers, dtype=np.float64),
+            freq_hz=0.0,
             hkt=hkt,
             temperature_k=temp,
-            stim=stim,
-            abtot=jres.abtot,
+            stim=np.ones(n_layers, dtype=np.float64),
+            abtot=np.ones(n_layers, dtype=np.float64),
             numnu=int(freq_all.size),
             rhox=rhox,
         )
-        # STATEQ MODE=2: accumulate H photo-ionization rates at this frequency.
-        if stateq_acc is not None:
-            stateq_accumulate(
-                stateq_acc,
-                freq=freq,
-                rcowt=rcowt,
-                jnu=jres.jnu,
-                hkt=hkt,
-                temperature_k=temp,
+        radiap_accumulate(
+            radst,
+            mode=3,
+            rcowt=0.0,
+            abtot=np.ones(n_layers, dtype=np.float64),
+            hnu=np.zeros(n_layers, dtype=np.float64),
+            jnu=np.zeros(n_layers, dtype=np.float64),
+            knu_surface=0.0,
+            flux=flux,
+            rhox=rhox,
+        )
+        accrad_out = radst.accrad.copy()
+        prad_out = radst.prad.copy()
+        flxrad_out = tcst.flxrad.copy()
+        rjmins_out = tcst.rjmins.copy()
+        rdabh_out = tcst.rdabh.copy()
+        rdiagj_out = tcst.rdiagj.copy()
+        rosstab_ingest(tcst, temp, state.p, abross_out)
+        # CALL HIGH: compute geometric height from RHOX / RHO (atlas12.for line 388).
+        state.height = high_from_rhox(rhox=rhox, rho=state.rho)
+        pturb0 = float(pturb[0]) if pturb.size > 0 else 0.0
+        pzero = pcon + float(pradk0_prev) + pturb0
+        ptotal = gravity_cgs * rhox + pzero
+        if ifconv == 1:
+            ed1, ed2, ed3, ed4, r1, r2, r3, r4 = _convec_fd_samples(
+                atm=atm,
+                state=state,
+                pradk=radst.pradk,
+                tauros=tauros_out,
+                ifmol=ifmol,
+                itemp_seed=itemp * 10,
+                itemp_cache=itemp_cache,
             )
-    abross_out, tauros_out = ross_step(
-        abross_work,
-        mode=3,
-        rcowt=0.0,
-        bnu=np.zeros(n_layers, dtype=np.float64),
-        freq_hz=0.0,
-        hkt=hkt,
-        temperature_k=temp,
-        stim=np.ones(n_layers, dtype=np.float64),
-        abtot=np.ones(n_layers, dtype=np.float64),
-        numnu=int(freq_all.size),
-        rhox=rhox,
-    )
-    radiap_accumulate(
-        radst,
-        mode=3,
-        rcowt=0.0,
-        abtot=np.ones(n_layers, dtype=np.float64),
-        hnu=np.zeros(n_layers, dtype=np.float64),
-        jnu=np.zeros(n_layers, dtype=np.float64),
-        knu_surface=0.0,
-        flux=flux,
-        rhox=rhox,
-    )
-    accrad_out = radst.accrad.copy()
-    prad_out = radst.prad.copy()
-    flxrad_out = tcst.flxrad.copy()
-    rjmins_out = tcst.rjmins.copy()
-    rdabh_out = tcst.rdabh.copy()
-    rdiagj_out = tcst.rdiagj.copy()
-    rosstab_ingest(tcst, temp, state.p, abross_out)
-    # CALL HIGH: compute geometric height from RHOX / RHO (atlas12.for line 388).
-    state.height = high_from_rhox(rhox=rhox, rho=state.rho)
-    pturb0 = float(pturb[0]) if pturb.size > 0 else 0.0
-    pzero = pcon + float(pradk0_prev) + pturb0
-    ptotal = gravity_cgs * rhox + pzero
-    if ifconv == 1:
-        ed1, ed2, ed3, ed4, r1, r2, r3, r4 = _convec_fd_samples(
-            atm=atm,
-            state=state,
-            pradk=radst.pradk,
+        else:
+            ed1 = ed2 = ed3 = ed4 = None
+            r1 = r2 = r3 = r4 = None
+        convec_log_path = os.getenv("ATLAS_CONVEC_LOG")
+        cv = convec(
+            tcst=tcst,
+            rhox=rhox,
             tauros=tauros_out,
-            ifmol=ifmol,
-            itemp_seed=numits * 10,
-            itemp_cache=itemp_cache,
-        )
-    else:
-        ed1 = ed2 = ed3 = ed4 = None
-        r1 = r2 = r3 = r4 = None
-    convec_log_path = os.getenv("ATLAS_CONVEC_LOG")
-    cv = convec(
-        tcst=tcst,
-        rhox=rhox,
-        tauros=tauros_out,
-        temperature_k=temp,
-        gas_pressure=state.p,
-        mass_density=state.rho,
-        abross=abross_out,
-        vturb=atm.vturb,
-        pradk=radst.pradk,
-        ptotal=ptotal,
-        gravity_cgs=gravity_cgs,
-        flux=flux,
-        mixlth=mixlth,
-        overwt=overwt,
-        ifconv=ifconv,
-        nconv=nconv if nconv > 0 else 36,
-        edens1=ed1,
-        edens2=ed2,
-        edens3=ed3,
-        edens4=ed4,
-        rho1=r1,
-        rho2=r2,
-        rho3=r3,
-        rho4=r4,
-        convec_log_path=convec_log_path,
-    )
-    flxcnv_out = cv.flxcnv.copy()
-    vconv_out = cv.vconv.copy()
-    grdadb_out = cv.grdadb.copy()
-    hscale_out = cv.hscale.copy()
-    tcres = tcorr_step(
-        tcst,
-        mode=3,
-        rcowt=0.0,
-        rhox=rhox,
-        abtot=np.ones(n_layers, dtype=np.float64),
-        hnu=np.zeros(n_layers, dtype=np.float64),
-        jmins=np.zeros(n_layers, dtype=np.float64),
-        taunu=np.zeros(n_layers, dtype=np.float64),
-        bnu=np.zeros(n_layers, dtype=np.float64),
-        freq_hz=0.0,
-        hkt=hkt,
-        temperature_k=temp,
-        stim=np.ones(n_layers, dtype=np.float64),
-        alpha=np.zeros(n_layers, dtype=np.float64),
-        flux=flux,
-        teff=teff,
-        numnu=int(freq_all.size),
-        tauros=tauros_out,
-        abross=abross_out,
-        iter_index=numits,
-        ifconv=ifconv,
-        flxcnv=cv.flxcnv,
-        flxcnv0=cv.flxcnv0,
-        dltdlp=cv.dltdlp,
-        grdadb=cv.grdadb,
-        hscale=cv.hscale,
-        ptotal=ptotal,
-        rho=state.rho,
-        dlrdlt=cv.dlrdlt,
-        heatcp=cv.heatcp,
-        mixlth=mixlth,
-        prad=prad_out if prad_out is not None else np.zeros(n_layers, dtype=np.float64),
-        pturb=pturb,
-        gravity_cgs=gravity_cgs,
-        steplg=0.125,
-        tau1lg=-6.875,
-    )
-    pradk0_prev = float(radst.pradk0)
-    if tcres is not None:
-        if flxcnv_out is not None:
-            # Fortran TCORR mode=3 updates FLXCNV only for J=2..NRHOX-1
-            # (atlas12.for lines 716-719), leaving endpoints untouched.
-            flxcnv_out = np.asarray(flxcnv_out, dtype=np.float64).copy()
-            if flxcnv_out.size > 2:
-                flxcnv_out[1:-1] = np.asarray(tcres.cnvflx, dtype=np.float64)[1:-1]
-        # Fortran TCORR (atlas12.for lines 951-991):
-        #   1. Apply DRHOX correction: RHOX(J) += DRHOX(J)  [lines 951-952]
-        #   2. Remap ALL state arrays from original TAUROS grid → TAUSTD via MAP1
-        #      [lines 954-963]: RHOX, T, P, XNE, ABROSS, PRAD, VTURB, BMIN, PTURB, ACCRAD
-        #   3. Copy remapped values back; set TAUROS = TAUSTD  [lines 969-991]
-        # Python mirrors this exactly: first set corrected T+T1 and RHOX+DRHOX on the
-        # original TAUROS grid, then remap every state variable to TAUSTD.
-        atm.temperature[:] = tcres.temperature   # T + T1, on original TAUROS grid
-        atm.rhox[:] = tcres.rhox                 # RHOX + DRHOX, on original TAUROS grid
-        if tauros_out is not None:
-            # atlas12.for lines 995-997: TAUSTD grid definition
-            taustd = np.float64(10.0) ** (
-                -6.875 + np.arange(n_layers, dtype=np.float64) * 0.125
-            )
-            # atlas12.for lines 954-963, 969-991: remap all state arrays to TAUSTD.
-            atm.rhox[:], _ = _josh_map1(tauros_out, atm.rhox, taustd)       # line 954, 970
-            atm.temperature[:], _ = _josh_map1(tauros_out, atm.temperature, taustd)  # 955, 971
-            state.p[:], _ = _josh_map1(tauros_out, state.p, taustd)         # line 956, 977
-            state.xne[:], _ = _josh_map1(tauros_out, state.xne, taustd)     # line 957, 978
-            if abross_out is not None:
-                abross_out, _ = _josh_map1(tauros_out, abross_out, taustd)  # line 958, 979
-            if prad_out is not None:
-                prad_out, _ = _josh_map1(tauros_out, prad_out, taustd)      # line 959, 980
-                prad = prad_out.copy()                                        # line 981
-            atm.vturb[:], _ = _josh_map1(tauros_out, atm.vturb, taustd)     # line 960, 982
-            pturb[:], _ = _josh_map1(tauros_out, pturb, taustd)              # line 962, 983
-            # Fortran behavior: MAP1 is called for ACCRAD (atlas12.for line 967),
-            # but the remapped DUM10 is never copied back into ACCRAD before output
-            # (lines 973-988), so ACCRAD remains on the pre-remap grid.
-            if accrad_out is not None:
-                pass
-            # atlas12.for line 991: TAUROS(J) = TAUSTD(J)
-            tauros_out = taustd.copy()
-        # Fortran does NOT recompute XNATOM/RHO/CHARGESQ after TCORR.
-        # These are recomputed by POPS at the start of the next iteration.
-        flxerr_out = tcres.flxerr.copy()
-        flxdrv_out = tcres.flxdrv.copy()
-        dtflux_out = tcres.dtflux.copy()
-        dtlamb_out = tcres.dtlamb.copy()
-        t1_out = tcres.t1.copy()
-    # STATEQ MODE=3: solve H departure coefficients after frequency loop.
-    if stateq_acc is not None:
-        stateq_solve(
-            stateq_acc,
             temperature_k=temp,
-            xne=state.xne,
-            tkev=atm.tkev,
-            xnfp=state.xnfp,
-            bhyd=state.bhyd,
-            bmin=state.bmin,
+            gas_pressure=state.p,
+            mass_density=state.rho,
+            abross=abross_out,
+            vturb=atm.vturb,
+            pradk=radst.pradk,
+            ptotal=ptotal,
+            gravity_cgs=gravity_cgs,
+            flux=flux,
+            mixlth=mixlth,
+            overwt=overwt,
+            ifconv=ifconv,
+            nconv=nconv if nconv > 0 else 36,
+            edens1=ed1,
+            edens2=ed2,
+            edens3=ed3,
+            edens4=ed4,
+            rho1=r1,
+            rho2=r2,
+            rho3=r3,
+            rho4=r4,
+            convec_log_path=convec_log_path,
         )
+        flxcnv_out = cv.flxcnv.copy()
+        vconv_out = cv.vconv.copy()
+        grdadb_out = cv.grdadb.copy()
+        hscale_out = cv.hscale.copy()
+        tcres = tcorr_step(
+            tcst,
+            mode=3,
+            rcowt=0.0,
+            rhox=rhox,
+            abtot=np.ones(n_layers, dtype=np.float64),
+            hnu=np.zeros(n_layers, dtype=np.float64),
+            jmins=np.zeros(n_layers, dtype=np.float64),
+            taunu=np.zeros(n_layers, dtype=np.float64),
+            bnu=np.zeros(n_layers, dtype=np.float64),
+            freq_hz=0.0,
+            hkt=hkt,
+            temperature_k=temp,
+            stim=np.ones(n_layers, dtype=np.float64),
+            alpha=np.zeros(n_layers, dtype=np.float64),
+            flux=flux,
+            teff=teff,
+            numnu=int(freq_all.size),
+            tauros=tauros_out,
+            abross=abross_out,
+            iter_index=iter_no,
+            ifconv=ifconv,
+            flxcnv=cv.flxcnv,
+            flxcnv0=cv.flxcnv0,
+            dltdlp=cv.dltdlp,
+            grdadb=cv.grdadb,
+            hscale=cv.hscale,
+            ptotal=ptotal,
+            rho=state.rho,
+            dlrdlt=cv.dlrdlt,
+            heatcp=cv.heatcp,
+            mixlth=mixlth,
+            prad=prad_out if prad_out is not None else np.zeros(n_layers, dtype=np.float64),
+            pturb=pturb,
+            gravity_cgs=gravity_cgs,
+            steplg=0.125,
+            tau1lg=-6.875,
+        )
+        pradk0_prev = float(radst.pradk0)
+        if tcres is not None:
+            if flxcnv_out is not None:
+                # Fortran TCORR mode=3 updates FLXCNV only for J=2..NRHOX-1
+                # (atlas12.for lines 716-719), leaving endpoints untouched.
+                flxcnv_out = np.asarray(flxcnv_out, dtype=np.float64).copy()
+                if flxcnv_out.size > 2:
+                    flxcnv_out[1:-1] = np.asarray(tcres.cnvflx, dtype=np.float64)[1:-1]
+            # Fortran TCORR (atlas12.for lines 951-991):
+            #   1. Apply DRHOX correction: RHOX(J) += DRHOX(J)  [lines 951-952]
+            #   2. Remap ALL state arrays from original TAUROS grid → TAUSTD via MAP1
+            #      [lines 954-963]: RHOX, T, P, XNE, ABROSS, PRAD, VTURB, BMIN, PTURB, ACCRAD
+            #   3. Copy remapped values back; set TAUROS = TAUSTD  [lines 969-991]
+            # Python mirrors this exactly: first set corrected T+T1 and RHOX+DRHOX on the
+            # original TAUROS grid, then remap every state variable to TAUSTD.
+            atm.temperature[:] = tcres.temperature   # T + T1, on original TAUROS grid
+            atm.rhox[:] = tcres.rhox                 # RHOX + DRHOX, on original TAUROS grid
+            if tauros_out is not None:
+                # atlas12.for lines 995-997: TAUSTD grid definition
+                taustd = np.float64(10.0) ** (
+                    -6.875 + np.arange(n_layers, dtype=np.float64) * 0.125
+                )
+                # atlas12.for lines 954-963, 969-991: remap all state arrays to TAUSTD.
+                atm.rhox[:], _ = _josh_map1(tauros_out, atm.rhox, taustd)       # line 954, 970
+                atm.temperature[:], _ = _josh_map1(tauros_out, atm.temperature, taustd)  # 955, 971
+                state.p[:], _ = _josh_map1(tauros_out, state.p, taustd)         # line 956, 977
+                state.xne[:], _ = _josh_map1(tauros_out, state.xne, taustd)     # line 957, 978
+                if abross_out is not None:
+                    abross_out, _ = _josh_map1(tauros_out, abross_out, taustd)  # line 958, 979
+                if prad_out is not None:
+                    prad_out, _ = _josh_map1(tauros_out, prad_out, taustd)      # line 959, 980
+                    prad = prad_out.copy()                                        # line 981
+                atm.vturb[:], _ = _josh_map1(tauros_out, atm.vturb, taustd)     # line 960, 982
+                pturb[:], _ = _josh_map1(tauros_out, pturb, taustd)              # line 962, 983
+                # Fortran behavior: MAP1 is called for ACCRAD (atlas12.for line 967),
+                # but the remapped DUM10 is never copied back into ACCRAD before output
+                # (lines 973-988), so ACCRAD remains on the pre-remap grid.
+                if accrad_out is not None:
+                    pass
+                # atlas12.for line 991: TAUROS(J) = TAUSTD(J)
+                tauros_out = taustd.copy()
+            if abross_out is not None:
+                atm.abross[:] = abross_out
+            if accrad_out is not None:
+                atm.accrad[:] = accrad_out
+            # Fortran does NOT recompute XNATOM/RHO/CHARGESQ after TCORR.
+            # These are recomputed by POPS at the start of the next iteration.
+            flxerr_out = tcres.flxerr.copy()
+            flxdrv_out = tcres.flxdrv.copy()
+            dtflux_out = tcres.dtflux.copy()
+            dtlamb_out = tcres.dtlamb.copy()
+            t1_out = tcres.t1.copy()
+            layer_idx = min(79, n_layers - 1)
+            rel_dt = np.abs(
+                (atm.temperature - temp_before_iter)
+                / np.maximum(np.abs(temp_before_iter), 1e-300)
+            )
+            if tauros_out is not None:
+                photo_mask = (tauros_out >= 1.0e-2) & (tauros_out <= 10.0)
+            else:
+                photo_mask = np.zeros(n_layers, dtype=bool)
+            if np.any(photo_mask):
+                photo_rel = rel_dt[photo_mask]
+                photo_msg = (
+                    " photo_median_dT=%.3e photo_max_dT=%.3e"
+                    % (float(np.median(photo_rel)), float(np.max(photo_rel)))
+                )
+            else:
+                photo_msg = ""
+            logger.info(
+                "ATLAS iteration %d/%d: T[layer%d]=%.3fK dTmax=%.3e "
+                "T1[layer%d]=%.3e RHOX[layer%d]=%.3e TAUROS[layer%d]=%.3e%s",
+                iter_no,
+                numits,
+                layer_idx + 1,
+                float(atm.temperature[layer_idx]),
+                float(np.max(rel_dt)),
+                layer_idx + 1,
+                float(t1_out[layer_idx]),
+                layer_idx + 1,
+                float(atm.rhox[layer_idx]),
+                layer_idx + 1,
+                float(tauros_out[layer_idx]) if tauros_out is not None else float("nan"),
+                photo_msg,
+            )
+        # STATEQ MODE=3: solve H departure coefficients after frequency loop.
+        if stateq_acc is not None:
+            stateq_solve(
+                stateq_acc,
+                temperature_k=temp,
+                xne=state.xne,
+                tkev=atm.tkev,
+                xnfp=state.xnfp,
+                bhyd=state.bhyd,
+                bmin=state.bmin,
+            )
 
     out_metadata = atm.metadata.copy()
     out_metadata["begin_line"] = f"BEGIN                    ITERATION{numits:4d} COMPLETED"
@@ -1171,6 +1256,7 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
         metadata=out_metadata,
         abundances=atm.abundances.copy(),
     )
+    logger.info("Timing: post-loop (ROSS/CONVEC/TCORR/output) in %.3fs", time.perf_counter() - _t_stage)
     write_atm(out, cfg.outputs.output_atm_path)
     if cfg.outputs.debug_state_path is not None:
         _write_debug_state_npz(
@@ -1197,5 +1283,6 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             grdadb_out=grdadb_out,
             hscale_out=hscale_out,
         )
+    logger.info("Timing: total atlas_py run in %.3fs", time.perf_counter() - _t_total)
     return out
 

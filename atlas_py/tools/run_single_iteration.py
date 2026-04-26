@@ -38,6 +38,12 @@ def main() -> int:
         ),
     )
     p.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="Number of internal ATLAS12 iterations for pass 2 (default: 1).",
+    )
+    p.add_argument(
         "--trace-config",
         type=Path,
         default=None,
@@ -69,15 +75,18 @@ BEGIN
 END
 """
 
-    deck2 = """READ PUNCH
+    iterations = max(1, int(args.iterations))
+    print_flags = " ".join(["1"] * iterations)
+    punch_flags = " ".join(["0"] * (iterations - 1) + ["1"])
+    deck2 = f"""READ PUNCH
 MOLECULES ON
 READ MOLECULES
 OPACITY ON LINES
 OPACITY ON XLINES
 CONVECTION OVER 1.25 0 36
-ITERATIONS 1
-PRINT 1
-PUNCH 1
+ITERATIONS {iterations}
+PRINT {print_flags}
+PUNCH {punch_flags}
 BEGIN
 END
 """

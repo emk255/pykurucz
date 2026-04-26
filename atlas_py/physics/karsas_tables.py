@@ -174,3 +174,46 @@ def xkarsas(freq: float, zeff_squared: float, n: int, ell: int) -> float:
     return _xkarsas_jit(
         freq, zeff_squared, n, ell, FREQ_LOG, XN_LOG, XL_LOG_ARRAY, EKARSAS, LN10
     )
+
+
+@jit(nopython=True)
+def _xkarsas_grid_jit(
+    freq: np.ndarray,
+    zeff_squared: float,
+    n: int,
+    ell: int,
+    freq_log_table: np.ndarray,
+    xn_log_table: np.ndarray,
+    xl_log_array: np.ndarray,
+    ekarsas_table: np.ndarray,
+    ln10: float,
+) -> np.ndarray:
+    out = np.empty(freq.size, dtype=np.float64)
+    for i in range(freq.size):
+        out[i] = _xkarsas_jit(
+            freq[i],
+            zeff_squared,
+            n,
+            ell,
+            freq_log_table,
+            xn_log_table,
+            xl_log_array,
+            ekarsas_table,
+            ln10,
+        )
+    return out
+
+
+def xkarsas_grid(freq: np.ndarray, zeff_squared: float, n: int, ell: int) -> np.ndarray:
+    """Return Karsas cross-sections for a frequency grid."""
+    return _xkarsas_grid_jit(
+        np.asarray(freq, dtype=np.float64),
+        zeff_squared,
+        n,
+        ell,
+        FREQ_LOG,
+        XN_LOG,
+        XL_LOG_ARRAY,
+        EKARSAS,
+        LN10,
+    )

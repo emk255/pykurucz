@@ -169,7 +169,7 @@ def compute_depth_state(
             # Fallback: compute hc/kT = 1.4388/T (in cm)
             hckt = 1.4388 / temp
 
-        boltz = np.array([tables.fast_ex(float(energy) * hckt) for energy in excitation_energy], dtype=np.float64)
+        boltz = tables.fast_ex_array(np.asarray(excitation_energy, dtype=np.float64) * hckt)
 
         # CRITICAL FIX: Element-specific thermal velocities
         # Fortran xnfpelsyn.for line 488: SQRT(2*TK/ATMASS(NELEM)/1.660D-24 + TURBV²)

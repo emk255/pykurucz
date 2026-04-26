@@ -41,6 +41,40 @@ class ExpTables:
         j = max(0, min(j, self.extabf.size - 1))
         return float(self.extab[i] * self.extabf[j])
 
+    def fast_ex_array(self, x: np.ndarray) -> np.ndarray:
+        """Vectorized FASTEX lookup with the same table rounding as fast_ex."""
+
+        values = np.asarray(x, dtype=np.float64)
+        out = np.empty_like(values, dtype=np.float64)
+
+        zero_mask = values == 0.0
+        neg_mask = values < 0.0
+        pos_mask = values > 0.0
+
+        out[zero_mask] = 1.0
+        out[neg_mask] = np.exp(-values[neg_mask])
+
+        if np.any(pos_mask):
+            pos = values[pos_mask]
+            i = np.floor(pos).astype(np.int64)
+            table_mask = i < self.extab.size
+            pos_out = np.empty_like(pos, dtype=np.float64)
+
+            if np.any(table_mask):
+                pos_table = pos[table_mask]
+                i_table = i[table_mask]
+                frac = pos_table - i_table
+                j = np.floor(frac * 1000.0 + 0.5).astype(np.int64)
+                j = np.clip(j, 0, self.extabf.size - 1)
+                pos_out[table_mask] = self.extab[i_table] * self.extabf[j]
+
+            if np.any(~table_mask):
+                pos_out[~table_mask] = np.exp(-pos[~table_mask])
+
+            out[pos_mask] = pos_out
+
+        return out
+
 
 # Lazily constructed singleton tables
 _exp_tables: ExpTables | None = None
@@ -57,6 +91,12 @@ def fast_ex(x: float) -> float:
     """Public FASTEX wrapper."""
 
     return _get_exp_tables().fast_ex(x)
+
+
+def fast_ex_array(x: np.ndarray) -> np.ndarray:
+    """Public vectorized FASTEX wrapper."""
+
+    return _get_exp_tables().fast_ex_array(x)
 
 
 # Coefficients from the legacy EXPI implementation

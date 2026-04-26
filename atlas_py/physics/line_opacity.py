@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import os
 
 import numpy as np
@@ -15,6 +16,7 @@ except ImportError:
 
 from .hydrogen_profile import (
     HydrogenProfileEvaluator,
+    _profile_for_setup_nb,
     compute_xnh2,
     load_hydrogen_profile_tables_from_atlas12,
 )
@@ -30,6 +32,27 @@ class LineOpacityState:
     lineused: int = 0
 
 
+def _subset_xline_records(records: XLineRecords, mask: np.ndarray) -> XLineRecords:
+    """Return a field-wise subset of decoded `fort.19` records."""
+
+    return XLineRecords(
+        wlvac=records.wlvac[mask],
+        elo=records.elo[mask],
+        gf=records.gf[mask],
+        nblo=records.nblo[mask],
+        nbup=records.nbup[mask],
+        nelion=records.nelion[mask],
+        type_code=records.type_code[mask],
+        ncon=records.ncon[mask],
+        nelionx=records.nelionx[mask],
+        gammar=records.gammar[mask],
+        gammas=records.gammas[mask],
+        gammaw=records.gammaw[mask],
+        iwl=records.iwl[mask],
+        lim=records.lim[mask],
+    )
+
+
 _RATIOLG = np.log(1.0 + 1.0 / 2_000_000.0)
 _CGF_SCALE = 0.026538 / 1.77245 / 2.99792458e17
 _GAMMA_SCALE = 1.0 / 12.5664 / 2.99792458e17
@@ -40,6 +63,7 @@ _TABH1 = _LO_TABLES["_TABH1"]
 _C_NM = 2.99792458e17
 
 
+@lru_cache(maxsize=1)
 def _build_contx() -> np.ndarray:
     """CONTX(25,16) used by XLINOP normal/hydrogen branches."""
 
@@ -64,11 +88,13 @@ def _build_contx() -> np.ndarray:
     return c
 
 
+@lru_cache(maxsize=1)
 def _build_tablog() -> np.ndarray:
     i = np.arange(1, 32769, dtype=np.float64)
     return 10.0 ** ((i - 16384.0) * 0.001)
 
 
+@lru_cache(maxsize=1)
 def _build_exptab() -> tuple[np.ndarray, np.ndarray]:
     i = np.arange(1001, dtype=np.float64)
     return np.exp(-i), np.exp(-i * 0.001)
@@ -154,6 +180,7 @@ def _map4(xold: np.ndarray, fold: np.ndarray, xnew: np.ndarray) -> np.ndarray:
     return fnew
 
 
+@lru_cache(maxsize=1)
 def _build_h_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     vsteps = 200.0
     h0lin = np.arange(2001, dtype=np.float64) / vsteps
@@ -321,6 +348,7 @@ def _accumulate_wings(
 
 if _NUMBA_AVAILABLE:
     _njit = numba.njit(cache=True)
+    _njit_parallel = numba.njit(cache=True, parallel=True)
 
     @_njit
     def _fastex_nb(x, extab, extabf):
@@ -426,6 +454,69 @@ if _NUMBA_AVAILABLE:
             if iw < 0:
                 break
             cv = np.float32(center * _voigt_nb(np.float32(wlvac - waveset[iw]) / dopwave, adamp, h0tab, h1tab, h2tab))
+            xlines[j0, iw] += cv
+            if cv < tabcont_ref:
+                break
+
+    @_njit
+    def _accwings_cutoff_nb(
+        xlines, j0, nu0, wlvac, center, adamp, dopwave, tabcont_ref,
+        waveset, h0tab, h1tab, h2tab, wing_steps, blue_cutoff,
+    ):
+        numnu = waveset.shape[0]
+        if dopwave <= 0.0:
+            return
+        ired_max = int(wing_steps)
+        ired_hi = min(nu0 + ired_max + 1, numnu)
+        if adamp <= 0.2:
+            for iw in range(nu0, ired_hi):
+                vvoigt = float(waveset[iw] - wlvac) / dopwave
+                if vvoigt > 10.0:
+                    cv = center * 0.5642 * adamp / (vvoigt * vvoigt)
+                else:
+                    iv = int(vvoigt * 200.0 + 1.5)
+                    if iv < 1:
+                        iv = 1
+                    if iv > 2001:
+                        iv = 2001
+                    ii = iv - 1
+                    cv = center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii])
+                xlines[j0, iw] += cv
+                if cv < tabcont_ref:
+                    break
+            for ired in range(1, ired_max + 1):
+                iw = nu0 - ired
+                if iw < 0:
+                    break
+                if blue_cutoff > 0.0 and waveset[iw] < blue_cutoff:
+                    break
+                vvoigt = float(wlvac - waveset[iw]) / dopwave
+                if vvoigt > 10.0:
+                    cv = center * 0.5642 * adamp / (vvoigt * vvoigt)
+                else:
+                    iv = int(vvoigt * 200.0 + 1.5)
+                    if iv < 1:
+                        iv = 1
+                    if iv > 2001:
+                        iv = 2001
+                    ii = iv - 1
+                    cv = center * ((h2tab[ii] * adamp + h1tab[ii]) * adamp + h0tab[ii])
+                xlines[j0, iw] += cv
+                if cv < tabcont_ref:
+                    break
+            return
+        for iw in range(nu0, ired_hi):
+            cv = center * _voigt_nb(float(waveset[iw] - wlvac) / dopwave, adamp, h0tab, h1tab, h2tab)
+            xlines[j0, iw] += cv
+            if cv < tabcont_ref:
+                break
+        for ired in range(1, ired_max + 1):
+            iw = nu0 - ired
+            if iw < 0:
+                break
+            if blue_cutoff > 0.0 and waveset[iw] < blue_cutoff:
+                break
+            cv = center * _voigt_nb(float(wlvac - waveset[iw]) / dopwave, adamp, h0tab, h1tab, h2tab)
             xlines[j0, iw] += cv
             if cv < tabcont_ref:
                 break
@@ -553,10 +644,405 @@ if _NUMBA_AVAILABLE:
 
         return xlines, lineused
 
+    @_njit
+    def _xlinop_type0_kernel_nb(
+        xlines,
+        n_records,
+        wlvac_arr, gf_arr, elo_arr, gammar_arr, gammas_arr, gammaw_arr,
+        nelion_arr, type_arr, ncon_arr, nelionx_arr, iwl_arr,
+        waveset, iwavetab, tab,
+        hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
+        emerge, contx,
+        extab, extabf, h0tab, h1tab, h2tab,
+        nrhox, numnu, nuhi_eff, nulo,
+    ):
+        ifj = np.zeros(nrhox + 2, dtype=np.int32)
+        nucont0 = 0
+        nu0 = max(0, nulo - 1)
+        lineused = 0
+        for iline in range(n_records):
+            typ = int(type_arr[iline])
+            if typ != 0 and typ != 3:
+                continue
+            wlvac = float(wlvac_arr[iline])
+            if wlvac > waveset[min(nuhi_eff, numnu) - 1]:
+                break
+            iwl = int(iwl_arr[iline])
+            while nucont0 < iwavetab.shape[0] and iwl >= int(iwavetab[nucont0]):
+                nucont0 += 1
+            if nucont0 >= tab.shape[1]:
+                continue
+            while nu0 < numnu and wlvac >= waveset[nu0]:
+                nu0 += 1
+            if nu0 >= numnu:
+                break
+
+            nelion = int(nelion_arr[iline])
+            if nelion < 1 or nelion > xnfdop_arr.shape[1]:
+                lineused += 1
+                continue
+            cgf = float(gf_arr[iline])
+            elo = float(elo_arr[iline])
+            gammar = float(gammar_arr[iline])
+            gammas = float(gammas_arr[iline])
+            gammaw = float(gammaw_arr[iline])
+            ncon_eff = int(ncon_arr[iline])
+            if ncon_eff > 10:
+                ncon_eff = 0
+            nelionx = int(nelionx_arr[iline])
+            for j1 in range(8, nrhox + 1, 8):
+                ifj[j1 + 1] = 0
+                j0 = j1 - 1
+                center = cgf * float(xnfdop_arr[j0, nelion - 1])
+                if center < float(tab[j0, nucont0]):
+                    continue
+                center *= _fastex_nb(elo * float(hckt_arr[j0]), extab, extabf)
+                if center < float(tab[j0, nucont0]):
+                    continue
+                dop = float(dopple_arr[j0, nelion - 1])
+                if dop <= 0.0:
+                    continue
+                ifj[j1 + 1] = 1
+                adamp = (gammar + gammas * float(xne_arr[j0]) + gammaw * float(txnxn[j0])) / dop
+                dopwave = dop * wlvac
+                blue_cutoff = -1.0
+                if ncon_eff > 0 and 1 <= nelionx <= contx.shape[1]:
+                    den = float(contx[ncon_eff - 1, nelionx - 1]) - float(emerge[j0])
+                    if den != 0.0:
+                        blue_cutoff = 1.0e7 / den
+                if blue_cutoff > 0.0 and wlvac < blue_cutoff:
+                    continue
+                _accwings_cutoff_nb(
+                    xlines, j0, nu0, wlvac, center, adamp, dopwave,
+                    float(tab[j0, nucont0]), waveset, h0tab, h1tab, h2tab,
+                    2000, blue_cutoff,
+                )
+
+            for k1 in range(8, nrhox + 1, 8):
+                if ifj[k1 - 7] + ifj[k1 + 1] == 0:
+                    continue
+                for j1 in range(k1 - 7, k1):
+                    j0 = j1 - 1
+                    center = cgf * float(xnfdop_arr[j0, nelion - 1])
+                    if center < float(tab[j0, nucont0]):
+                        continue
+                    center *= _fastex_nb(elo * float(hckt_arr[j0]), extab, extabf)
+                    if center < float(tab[j0, nucont0]):
+                        continue
+                    dop = float(dopple_arr[j0, nelion - 1])
+                    if dop <= 0.0:
+                        continue
+                    adamp = (gammar + gammas * float(xne_arr[j0]) + gammaw * float(txnxn[j0])) / dop
+                    dopwave = dop * wlvac
+                    blue_cutoff = -1.0
+                    if ncon_eff > 0 and 1 <= nelionx <= contx.shape[1]:
+                        den = float(contx[ncon_eff - 1, nelionx - 1]) - float(emerge[j0])
+                        if den != 0.0:
+                            blue_cutoff = 1.0e7 / den
+                    if blue_cutoff > 0.0 and wlvac < blue_cutoff:
+                        continue
+                    _accwings_cutoff_nb(
+                        xlines, j0, nu0, wlvac, center, adamp, dopwave,
+                        float(tab[j0, nucont0]), waveset, h0tab, h1tab, h2tab,
+                        2000, blue_cutoff,
+                    )
+            lineused += 1
+        return xlines, lineused
+
+    @_njit_parallel
+    def _xlinop_type_minus1_kernel_nb(
+        xlines,
+        n_records,
+        wlvac_arr,
+        gf_arr,
+        nblo_arr,
+        type_arr,
+        ncon_arr,
+        iwl_arr,
+        setup_valid,
+        setup_n,
+        setup_m,
+        setup_freqnm,
+        setup_wavenm,
+        setup_dbeta,
+        setup_c1con,
+        setup_c2con,
+        setup_radamp,
+        setup_resont,
+        setup_vdw,
+        setup_stark,
+        setup_y1num,
+        setup_y1wht,
+        setup_finest,
+        setup_finswt,
+        waveset,
+        iwavetab,
+        tab,
+        bolth,
+        contx,
+        emerge,
+        xne_arr,
+        xnf_h1,
+        xnf_h2,
+        xnfp_h1,
+        dopple_h1,
+        fo_arr,
+        pp_arr_h,
+        y1s_arr,
+        y1b_arr,
+        t3nhe_arr,
+        t3nh2_arr,
+        c1d_arr,
+        c2d_arr,
+        gcon1_arr,
+        gcon2_arr,
+        extab_h,
+        extabf_h,
+        faste1_tbl,
+        propbm,
+        c_arr,
+        d_arr,
+        pp_tab,
+        beta_arr,
+        cutoff_h2,
+        cutoff_h2_plus,
+        nrhox,
+        numnu,
+        nuhi_eff,
+        nulo,
+    ):
+        nucont0 = 0
+        nu0 = max(0, nulo - 1)
+        lineused = 0
+        for iline in range(n_records):
+            typ = int(type_arr[iline])
+            if typ == 2:
+                continue
+            if typ != -1:
+                continue
+            wlvac = float(wlvac_arr[iline])
+            if wlvac > waveset[min(nuhi_eff, numnu) - 1]:
+                break
+            iwl = int(iwl_arr[iline])
+            while nucont0 < iwavetab.shape[0] and iwl >= int(iwavetab[nucont0]):
+                nucont0 += 1
+            if nucont0 >= tab.shape[1]:
+                continue
+            while nu0 < numnu and wlvac >= waveset[nu0]:
+                nu0 += 1
+            if nu0 >= numnu:
+                break
+
+            nblo = int(nblo_arr[iline])
+            ncon_eff = int(ncon_arr[iline])
+            if nblo < 1 or nblo > bolth.shape[1]:
+                continue
+            if ncon_eff == 0:
+                continue
+            if ncon_eff < 1 or ncon_eff > contx.shape[0]:
+                continue
+            if int(setup_valid[iline]) == 0:
+                continue
+
+            cgf = np.float32(float(gf_arr[iline]))
+            for j0 in numba.prange(nrhox):
+                center = np.float32(cgf * float(bolth[j0, nblo - 1]))
+                if center < float(tab[j0, nucont0]):
+                    continue
+                den = float(contx[ncon_eff - 1, 0]) - float(emerge[j0])
+                if den == 0.0:
+                    continue
+                wcon = 1.0e7 / den
+
+                ired_hi = min(nu0 + 2001, numnu)
+                for iw in range(nu0, ired_hi):
+                    if float(waveset[iw]) < wcon:
+                        continue
+                    delw = np.float32(float(waveset[iw]) - wlvac)
+                    hprof = np.float32(
+                        _profile_for_setup_nb(
+                            int(setup_n[iline]),
+                            int(setup_m[iline]),
+                            float(setup_freqnm[iline]),
+                            float(setup_wavenm[iline]),
+                            float(setup_dbeta[iline]),
+                            float(setup_c1con[iline]),
+                            float(setup_c2con[iline]),
+                            float(setup_radamp[iline]),
+                            float(setup_resont[iline]),
+                            float(setup_vdw[iline]),
+                            float(setup_stark[iline]),
+                            float(setup_y1num[iline]),
+                            float(setup_y1wht[iline]),
+                            setup_finest[iline],
+                            setup_finswt[iline],
+                            j0,
+                            float(delw),
+                            xne_arr,
+                            xnf_h1,
+                            xnf_h2,
+                            xnfp_h1,
+                            dopple_h1,
+                            fo_arr,
+                            pp_arr_h,
+                            y1s_arr,
+                            y1b_arr,
+                            t3nhe_arr,
+                            t3nh2_arr,
+                            c1d_arr,
+                            c2d_arr,
+                            gcon1_arr,
+                            gcon2_arr,
+                            extab_h,
+                            extabf_h,
+                            faste1_tbl,
+                            propbm,
+                            c_arr,
+                            d_arr,
+                            pp_tab,
+                            beta_arr,
+                            cutoff_h2,
+                            cutoff_h2_plus,
+                        )
+                    )
+                    cv = np.float32(center * hprof)
+                    xlines[j0, iw] += cv
+                    if cv < float(tab[j0, nucont0]):
+                        break
+
+                for ired in range(1, 2001):
+                    iw = nu0 - ired
+                    if iw < 0:
+                        break
+                    if float(waveset[iw]) < wcon:
+                        break
+                    delw = np.float32(float(waveset[iw]) - wlvac)
+                    hprof = np.float32(
+                        _profile_for_setup_nb(
+                            int(setup_n[iline]),
+                            int(setup_m[iline]),
+                            float(setup_freqnm[iline]),
+                            float(setup_wavenm[iline]),
+                            float(setup_dbeta[iline]),
+                            float(setup_c1con[iline]),
+                            float(setup_c2con[iline]),
+                            float(setup_radamp[iline]),
+                            float(setup_resont[iline]),
+                            float(setup_vdw[iline]),
+                            float(setup_stark[iline]),
+                            float(setup_y1num[iline]),
+                            float(setup_y1wht[iline]),
+                            setup_finest[iline],
+                            setup_finswt[iline],
+                            j0,
+                            float(delw),
+                            xne_arr,
+                            xnf_h1,
+                            xnf_h2,
+                            xnfp_h1,
+                            dopple_h1,
+                            fo_arr,
+                            pp_arr_h,
+                            y1s_arr,
+                            y1b_arr,
+                            t3nhe_arr,
+                            t3nh2_arr,
+                            c1d_arr,
+                            c2d_arr,
+                            gcon1_arr,
+                            gcon2_arr,
+                            extab_h,
+                            extabf_h,
+                            faste1_tbl,
+                            propbm,
+                            c_arr,
+                            d_arr,
+                            pp_tab,
+                            beta_arr,
+                            cutoff_h2,
+                            cutoff_h2_plus,
+                        )
+                    )
+                    cv = np.float32(center * hprof)
+                    xlines[j0, iw] += cv
+                    if cv < float(tab[j0, nucont0]):
+                        break
+            lineused += 1
+        return xlines, lineused
+
 
 def selectlines(*, layers: int, n_freq: int) -> LineOpacityState:  # noqa: E302
     """Allocate `XLINES` workspace (selection itself is done by Fortran pass-1)."""
     return LineOpacityState(xlines=np.zeros((layers, n_freq), dtype=np.float64), lineused=0)
+
+
+def _hydrogen_setup_arrays(records: XLineRecords, hprof_eval: HydrogenProfileEvaluator) -> dict[str, np.ndarray]:
+    nrec = int(records.size)
+    valid = np.zeros(nrec, dtype=np.int32)
+    n_arr = np.zeros(nrec, dtype=np.int32)
+    m_arr = np.zeros(nrec, dtype=np.int32)
+    freqnm = np.zeros(nrec, dtype=np.float64)
+    wavenm = np.zeros(nrec, dtype=np.float64)
+    dbeta = np.zeros(nrec, dtype=np.float64)
+    c1con = np.zeros(nrec, dtype=np.float64)
+    c2con = np.zeros(nrec, dtype=np.float64)
+    radamp = np.zeros(nrec, dtype=np.float64)
+    resont = np.zeros(nrec, dtype=np.float64)
+    vdw = np.zeros(nrec, dtype=np.float64)
+    stark = np.zeros(nrec, dtype=np.float64)
+    y1num = np.zeros(nrec, dtype=np.float64)
+    y1wht = np.zeros(nrec, dtype=np.float64)
+    max_comp = 1
+    setups: list[object] = [None] * nrec
+    for iline in range(nrec):
+        if int(records.type_code[iline]) != -1:
+            continue
+        setup = hprof_eval._line_setup(int(records.nblo[iline]), int(records.nbup[iline]))
+        if setup is None:
+            continue
+        setups[iline] = setup
+        max_comp = max(max_comp, int(setup.finest.size))
+    finest = np.zeros((nrec, max_comp), dtype=np.float64)
+    finswt = np.zeros((nrec, max_comp), dtype=np.float64)
+    for iline, setup_obj in enumerate(setups):
+        if setup_obj is None:
+            continue
+        setup = setup_obj
+        valid[iline] = 1
+        n_arr[iline] = int(setup.n)
+        m_arr[iline] = int(setup.m)
+        freqnm[iline] = float(setup.freqnm)
+        wavenm[iline] = float(setup.wavenm)
+        dbeta[iline] = float(setup.dbeta)
+        c1con[iline] = float(setup.c1con)
+        c2con[iline] = float(setup.c2con)
+        radamp[iline] = float(setup.radamp)
+        resont[iline] = float(setup.resont)
+        vdw[iline] = float(setup.vdw)
+        stark[iline] = float(setup.stark)
+        y1num[iline] = float(setup.y1num)
+        y1wht[iline] = float(setup.y1wht)
+        ncomp = int(setup.finest.size)
+        finest[iline, :ncomp] = np.asarray(setup.finest, dtype=np.float64)
+        finswt[iline, :ncomp] = np.asarray(setup.finswt, dtype=np.float64)
+    return {
+        "valid": valid,
+        "n": n_arr,
+        "m": m_arr,
+        "freqnm": freqnm,
+        "wavenm": wavenm,
+        "dbeta": dbeta,
+        "c1con": c1con,
+        "c2con": c2con,
+        "radamp": radamp,
+        "resont": resont,
+        "vdw": vdw,
+        "stark": stark,
+        "y1num": y1num,
+        "y1wht": y1wht,
+        "finest": finest,
+        "finswt": finswt,
+    }
 
 
 def linop1(
@@ -761,7 +1247,7 @@ def linop1(
                     continue
                 adamp = (gammar + gammas * float(xne_arr[j0]) + gammaw * float(txnxn[j0])) / dop
                 dopwave = dop * wlvac
-                if trace_in_focus(wlvac_nm=wlvac, j0=j0):
+                if trace_focus and trace_in_focus(wlvac_nm=wlvac, j0=j0):
                     trace_emit(
                         event="center_pass_inner",
                         iter_num=1,
@@ -859,25 +1345,6 @@ def xlinop(
     eh[9] = 108581.988
     for n in range(11, 101):
         eh[n - 1] = 109678.764 - 109677.576 / float(n * n)
-    bolth = np.exp(-np.outer(hckt_arr, eh)) * xnfdop_arr[:, 0:1]
-    hyd_tables = load_hydrogen_profile_tables_from_atlas12()
-    xnh2 = compute_xnh2(
-        temperature_k=t,
-        xnfp_h1=xnfp_arr[:, 0],
-        bhyd1=np.ones(nrhox, dtype=np.float64),
-        tables=hyd_tables,
-    )
-    hprof_eval = HydrogenProfileEvaluator(
-        temperature_k=t,
-        xne=xne_arr,
-        xnf_h1=xnf_arr[:, 0],
-        xnf_h2=xnf_arr[:, 1],
-        xnfp_h1=xnfp_arr[:, 0],
-        xnfp_he1=xnfp_arr[:, 2],
-        dopple_h1=dopple_arr[:, 0],
-        xnh2=xnh2,
-        tables=hyd_tables,
-    )
 
     if ifop15_enabled and base_xlines is not None:
         xlines = np.asarray(base_xlines, dtype=np.float32).copy()
@@ -888,7 +1355,8 @@ def xlinop(
     nu0 = max(0, int(nulo) - 1)
     ifj = np.zeros(nrhox + 2, dtype=np.int32)
     lineused = 0
-    focus_wave_mask = (waveset >= 381.0) & (waveset <= 410.0)
+    trace_focus = trace_enabled()
+    focus_wave_mask = trace_focus & (waveset >= 381.0) & (waveset <= 410.0)
     focus_layer_lo = 57
     focus_layer_hi = 63
     focus_base_sum = float(np.sum(np.asarray(xlines[focus_layer_lo:focus_layer_hi, :], dtype=np.float64)[:, focus_wave_mask]))
@@ -940,9 +1408,169 @@ def xlinop(
     focus_iw_lo = int(focus_iw[0]) if focus_iw.size > 0 else 0
     focus_iw_hi = int(focus_iw[-1]) if focus_iw.size > 0 else -1
 
+    if _NUMBA_AVAILABLE and not trace_focus and records.size > 0:
+        normal_mask = (records.type_code == 0) | (records.type_code == 3)
+        if np.any(normal_mask):
+            xlines, lineused_normal = _xlinop_type0_kernel_nb(
+                xlines,
+                records.size,
+                np.asarray(records.wlvac, dtype=np.float64),
+                np.asarray(records.gf, dtype=np.float64),
+                np.asarray(records.elo, dtype=np.float64),
+                np.asarray(records.gammar, dtype=np.float64),
+                np.asarray(records.gammas, dtype=np.float64),
+                np.asarray(records.gammaw, dtype=np.float64),
+                np.asarray(records.nelion, dtype=np.int64),
+                np.asarray(records.type_code, dtype=np.int64),
+                np.asarray(records.ncon, dtype=np.int64),
+                np.asarray(records.nelionx, dtype=np.int64),
+                np.asarray(records.iwl, dtype=np.int64),
+                waveset,
+                iwavetab,
+                tab,
+                hckt_arr,
+                xne_arr,
+                xnfdop_arr,
+                dopple_arr,
+                txnxn,
+                emerge,
+                contx,
+                extab,
+                extabf,
+                h0tab,
+                h1tab,
+                h2tab,
+                nrhox,
+                numnu,
+                nuhi_eff,
+                nulo,
+            )
+            special_mask = ~normal_mask
+            if not np.any(special_mask):
+                return LineOpacityState(xlines=xlines, lineused=int(lineused_normal))
+            special_state = xlinop(
+                records=_subset_xline_records(records, special_mask),
+                wave_set_nm=waveset,
+                i_wavetab=iwavetab,
+                tabcont=tab,
+                temperature_k=t,
+                hckt=hckt_arr,
+                xne=xne_arr,
+                xnf=xnf_arr,
+                xnfp=xnfp_arr,
+                rho=rho_arr,
+                xnfdop=xnfdop_arr,
+                dopple=dopple_arr,
+                ifop15_enabled=True,
+                base_xlines=xlines,
+                nulo=nulo,
+                nuhi=nuhi,
+            )
+            special_state.lineused += int(lineused_normal)
+            return special_state
+
+    bolth = np.exp(-np.outer(hckt_arr, eh)) * xnfdop_arr[:, 0:1]
+    hyd_tables = load_hydrogen_profile_tables_from_atlas12()
+    xnh2 = compute_xnh2(
+        temperature_k=t,
+        xnfp_h1=xnfp_arr[:, 0],
+        bhyd1=np.ones(nrhox, dtype=np.float64),
+        tables=hyd_tables,
+    )
+    hprof_eval = HydrogenProfileEvaluator(
+        temperature_k=t,
+        xne=xne_arr,
+        xnf_h1=xnf_arr[:, 0],
+        xnf_h2=xnf_arr[:, 1],
+        xnfp_h1=xnfp_arr[:, 0],
+        xnfp_he1=xnfp_arr[:, 2],
+        dopple_h1=dopple_arr[:, 0],
+        xnh2=xnh2,
+        tables=hyd_tables,
+    )
+
+    if _NUMBA_AVAILABLE and not trace_focus and records.size > 0:
+        typ_arr = np.asarray(records.type_code, dtype=np.int64)
+        if np.all((typ_arr == -1) | (typ_arr == 2)):
+            for iline in range(records.size):
+                if int(records.type_code[iline]) != -1:
+                    continue
+                nblo_v = int(records.nblo[iline])
+                nbup_v = int(records.nbup[iline])
+                ncon_v = int(records.ncon[iline])
+                if nblo_v < 1 or nblo_v > 100:
+                    raise ValueError(f"XLINOP hydrogen line has NBLO={nblo_v}, expected 1..100")
+                if nbup_v < 1 or nbup_v > 100:
+                    raise ValueError(f"XLINOP hydrogen line has NBUP={nbup_v}, expected 1..100")
+                if ncon_v != 0 and (ncon_v < 1 or ncon_v > contx.shape[0]):
+                    raise ValueError(f"XLINOP hydrogen line has NCON={ncon_v}, expected 1..{contx.shape[0]}")
+            setup_arrays = _hydrogen_setup_arrays(records, hprof_eval)
+            xlines, lineused_h = _xlinop_type_minus1_kernel_nb(
+                xlines,
+                records.size,
+                np.asarray(records.wlvac, dtype=np.float64),
+                np.asarray(records.gf, dtype=np.float64),
+                np.asarray(records.nblo, dtype=np.int64),
+                typ_arr,
+                np.asarray(records.ncon, dtype=np.int64),
+                np.asarray(records.iwl, dtype=np.int64),
+                setup_arrays["valid"],
+                setup_arrays["n"],
+                setup_arrays["m"],
+                setup_arrays["freqnm"],
+                setup_arrays["wavenm"],
+                setup_arrays["dbeta"],
+                setup_arrays["c1con"],
+                setup_arrays["c2con"],
+                setup_arrays["radamp"],
+                setup_arrays["resont"],
+                setup_arrays["vdw"],
+                setup_arrays["stark"],
+                setup_arrays["y1num"],
+                setup_arrays["y1wht"],
+                setup_arrays["finest"],
+                setup_arrays["finswt"],
+                waveset,
+                iwavetab,
+                tab,
+                bolth,
+                contx,
+                emerge,
+                xne_arr,
+                xnf_arr[:, 0],
+                xnf_arr[:, 1],
+                xnfp_arr[:, 0],
+                dopple_arr[:, 0],
+                hprof_eval.fo,
+                hprof_eval.pp,
+                hprof_eval.y1s,
+                hprof_eval.y1b,
+                hprof_eval.t3nhe,
+                hprof_eval.t3nh2,
+                hprof_eval.c1d,
+                hprof_eval.c2d,
+                hprof_eval.gcon1,
+                hprof_eval.gcon2,
+                hprof_eval.extab,
+                hprof_eval.extabf,
+                hprof_eval.faste1_tbl,
+                hyd_tables.propbm,
+                hyd_tables.c,
+                hyd_tables.d,
+                hyd_tables.pp,
+                hyd_tables.beta,
+                hyd_tables.cutoff_h2,
+                hyd_tables.cutoff_h2_plus,
+                nrhox,
+                numnu,
+                nuhi_eff,
+                nulo,
+            )
+            return LineOpacityState(xlines=xlines, lineused=int(lineused_h))
+
     for iline in range(records.size):
         wlvac = float(records.wlvac[iline])
-        in_focus_band = 381.0 <= wlvac <= 410.0
+        in_focus_band = trace_focus and 381.0 <= wlvac <= 410.0
         if wlvac > float(waveset[min(nuhi_eff, numnu) - 1]):
             break
         iwl = int(records.iwl[iline])
@@ -954,7 +1582,12 @@ def xlinop(
             nu0 += 1
         if nu0 >= numnu:
             break
-        line_may_hit_focus = bool(focus_iw_hi >= 0 and (nu0 - 2000) <= focus_iw_hi and (nu0 + 2000) >= focus_iw_lo)
+        line_may_hit_focus = bool(
+            trace_focus
+            and focus_iw_hi >= 0
+            and (nu0 - 2000) <= focus_iw_hi
+            and (nu0 + 2000) >= focus_iw_lo
+        )
         line_focus_before = 0.0
         if line_may_hit_focus:
             line_focus_before = float(np.sum(np.asarray(xlines[focus_layer_lo:focus_layer_hi, :], dtype=np.float64)[:, focus_wave_mask]))
@@ -1018,11 +1651,14 @@ def xlinop(
             if ncon < 1 or ncon > contx.shape[0]:
                 raise ValueError(f"XLINOP hydrogen line has NCON={ncon}, expected 1..{contx.shape[0]}")
             cgf = np.float32(gf)
+            h_setup = hprof_eval._line_setup(nblo, nbup)
+            if h_setup is None:
+                continue
             for j0 in range(nrhox):
                 center = np.float32(cgf * float(bolth[j0, nblo - 1]))
                 if center < float(tab[j0, nucont0]):
                     continue
-                if trace_in_focus(wlvac_nm=wlvac, j0=j0):
+                if trace_focus and trace_in_focus(wlvac_nm=wlvac, j0=j0):
                     trace_emit(
                         event="h_center_pass",
                         iter_num=1,
@@ -1051,14 +1687,17 @@ def xlinop(
                 for iw in range(nu0, min(nu0 + 2001, numnu)):
                     if float(waveset[iw]) < wcon:
                         continue
-                    in_focus_cell = bool(focus_layer_lo <= j0 < focus_layer_hi and focus_iw_lo <= iw <= focus_iw_hi)
+                    in_focus_cell = bool(
+                        trace_focus
+                        and focus_layer_lo <= j0 < focus_layer_hi
+                        and focus_iw_lo <= iw <= focus_iw_hi
+                    )
                     if in_focus_cell:
                         line_typm1_red_steps += 1
                     delw = np.float32(float(waveset[iw]) - wlvac)
                     hprof = np.float32(
-                        hprof_eval.profile(
-                            nblo,
-                            nbup,
+                        hprof_eval.profile_for_setup(
+                            h_setup,
                             j0,
                             float(delw),
                             trace_line_1b=iline + 1,
@@ -1066,7 +1705,7 @@ def xlinop(
                         )
                     )
                     cv = np.float32(center * hprof)
-                    if iw == nu0 and trace_in_focus(wlvac_nm=wlvac, j0=j0):
+                    if trace_focus and iw == nu0 and trace_in_focus(wlvac_nm=wlvac, j0=j0):
                         trace_emit(
                             event="h_red_nu",
                             iter_num=1,
@@ -1170,7 +1809,7 @@ def xlinop(
                     if in_focus_cell and float(cv) > line_typm1_max_cv:
                         line_typm1_max_cv = float(cv)
                     if cv < float(tab[j0, nucont0]):
-                        if trace_in_focus(wlvac_nm=float(waveset[iw]), j0=j0):
+                        if trace_focus and trace_in_focus(wlvac_nm=float(waveset[iw]), j0=j0):
                             trace_emit(
                                 event="h_red_break",
                                 iter_num=1,
@@ -1197,14 +1836,17 @@ def xlinop(
                         if focus_layer_lo <= j0 < focus_layer_hi:
                             line_typm1_blue_break_wcon += 1
                         break
-                    in_focus_cell = bool(focus_layer_lo <= j0 < focus_layer_hi and focus_iw_lo <= iw <= focus_iw_hi)
+                    in_focus_cell = bool(
+                        trace_focus
+                        and focus_layer_lo <= j0 < focus_layer_hi
+                        and focus_iw_lo <= iw <= focus_iw_hi
+                    )
                     if in_focus_cell:
                         line_typm1_blue_steps += 1
                     delw = np.float32(float(waveset[iw]) - wlvac)
                     hprof = np.float32(
-                        hprof_eval.profile(
-                            nblo,
-                            nbup,
+                        hprof_eval.profile_for_setup(
+                            h_setup,
                             j0,
                             float(delw),
                             trace_line_1b=iline + 1,
@@ -1212,7 +1854,7 @@ def xlinop(
                         )
                     )
                     cv = np.float32(center * hprof)
-                    if ired == 1 and trace_in_focus(wlvac_nm=wlvac, j0=j0):
+                    if trace_focus and ired == 1 and trace_in_focus(wlvac_nm=wlvac, j0=j0):
                         trace_emit(
                             event="h_blue_nu1",
                             iter_num=1,
@@ -1316,7 +1958,7 @@ def xlinop(
                     if in_focus_cell and float(cv) > line_typm1_max_cv:
                         line_typm1_max_cv = float(cv)
                     if cv < float(tab[j0, nucont0]):
-                        if trace_in_focus(wlvac_nm=float(waveset[iw]), j0=j0):
+                        if trace_focus and trace_in_focus(wlvac_nm=float(waveset[iw]), j0=j0):
                             trace_emit(
                                 event="h_blue_break",
                                 iter_num=1,

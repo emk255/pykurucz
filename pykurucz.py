@@ -236,13 +236,13 @@ def write_atm_file(path: Path, teff: float, logg: float,
     n_layers = data.shape[0]
     lines.append(f'READ DECK6 {n_layers} RHOX,T,P,XNE,ABROSS,ACCRAD,VTURB')
 
-    vturb_cms = vturb * 1.0e5
     for row in data:
         parts = [f' {row[0]:.8E}', f'   {row[1]:.1f}']
         for j in range(2, 6):
             parts.append(f' {row[j]:.3E}')
-        parts.append(f' {vturb_cms:.3E}')
-        parts.append(f' {row[6]:.3E} {row[7]:.3E}')
+        # Fortran ATLAS12 writes DECK6 trailing columns as VTURB, FLXCNV, VCONV.
+        parts.append(f' {row[6]:.3E}')
+        parts.append(f' {row[7]:.3E} {row[8]:.3E}')
         lines.append(''.join(parts))
 
     lines.append(f'PRADK {0.5:.4E}')
@@ -423,12 +423,24 @@ def run_atlas_py(
         cmd.extend(["--line-selection-bin", str(fort12_bin)])
 
     with log_path.open("w", encoding="utf-8") as logf:
+        logf.write(
+            "=" * 60 + "\n"
+            f"  atlas_py.cli  input={input_atm.name}  iter={iterations}\n"
+            "=" * 60 + "\n\n"
+        )
+        logf.flush()
+        t0 = time.perf_counter()
+        logf.write("==== STEP: atlas_py.cli START ====\n"); logf.flush()
         try:
             _run_streaming(cmd, cwd=_REPO_ROOT, log_handle=logf)
         except RuntimeError as exc:
             raise RuntimeError(
                 f"atlas_py.cli failed. See log: {log_path}\n{exc}"
             ) from exc
+        logf.write(
+            f"==== STEP: atlas_py.cli END wall={time.perf_counter() - t0:.3f}s ====\n"
+        )
+        logf.flush()
     return output_atm
 
 

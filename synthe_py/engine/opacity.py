@@ -3141,17 +3141,7 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
             "Computing TRANSP and ASYNTH from line catalog using Saha-Boltzmann populations"
         )
 
-        # Compute populations for all depths
-        t_stage = time.perf_counter()
-        pops = populations.compute_depth_state(
-            atm,
-            catalog.wavelength,
-            catalog.excitation_energy,
-            cfg.wavelength_grid.velocity_microturb,
-        )
-        logger.info(
-            "Timing: populations (line opacity) in %.3fs", time.perf_counter() - t_stage
-        )
+        # Reuse the depth state computed above; atm and catalog inputs are unchanged.
 
         # Compute TRANSP (line opacity at line center)
         # Fortran synthe.for line 266: KAPMIN=CONTINUUM(...)*CUTOFF

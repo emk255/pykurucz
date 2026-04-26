@@ -10,6 +10,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+try:
+    import numba
+
+    _NUMBA_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional acceleration
+    numba = None
+    _NUMBA_AVAILABLE = False
 
 from .josh_math import _deriv, _integ, _map1
 
@@ -131,6 +138,144 @@ def _expi(n: int, x: float) -> float:
     for i in range(1, max(n, 1)):
         out = (np.exp(-x) - x * out) / float(i)
     return float(out)
+
+
+if _NUMBA_AVAILABLE:
+    @numba.njit(cache=True)
+    def _expi_nb(n: int, x: float) -> float:
+        a0, a1, a2, a3, a4, a5 = (
+            -44178.5471728217,
+            57721.7247139444,
+            9938.31388962037,
+            1842.11088668,
+            101.093806161906,
+            5.03416184097568,
+        )
+        b0, b1, b2, b3, b4 = (
+            76537.3323337614,
+            32597.1881290275,
+            6106.10794245759,
+            635.419418378382,
+            37.2298352833327,
+        )
+        c0, c1, c2, c3, c4, c5, c6 = (
+            4.65627107975096e-7,
+            0.999979577051595,
+            9.04161556946329,
+            24.3784088791317,
+            23.0192559391333,
+            6.90522522784444,
+            0.430967839469389,
+        )
+        d1, d2, d3, d4, d5, d6 = (
+            10.0411643829054,
+            32.4264210695138,
+            41.2807841891424,
+            20.4494785013794,
+            3.31909213593302,
+            0.103400130404874,
+        )
+        e0, e1, e2, e3, e4, e5, e6 = (
+            -0.999999999998447,
+            -26.6271060431811,
+            -241.055827097015,
+            -895.927957772937,
+            -1298.85688746484,
+            -545.374158883133,
+            -5.66575206533869,
+        )
+        f1, f2, f3, f4, f5, f6 = (
+            28.6271060422192,
+            292.310039388533,
+            1332.78537748257,
+            2777.61949509163,
+            2404.01713225909,
+            631.6574832808,
+        )
+        if x <= 0.0:
+            ex1 = 0.0
+        else:
+            ex = np.exp(-x)
+            if x > 4.0:
+                ex1 = (
+                    ex
+                    + ex
+                    * (e0 + (e1 + (e2 + (e3 + (e4 + (e5 + e6 / x) / x) / x) / x) / x) / x)
+                    / (x + f1 + (f2 + (f3 + (f4 + (f5 + f6 / x) / x) / x) / x) / x)
+                ) / x
+            elif x > 1.0:
+                ex1 = ex * (c6 + (c5 + (c4 + (c3 + (c2 + (c1 + c0 * x) * x) * x) * x) * x) * x) / (
+                    d6 + (d5 + (d4 + (d3 + (d2 + (d1 + x) * x) * x) * x) * x) * x
+                )
+            else:
+                ex1 = (a0 + (a1 + (a2 + (a3 + (a4 + a5 * x) * x) * x) * x) * x) / (
+                    b0 + (b1 + (b2 + (b3 + (b4 + x) * x) * x) * x) * x
+                ) - np.log(x)
+        out = ex1
+        for i in range(1, max(n, 1)):
+            out = (np.exp(-x) - x * out) / float(i)
+        return float(out)
+
+
+    @numba.njit(cache=True)
+    def _tcorr_mode2_nb(
+        rjmins: np.ndarray,
+        rdabh: np.ndarray,
+        rdiagj: np.ndarray,
+        flxrad: np.ndarray,
+        rcowt: float,
+        rhox: np.ndarray,
+        abtot: np.ndarray,
+        hnu: np.ndarray,
+        jmins: np.ndarray,
+        taunu: np.ndarray,
+        bnu: np.ndarray,
+        freq_hz: float,
+        hkt: np.ndarray,
+        temperature_k: np.ndarray,
+        stim: np.ndarray,
+        alpha: np.ndarray,
+        flux: float,
+        teff: float,
+        numnu: int,
+    ) -> None:
+        dabtot = _deriv(rhox, abtot)
+        n = temperature_k.size
+        for j in range(n):
+            den_ab = abtot[j] if abtot[j] >= 1.0e-300 else 1.0e-300
+            rdabh[j] += dabtot[j] / den_ab * hnu[j] * rcowt
+            rjmins[j] += abtot[j] * jmins[j] * rcowt
+            flxrad[j] += hnu[j] * rcowt
+
+        term2 = 0.0
+        for j in range(n):
+            term1 = term2
+            d = 1.0e-10
+            if j != n - 1:
+                d = taunu[j + 1] - taunu[j]
+            if d < 1.0e-10:
+                d = 1.0e-10
+            if d <= 0.01:
+                term2 = (0.922784335098467 - np.log(d)) * d / 4.0 + d * d / 12.0 - d ** 3 / 96.0 + d ** 4 / 720.0
+            else:
+                ex = 0.0
+                if d < 10.0:
+                    ex = _expi_nb(3, d)
+                if teff <= 4250.0 and d > 0.005 and d < 0.02:
+                    ex = 0.0
+                term2 = 0.5 * (d + ex - 0.5) / d
+            diagj = term1 + term2
+            den = temperature_k[j] * stim[j]
+            if den < 1.0e-300:
+                den = 1.0e-300
+            dbdt = bnu[j] * freq_hz * hkt[j] / den
+            if numnu == 1:
+                temp_den = temperature_k[j] if temperature_k[j] >= 1.0e-300 else 1.0e-300
+                dbdt = flux * 16.0 / temp_den
+            den_diag = 1.0 - alpha[j] * diagj
+            if den_diag < 1.0e-300:
+                den_diag = 1.0e-300
+            rdiagj[j] += abtot[j] * (diagj - 1.0) / den_diag * (1.0 - alpha[j]) * dbdt * rcowt
 
 
 def init_tcorr(n_layers: int) -> TcorrState:
@@ -390,6 +535,29 @@ def tcorr_step(
         st.flxrad[:] = 0.0
         return None
     if mode == 2:
+        if _NUMBA_AVAILABLE:
+            _tcorr_mode2_nb(
+                st.rjmins,
+                st.rdabh,
+                st.rdiagj,
+                st.flxrad,
+                rcowt,
+                np.asarray(rhox, dtype=np.float64),
+                np.asarray(abtot, dtype=np.float64),
+                np.asarray(hnu, dtype=np.float64),
+                np.asarray(jmins, dtype=np.float64),
+                np.asarray(taunu, dtype=np.float64),
+                np.asarray(bnu, dtype=np.float64),
+                freq_hz,
+                np.asarray(hkt, dtype=np.float64),
+                np.asarray(temperature_k, dtype=np.float64),
+                np.asarray(stim, dtype=np.float64),
+                np.asarray(alpha, dtype=np.float64),
+                flux,
+                teff,
+                numnu,
+            )
+            return None
         dabtot = _deriv(np.asarray(rhox, dtype=np.float64), np.asarray(abtot, dtype=np.float64))
         st.rdabh += dabtot / np.maximum(abtot, 1e-300) * hnu * rcowt
         st.rjmins += abtot * jmins * rcowt

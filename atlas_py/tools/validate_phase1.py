@@ -171,9 +171,10 @@ def main() -> int:
 
     _ensure_gfpred_assembled(gfpred_bin)
 
-    fortran_atm = outdir / "fortran_iter1.atm"
-    python_atm = outdir / "python_iter1.atm"
-    fortran_log = outdir / "fortran_iter1.log"
+    iter_tag = f"iter{max(1, int(args.iterations))}"
+    fortran_atm = outdir / f"fortran_{iter_tag}.atm"
+    python_atm = outdir / f"python_{iter_tag}.atm"
+    fortran_log = outdir / f"fortran_{iter_tag}.log"
     fortran_state = outdir / "fortran_state.npz"
     python_state = outdir / "python_state.npz"
     atm_report = outdir / "compare_atm.txt"
@@ -231,6 +232,8 @@ def main() -> int:
         str(fortran_log),
         "--output-lines-bin",
         str(fortran_fort12),
+        "--iterations",
+        str(max(1, args.iterations)),
     ]
     if args.enable_trace:
         run_fortran_cmd.extend(
@@ -256,6 +259,8 @@ def main() -> int:
         str(max(1, args.iterations)),
         "--debug-state",
         str(python_state),
+        "--line-selection-bin",
+        str(fortran_fort12),
         "--fort11",
         str(gfpred_bin),
         "--fort111",

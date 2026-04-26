@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 
 from .kapp import KappAtmosphereAdapter, compute_kapp
@@ -38,6 +40,7 @@ _KAPCONT_WAVETAB_343 = np.array(
 )
 
 
+@lru_cache(maxsize=16)
 def build_waveset(teff: float) -> tuple[np.ndarray, np.ndarray]:
     """Construct WAVESET and RCOSET arrays following atlas12.for lines 188-214."""
 
@@ -73,6 +76,7 @@ def build_waveset(teff: float) -> tuple[np.ndarray, np.ndarray]:
     return wave, rco
 
 
+@lru_cache(maxsize=1)
 def build_kapcont_wavetab() -> tuple[np.ndarray, np.ndarray]:
     """Build `WAVETAB(344)` and `IWAVETAB(344)` from atlas12.for KAPCONT."""
 
@@ -106,28 +110,41 @@ def kapcont_table(
     n_layers = temperature_k.size
     tabcont = np.zeros((n_layers, 344), dtype=np.float32)
 
+    active = wavetab[:343] > float(wave_set[0])
+    active_idx = np.nonzero(active)[0]
+    active_acont = np.empty((n_layers, 0), dtype=np.float64)
+    active_sigmac = np.empty((n_layers, 0), dtype=np.float64)
+    if active_idx.size:
+        active_freq = 2.99792458e17 / np.maximum(wavetab[active_idx], 1e-300)
+        active_acont, active_sigmac, _ = compute_kapp(
+            adapter=adapter,
+            freq_hz=np.asarray(active_freq, dtype=np.float64),
+            atlas_tables=atlas_tables,
+            ifop=ifop,
+            tcst=tcst,
+        )
+        stim = np.maximum(1.0 - np.exp(-np.outer(hkt, active_freq)), 1e-300)
+        tabcont[:, active_idx] = np.asarray(
+            (active_acont + active_sigmac) * 1.0e-3 / stim,
+            dtype=np.float32,
+        )
+
+    inactive_idx = np.nonzero(~active)[0]
+    if inactive_idx.size:
+        inactive_freq = 2.99792458e17 / np.maximum(wavetab[inactive_idx], 1e-300)
+        stim = np.maximum(1.0 - np.exp(-np.outer(hkt, inactive_freq)), 1e-300)
+        tabcont[:, inactive_idx] = np.asarray(1.0e10 * 1.0e-3 / stim, dtype=np.float32)
+
+    active_pos = {int(idx): pos for pos, idx in enumerate(active_idx)}
     for nu in range(343):
         wave = float(wavetab[nu])
-        freq = 2.99792458e17 / max(wave, 1e-300)
-        ehvkt = np.exp(-freq * hkt)
-        stim = np.maximum(1.0 - ehvkt, 1e-300)
-        acont_col: np.ndarray
-        sigmac_col: np.ndarray
-        if wave > float(wave_set[0]):
-            acont, sigmac, _ = compute_kapp(
-                adapter=adapter,
-                freq_hz=np.asarray([freq], dtype=np.float64),
-                atlas_tables=atlas_tables,
-                ifop=ifop,
-                tcst=tcst,
-            )
-            acont_col = np.asarray(acont[:, 0], dtype=np.float64)
-            sigmac_col = np.asarray(sigmac[:, 0], dtype=np.float64)
-            tabcont[:, nu] = np.asarray((acont_col + sigmac_col) * 1.0e-3 / stim, dtype=np.float32)
+        if active[nu]:
+            pos = active_pos[nu]
+            acont_col = np.asarray(active_acont[:, pos], dtype=np.float64)
+            sigmac_col = np.asarray(active_sigmac[:, pos], dtype=np.float64)
         else:
             acont_col = np.full(n_layers, 1.0e10, dtype=np.float64)
             sigmac_col = np.zeros(n_layers, dtype=np.float64)
-            tabcont[:, nu] = np.asarray(1.0e10 * 1.0e-3 / stim, dtype=np.float32)
         if trace_enabled():
             for j0 in range(n_layers):
                 if not trace_in_focus(wlvac_nm=wave, j0=j0):

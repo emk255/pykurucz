@@ -22,7 +22,13 @@ from typing import TYPE_CHECKING, Any, Tuple, Optional
 
 import numpy as np
 
-from .karsas_tables import xkarsas
+try:
+    import numba
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    _NUMBA_AVAILABLE = False
+
+from .karsas_tables import xkarsas, xkarsas_grid
 from .hydrogen_wings import compute_hydrogen_continuum
 from .hydrogen_profile import compute_xnh2 as _compute_xnh2_equilh2
 from .tcorr import rosstab_eval as _rosstab_eval, TcorrState as _TcorrState
@@ -257,6 +263,10 @@ def _linter(xold: np.ndarray, yold: np.ndarray, xnew: np.ndarray) -> np.ndarray:
             ynew[inew] = yold[iold - 1] + (yold[iold] - yold[iold - 1]) * weight
 
     return ynew
+
+
+if _NUMBA_AVAILABLE:
+    _linter = numba.njit(cache=True)(_linter)
 
 
 def _map1_simple(xold: np.ndarray, fold: np.ndarray, xnew: float) -> float:
@@ -808,6 +818,65 @@ def _h2_collision_opacity(
     return result
 
 
+def _h2_collision_opacity_grid(
+    freq: np.ndarray,
+    temp: np.ndarray,
+    xnfph1: np.ndarray,
+    bhyd1: np.ndarray,
+    xnfhe1: np.ndarray,
+    rho: np.ndarray,
+    stim: np.ndarray,
+) -> np.ndarray:
+    """Vectorized H2 collision opacity over the frequency grid.
+
+    This mirrors `_h2_collision_opacity` but computes the Fortran H2RAOP XNH2
+    state once per KAPP call. In ATLAS12, XNH2 lives in COMMON /XNF/ and is
+    reused by H2COLLOP for every frequency.
+    """
+
+    n_layers = temp.size
+    nfreq = freq.size
+    result = np.zeros((n_layers, nfreq), dtype=np.float64)
+
+    waveno = freq / 2.99792458e10
+    active = waveno <= 20000.0
+    if not np.any(active):
+        return result
+
+    xnh2 = _compute_xnh2_equilh2(
+        temperature_k=temp,
+        xnfp_h1=xnfph1,
+        bhyd1=bhyd1,
+    )
+    xnh2 = np.where(temp > 20000.0, 0.0, xnh2)
+
+    wv = waveno[active]
+    nu = np.asarray(wv / 250.0, dtype=np.int64)
+    nu = np.minimum(nu, 79)
+    delnu = (wv - 250.0 * nu) / 250.0
+    idx1 = np.minimum(nu, 80)
+    idx2 = np.minimum(nu + 1, 80)
+    h2h2_nu = _H2_COLL_H2H2[idx1, :] * (1.0 - delnu[:, np.newaxis]) + _H2_COLL_H2H2[idx2, :] * delnu[:, np.newaxis]
+    h2he_nu = _H2_COLL_H2HE[idx1, :] * (1.0 - delnu[:, np.newaxis]) + _H2_COLL_H2HE[idx2, :] * delnu[:, np.newaxis]
+
+    it = np.asarray(temp / 1000.0, dtype=np.int64)
+    it = np.clip(it, 1, 6)
+    delt = np.clip((temp - 1000.0 * it) / 1000.0, 0.0, 1.0)
+
+    active_idx = np.nonzero(active)[0]
+    for j in range(n_layers):
+        xh2h2 = h2h2_nu[:, it[j] - 1] * delt[j] + h2h2_nu[:, it[j]] * (1.0 - delt[j])
+        xh2he = h2he_nu[:, it[j] - 1] * delt[j] + h2he_nu[:, it[j]] * (1.0 - delt[j])
+        result[j, active_idx] = (
+            (10.0**xh2he * xnfhe1[j] + 10.0**xh2h2 * xnh2[j])
+            * xnh2[j]
+            / rho[j]
+            * stim[j, active_idx]
+        )
+
+    return result
+
+
 # =============================================================================
 # HYDROGEN PARTITION FUNCTION AND GROUND-STATE POPULATION
 # =============================================================================
@@ -1174,18 +1243,14 @@ def compute_kapp_continuum(
     n_layers = atmosphere.layers
     nfreq = freq.size
 
-    logger.info(f"Computing KAPP continuum: {n_layers} layers × {nfreq} frequencies")
+    logger.debug("Computing KAPP continuum: %d layers × %d frequencies", n_layers, nfreq)
 
     # Initialize arrays
     acont = np.zeros((n_layers, nfreq), dtype=np.float64)
     sigmac = np.zeros((n_layers, nfreq), dtype=np.float64)
     scont = np.zeros((n_layers, nfreq), dtype=np.float64)
 
-    # Compute Planck functions for all frequencies
     temp = np.asarray(atmosphere.temperature, dtype=np.float64)
-    bnu_all = np.zeros((n_layers, nfreq), dtype=np.float64)
-    for i, f in enumerate(freq):
-        bnu_all[:, i] = _planck_nu(f, temp)
 
     # Compute frequency-dependent quantities
     wavelength_nm = C_LIGHT_NM / np.maximum(freq, 1e-30)
@@ -1194,8 +1259,30 @@ def compute_kapp_continuum(
     # hckt = hkt * c (cm²/s) - used in HE1OP, HE2OP, etc. (atlas7v.for line 81: HCKT(J)=HKT(J)*2.99792458D10)
     hckt = hkt * C_LIGHT_CM
     # ehvkt and stim are per layer and frequency (shape: (n_layers, nfreq))
-    ehvkt = np.exp(-H_PLANCK * freq[None, :] / (K_BOLTZ * temp[:, None]))
+    hnu_over_kt = H_PLANCK * freq[None, :] / (K_BOLTZ * temp[:, None])
+    ehvkt = np.exp(-hnu_over_kt)
     stim = 1.0 - ehvkt
+    # Compute Planck functions for all frequencies. This is algebraically the
+    # same as `_planck_nu` but avoids a Python loop over the full ATLAS grid.
+    bnu_all = np.zeros((n_layers, nfreq), dtype=np.float64)
+    rj_mask = hnu_over_kt < 1.0e-6
+    if np.any(rj_mask):
+        bnu_all[rj_mask] = (
+            2.0
+            * K_BOLTZ
+            * temp[:, np.newaxis]
+            * (freq[np.newaxis, :] ** 2)
+            / C_LIGHT_CM**2
+        )[rj_mask]
+    full_planck_mask = ~rj_mask
+    if np.any(full_planck_mask):
+        bnu_full = (
+            (2.0 * H_PLANCK / C_LIGHT_CM**2)
+            * (freq[np.newaxis, :] ** 3)
+            / np.expm1(hnu_over_kt)
+        )
+        bnu_all[full_planck_mask] = bnu_full[full_planck_mask]
+    bnu_all[~np.isfinite(bnu_all)] = 0.0
     waveno = freq / C_LIGHT_CM
 
     # Initialize component arrays
@@ -1258,7 +1345,7 @@ def compute_kapp_continuum(
 
     # HOP: Hydrogen opacity (`atlas12.for` lines 5268-5312).
     if ifop[0] == 1 and atmosphere.xnfph is not None:
-        logger.info("Computing HOP (hydrogen opacity)...")
+        logger.debug("Computing HOP (hydrogen opacity)...")
         xnfph = np.asarray(atmosphere.xnfph, dtype=np.float64)
         if xnfph.ndim == 1:
             xnfph = xnfph[:, np.newaxis]
@@ -1289,24 +1376,21 @@ def compute_kapp_continuum(
         boltex = np.exp(-13.427 / tkev) * xr
         exlim = np.exp(-13.595 / tkev) * xr
         tlog_arr = np.log(np.maximum(temp, 1e-300))
+        coulff_h = _coulff_grid(1, np.log(np.maximum(freq, 1e-300)), tlog_arr)
+        cont_h = np.vstack(
+            [xkarsas_grid(freq, 1.0, n, n) for n in range(1, 9)]
+        )
 
         for j in range(nfreq):
             f = float(freq[j])
-            freqlg = np.log(max(f, 1e-300))
             stim_j = stim[:, j]
             ehvkt_j = ehvkt[:, j]
             bnu_j = bnu_all[:, j]
-            cont = np.array([xkarsas(f, 1.0, n, n) for n in range(1, 9)], dtype=np.float64)
+            cont = cont_h[:, j]
             freq3 = max(f * f * f, 1e-300)
             cfree = 3.6919e8 / freq3
             cterm = 2.815e29 / freq3
-            coulff_arr = np.array(
-                [
-                    _coulff(j_idx, 1, f, freqlg, temp, tlog_arr)
-                    for j_idx in range(n_layers)
-                ],
-                dtype=np.float64,
-            )
+            coulff_arr = coulff_h[:, j]
             ex = boltex.copy()
             if f < 4.05933e13:
                 ex = exlim / np.maximum(ehvkt_j, 1e-300)
@@ -1326,45 +1410,42 @@ def compute_kapp_continuum(
 
     # H2PLOP: H2+ opacity (atlas7v.for line 5189-5211)
     if ifop[1] == 1 and atmosphere.xnfph is not None:
-        logger.info("Computing H2PLOP (H2+ opacity)...")
+        logger.debug("Computing H2PLOP (H2+ opacity)...")
         xnfph_arr = np.asarray(atmosphere.xnfph, dtype=np.float64)
         bhyd = atlas_tables.get("bhyd", np.ones((n_layers, 8), dtype=np.float64))
         tkev = np.asarray(atmosphere.temperature, dtype=np.float64) * KBOLTZ_EV
 
-        for j in range(nfreq):
-            f = freq[j]
-            if f > 3.28805e15:
-                continue
-            wno = waveno[j]
-            freqlg = np.log(f)
-            freq15 = f / 1.0e15
+        if xnfph_arr.shape[1] >= 2:
+            active = freq <= 3.28805e15
+            if np.any(active):
+                f_active = freq[active]
+                freqlg = np.log(f_active)
+                freq15 = f_active / 1.0e15
 
-            # FR = polynomial in FREQLG (atlas7v.for line 5200-5201)
-            fr = (
-                -3.0233e3
-                + (
-                    3.7797e2
-                    + (-1.82496e1 + (3.9207e-1 - 3.1672e-3 * freqlg) * freqlg) * freqlg
-                )
-                * freqlg
-            )
-
-            # ES = polynomial in FREQ15 (atlas7v.for line 5203-5204)
-            es = (
-                -7.342e-3
-                + (
-                    -2.409e0
+                # FR = polynomial in FREQLG (atlas7v.for line 5200-5201)
+                fr = (
+                    -3.0233e3
                     + (
-                        1.028e0
-                        + (-4.230e-1 + (1.224e-1 - 1.351e-2 * freq15) * freq15) * freq15
+                        3.7797e2
+                        + (-1.82496e1 + (3.9207e-1 - 3.1672e-3 * freqlg) * freqlg) * freqlg
+                    )
+                    * freqlg
+                )
+
+                # ES = polynomial in FREQ15 (atlas7v.for line 5203-5204)
+                es = (
+                    -7.342e-3
+                    + (
+                        -2.409e0
+                        + (
+                            1.028e0
+                            + (-4.230e-1 + (1.224e-1 - 1.351e-2 * freq15) * freq15) * freq15
+                        )
+                        * freq15
                     )
                     * freq15
                 )
-                * freq15
-            )
 
-            # AH2P = EXP(-ES/TKEV + FR + LOG(XNFPH(J,1))) * 2. * BHYD(J,1) * XNFPH(J,2) / RHO(J) * STIM(J)
-            if xnfph_arr.shape[1] >= 2:
                 xnfph1 = xnfph_arr[:, 0]
                 xnfph2 = xnfph_arr[:, 1]
                 bhyd1 = (
@@ -1372,21 +1453,22 @@ def compute_kapp_continuum(
                     if bhyd.shape[1] > 0
                     else np.ones(n_layers, dtype=np.float64)
                 )
-                stim_j = stim[:, j]
-
-                ah2p_val = (
-                    np.exp(-es / tkev + fr + np.log(np.maximum(xnfph1, 1e-40)))
+                ah2p[:, active] = (
+                    np.exp(
+                        -es[np.newaxis, :] / tkev[:, np.newaxis]
+                        + fr[np.newaxis, :]
+                        + np.log(np.maximum(xnfph1, 1e-40))[:, np.newaxis]
+                    )
                     * 2.0
-                    * bhyd1
-                    * xnfph2
-                    / rho
-                    * stim_j
+                    * bhyd1[:, np.newaxis]
+                    * xnfph2[:, np.newaxis]
+                    / rho[:, np.newaxis]
+                    * stim[:, active]
                 )
-                ah2p[:, j] = ah2p_val
 
     # HE1OP: Helium I opacity (atlas12.for lines 6007-6127)
     if ifop[4] == 1 and atmosphere.xnf_he1 is not None:
-        logger.info("Computing HE1OP (Helium I opacity, atlas12)...")
+        logger.debug("Computing HE1OP (Helium I opacity, atlas12)...")
         # XNFP(J,3): He I partition-function-weighted number density
         xnfp_he1 = np.asarray(atmosphere.xnf_he1, dtype=np.float64)
         if xnfp_he1.ndim > 1:
@@ -1439,10 +1521,28 @@ def compute_kapp_continuum(
         he1_exlim = np.exp(-24.587 / tkev_he1) * he1_xr
 
         he1_tlog = np.log(np.maximum(temp, 1e-10))
+        he1_coulff = _coulff_grid(1, np.log(np.maximum(freq, 1e-300)), he1_tlog)
+        he1_xk_trans = {
+            5: xkarsas_grid(freq, 1.236439, 3, 0),
+            6: xkarsas_grid(freq, 1.102898, 3, 0),
+            7: xkarsas_grid(freq, 1.045499, 3, 1),
+            8: xkarsas_grid(freq, 1.001427, 3, 2),
+            9: xkarsas_grid(freq, 0.9926, 3, 1),
+        }
+        he1_auto_grids: dict[float, np.ndarray] = {}
+        for elim, levels in (
+            (527490.06, (171135.000, 169087.0, 166277.546, 159856.069)),
+            (588451.59, (186209.471, 186101.0, 185564.0, 184864.0, 183236.0)),
+        ):
+            for level in levels:
+                freqhe_grid = (elim - level) * C_LIGHT_CM
+                he1_auto_grids[freqhe_grid] = xkarsas_grid(freq, freqhe_grid / ryd_he1, 1, 0)
+        he1_transn = np.zeros((28, nfreq), dtype=np.float64)
+        for _n in range(4, 28):
+            he1_transn[_n, :] = xkarsas_grid(freq, 4.0 - 3.0 / (_n * _n), 1, 0)
 
         for j in range(nfreq):
             f = freq[j]
-            freqlg_j = np.log(f)
             stim_j = stim[:, j]
             ehvkt_j = ehvkt[:, j]
 
@@ -1472,54 +1572,54 @@ def compute_kapp_continuum(
                 if imin <= 5:
                     trans[4] = _he12p1p(f)
                 if imin <= 6:
-                    trans[5] = xkarsas(f, 1.236439, 3, 0)
+                    trans[5] = he1_xk_trans[5][j]
                 if imin <= 7:
-                    trans[6] = xkarsas(f, 1.102898, 3, 0)
+                    trans[6] = he1_xk_trans[6][j]
                 if imin <= 8:
-                    trans[7] = xkarsas(f, 1.045499, 3, 1)
+                    trans[7] = he1_xk_trans[7][j]
                 if imin <= 9:
-                    trans[8] = xkarsas(f, 1.001427, 3, 2)
+                    trans[8] = he1_xk_trans[8][j]
                 if imin <= 10:
-                    trans[9] = xkarsas(f, 0.9926, 3, 1)
+                    trans[9] = he1_xk_trans[9][j]
 
                 # He II n=2 autoionization (atlas12.for lines 6067-6084)
                 elim2 = 527490.06
                 freqhe = (elim2 - 171135.000) * C_LIGHT_CM
                 if f >= freqhe:
-                    trans[4] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                    trans[4] += he1_auto_grids[freqhe][j]
                     freqhe = (elim2 - 169087.0) * C_LIGHT_CM
                     if f >= freqhe:
-                        trans[3] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                        trans[3] += he1_auto_grids[freqhe][j]
                         freqhe = (elim2 - 166277.546) * C_LIGHT_CM
                         if f >= freqhe:
-                            trans[2] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                            trans[2] += he1_auto_grids[freqhe][j]
                             freqhe = (elim2 - 159856.069) * C_LIGHT_CM
                             if f >= freqhe:
-                                trans[1] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                                trans[1] += he1_auto_grids[freqhe][j]
 
                 # He II n=3 autoionization (atlas12.for lines 6086-6106)
                 elim3 = 588451.59
                 freqhe = (elim3 - 186209.471) * C_LIGHT_CM
                 if f >= freqhe:
-                    trans[9] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                    trans[9] += he1_auto_grids[freqhe][j]
                     freqhe = (elim3 - 186101.0) * C_LIGHT_CM
                     if f >= freqhe:
-                        trans[8] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                        trans[8] += he1_auto_grids[freqhe][j]
                         freqhe = (elim3 - 185564.0) * C_LIGHT_CM
                         if f >= freqhe:
-                            trans[7] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                            trans[7] += he1_auto_grids[freqhe][j]
                             freqhe = (elim3 - 184864.0) * C_LIGHT_CM
                             if f >= freqhe:
-                                trans[6] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                                trans[6] += he1_auto_grids[freqhe][j]
                                 freqhe = (elim3 - 183236.0) * C_LIGHT_CM
                                 if f >= freqhe:
-                                    trans[5] += xkarsas(f, freqhe / ryd_he1, 1, 0)
+                                    trans[5] += he1_auto_grids[freqhe][j]
 
             # High-n levels N=4..27 (atlas12.for lines 6107-6110)
             transn = np.zeros(28, dtype=np.float64)
             if f >= 1.25408e16:
                 for _n in range(4, 28):
-                    transn[_n] = xkarsas(f, 4.0 - 3.0 / (_n * _n), 1, 0)
+                    transn[_n] = he1_transn[_n, j]
 
             # Per-layer computation (atlas12.for lines 6111-6123)
             if f < 2.055e14:
@@ -1537,16 +1637,14 @@ def compute_kapp_continuum(
                     he1_val = he1_val + transn[_n] * he1_boltn[:, _n]
 
             # Free-free: COULFF(J,1)*FREET(J)*CFREE (atlas12.for line 6123)
-            coulff_arr = np.array(
-                [_coulff(jj, 1, f, freqlg_j, temp, he1_tlog) for jj in range(n_layers)]
-            )
+            coulff_arr = he1_coulff[:, j]
             ahe1[:, j] = (he1_val + coulff_arr * he1_freet * cfree) * stim_j
             she1[:, j] = bnu_all[:, j]
 
     # HE2OP: Helium II opacity (atlas12.for lines 6331-6375)
     # Uses XKARSAS (Karzas & Latter 1960) cross-sections, matching atlas12 exactly.
     if ifop[5] == 1 and atmosphere.xnf_he2 is not None:
-        logger.info("Computing HE2OP (Helium II opacity, atlas12 XKARSAS)...")
+        logger.debug("Computing HE2OP (Helium II opacity, atlas12 XKARSAS)...")
         xnfp_he2 = np.asarray(atmosphere.xnf_he2, dtype=np.float64)  # XNFP(J,4)
         xnf_he3 = np.asarray(atmosphere.xnf_all[:, 4], dtype=np.float64)  # XNF(J,5)
 
@@ -1570,14 +1668,15 @@ def compute_kapp_continuum(
         exlim = np.exp(-54.403 / tkev) * xr
 
         tlog_arr = np.log(np.maximum(temp, 1e-10))
+        he2_coulff = _coulff_grid(2, np.log(np.maximum(freq, 1e-300)), tlog_arr)
+        he2_cont = np.vstack(
+            [xkarsas_grid(freq, 4.0, n, n) for n in range(1, 10)]
+        )
 
         for j in range(nfreq):
             f = freq[j]
-            freqlg_j = np.log(f)
 
-            cont = np.empty(9, dtype=np.float64)
-            for n in range(1, 10):
-                cont[n - 1] = xkarsas(f, 4.0, n, n)
+            cont = he2_cont[:, j]
 
             freq3 = f ** 3
             cfree = 3.6919e8 / freq3 * 4.0
@@ -1592,9 +1691,7 @@ def compute_kapp_continuum(
             for n in range(9):
                 he2_val = he2_val + cont[n] * bolt[:, n]
 
-            coulff_arr = np.array(
-                [_coulff(j_idx, 2, f, freqlg_j, temp, tlog_arr) for j_idx in range(n_layers)]
-            )
+            coulff_arr = he2_coulff[:, j]
 
             ahe2[:, j] = (he2_val + coulff_arr * cfree * freet) * stim[:, j]
             she2[:, j] = bnu_all[:, j]
@@ -1604,31 +1701,33 @@ def compute_kapp_continuum(
     #   AHEMIN(J)=(A*T(J)+B+C/T(J))/1.D15*XNE(J)/1.D15*XNFPHE(J,1)/1.D15/RHO(J)
     # where A, B, C are frequency-dependent polynomials in 1/FREQ.
     if ifop[6] == 1 and atmosphere.xnf_he1 is not None and atmosphere.electron_density is not None:
-        logger.info("Computing HEMIOP (He- opacity)...")
+        logger.debug("Computing HEMIOP (He- opacity)...")
         xnfphe = np.asarray(atmosphere.xnf_he1, dtype=np.float64)
         if xnfphe.ndim == 1:
             xnfphe = xnfphe[:, np.newaxis]
         xnfphe1 = xnfphe[:, 0] if xnfphe.shape[1] > 0 else np.ones(n_layers)
         xne = np.asarray(atmosphere.electron_density, dtype=np.float64)
 
-        for j in range(nfreq):
-            f = freq[j]
-            a_coeff = 3.397e-01 + (-5.216e14 + 7.039e30 / f) / f
-            b_coeff = -4.116e03 + (1.067e19 + 8.135e34 / f) / f
-            c_coeff = 5.081e08 + (-8.724e22 - 5.659e37 / f) / f
-            ahemin[:, j] = (
-                (a_coeff * temp + b_coeff + c_coeff / temp)
-                / 1.0e15
-                * xne
-                / 1.0e15
-                * xnfphe1
-                / 1.0e15
-                / rho
+        a_coeff = 3.397e-01 + (-5.216e14 + 7.039e30 / freq) / freq
+        b_coeff = -4.116e03 + (1.067e19 + 8.135e34 / freq) / freq
+        c_coeff = 5.081e08 + (-8.724e22 - 5.659e37 / freq) / freq
+        ahemin[:, :] = (
+            (
+                a_coeff[np.newaxis, :] * temp[:, np.newaxis]
+                + b_coeff[np.newaxis, :]
+                + c_coeff[np.newaxis, :] / temp[:, np.newaxis]
             )
+            / 1.0e15
+            * xne[:, np.newaxis]
+            / 1.0e15
+            * xnfphe1[:, np.newaxis]
+            / 1.0e15
+            / rho[:, np.newaxis]
+        )
 
     # HMINOP: H- opacity (atlas7v.for line 5212-5316)
     if ifop[2] == 1 and atmosphere.xnfph is not None and atmosphere.electron_density is not None:
-        logger.info("Computing HMINOP (H- opacity)...")
+        logger.debug("Computing HMINOP (H- opacity)...")
         xnfph_arr = np.asarray(atmosphere.xnfph, dtype=np.float64)
         xne = np.asarray(atmosphere.electron_density, dtype=np.float64)
         bhyd = atlas_tables.get("bhyd", np.ones((n_layers, 8), dtype=np.float64))
@@ -1681,74 +1780,76 @@ def compute_kapp_continuum(
                 ff_val = ff_full[it, iw]
                 fflog[iw, it] = np.log(ff_val / HMINOP_THETAFF[it] * 5040.0 * K_BOLTZ)
 
-        for j in range(nfreq):
-            f = freq[j]
-            wno = waveno[j]
-            bnu_j = bnu_all[:, j]
-            ehvkt_j = ehvkt[:, j]
-            stim_j = stim[:, j]
+        # WAVE = 2.99792458e17 / FREQ (atlas7v.for line 5300), wavelength in nm.
+        # WAVELOG matches Fortran exactly because WFFLOG = log(91.134/WAVEK) = log(wave_nm).
+        wavelog = np.log(wavelength_nm)
 
-            # WAVE = 2.99792458e17 / FREQ (atlas7v.for line 5300)
-            wave = 2.99792458e17 / f  # wavelength in nm
-            # WAVELOG matches Fortran exactly - log of wavelength in nm
-            # The WFFLOG array uses log(91.134/WAVEK) where WAVEK = 91.134/wavelength_nm
-            # So WFFLOG = log(91.134 / (91.134/wave_nm)) = log(wave_nm)
-            wavelog = np.log(wave)
+        # Interpolate FFLOG over wavelength once for every THETA table row.
+        fftt = np.empty((nthetaff, nfreq), dtype=np.float64)
+        for it in range(nthetaff):
+            fftt[it, :] = np.exp(_linter(wfflog, fflog[:, it], wavelog))
 
-            # Interpolate FFLOG to get FFTT for each THETA (atlas7v.for line 5302-5304)
-            fftheta = np.zeros((n_layers,), dtype=np.float64)
-            for layer_idx in range(n_layers):
-                # For each THETA, interpolate FFLOG over wavelength
-                fftt_for_theta = np.zeros((nthetaff,), dtype=np.float64)
-                for it in range(nthetaff):
-                    # Interpolate FFLOG over WFFLOG (wavelength dimension)
-                    fftt_val = _linter(wfflog, fflog[:, it], np.array([wavelog]))[0]
-                    fftt_for_theta[it] = np.exp(fftt_val)
+        # Interpolate FFTT over THETA for each layer.  The theta bracket is
+        # layer-only, so reuse it across the full frequency grid.
+        fftheta = np.empty((n_layers, nfreq), dtype=np.float64)
+        for layer_idx in range(n_layers):
+            iold = int(np.searchsorted(HMINOP_THETAFF, theta[layer_idx], side="right"))
+            iold = max(1, min(iold, nthetaff - 1))
+            denom = HMINOP_THETAFF[iold] - HMINOP_THETAFF[iold - 1]
+            if abs(denom) < 1e-40:
+                fftheta[layer_idx, :] = fftt[iold - 1, :]
+            else:
+                weight = (theta[layer_idx] - HMINOP_THETAFF[iold - 1]) / denom
+                fftheta[layer_idx, :] = fftt[iold - 1, :] + (fftt[iold, :] - fftt[iold - 1, :]) * weight
 
-                # Interpolate FFTT over THETA (atlas7v.for line 5308)
-                fftheta[layer_idx] = _linter(
-                    HMINOP_THETAFF, fftt_for_theta, np.array([theta[layer_idx]])
-                )[0]
+        # HMINBF from MAP1 (atlas7v.for line 5306)
+        hminbf = np.zeros(nfreq, dtype=np.float64)
+        hminbf_active = freq > 1.82365e14
+        if np.any(hminbf_active):
+            from .josh_math import _map1
 
-            # HMINBF from MAP1 (atlas7v.for line 5306)
-            hminbf = 0.0
-            if f > 1.82365e14:
-                hminbf = _map1_simple(HMINOP_WBF, HMINOP_BF, wave)
-
-            # Compute H- opacity (atlas7v.for line 5309-5313)
-            # HMINFF = FFTETA * XNFPH(J,1) * 2. * BHYD(J,1) * XNE(J) / RHO(J) * 1e-26
-            hminff = fftheta * xnfph1 * 2.0 * bhyd1 * xne / rho * 1e-26
-
-            # H = HMINBF * 1e-18 * (1. - EHVKT(J)/BMIN(J)) * XHMIN(J) / RHO(J)
-            h_bf = (
-                hminbf * 1e-18 * (1.0 - ehvkt_j / np.maximum(bmin, 1e-40)) * xhmin / rho
+            hminbf[hminbf_active], _ = _map1(
+                HMINOP_WBF,
+                HMINOP_BF,
+                wavelength_nm[hminbf_active],
             )
 
-            ahmin[:, j] = h_bf + hminff
+        # Compute H- opacity (atlas7v.for line 5309-5313)
+        # HMINFF = FFTETA * XNFPH(J,1) * 2. * BHYD(J,1) * XNE(J) / RHO(J) * 1e-26
+        hminff = fftheta * (xnfph1 * 2.0 * bhyd1 * xne / rho * 1e-26)[:, np.newaxis]
 
-            # Source function (atlas7v.for line 5313-5314)
-            # SHMIN = (H * BNU(J) * STIM(J) / (BMIN(J) - EHVKT(J)) + HMINFF * BNU(J)) / AHMIN(J)
-            bmin_expanded = np.broadcast_to(bmin, (n_layers,))
-            denom = bmin_expanded - ehvkt_j
-            h_bf_src = h_bf * bnu_j * stim_j / np.maximum(denom, 1e-40)
-            shmin[:, j] = np.where(
-                ahmin[:, j] > 0, (h_bf_src + hminff * bnu_j) / ahmin[:, j], bnu_j
-            )
+        # H = HMINBF * 1e-18 * (1. - EHVKT(J)/BMIN(J)) * XHMIN(J) / RHO(J)
+        h_bf = (
+            hminbf[np.newaxis, :]
+            * 1e-18
+            * (1.0 - ehvkt / np.maximum(bmin, 1e-40)[:, np.newaxis])
+            * xhmin[:, np.newaxis]
+            / rho[:, np.newaxis]
+        )
+
+        ahmin[:, :] = h_bf + hminff
+
+        # Source function (atlas7v.for line 5313-5314)
+        # SHMIN = (H * BNU(J) * STIM(J) / (BMIN(J) - EHVKT(J)) + HMINFF * BNU(J)) / AHMIN(J)
+        denom = bmin[:, np.newaxis] - ehvkt
+        h_bf_src = h_bf * bnu_all * stim / np.maximum(denom, 1e-40)
+        shmin[:, :] = np.where(
+            ahmin > 0, (h_bf_src + hminff * bnu_all) / ahmin, bnu_all
+        )
 
     # Scattering subroutines
     # ELECOP: Electron scattering (atlas7v.for line 7806-7817) - Simple!
     if ifop[11] == 1 and atmosphere.electron_density is not None:
-        logger.info("Computing ELECOP (electron scattering)...")
+        logger.debug("Computing ELECOP (electron scattering)...")
         xne = np.asarray(atmosphere.electron_density, dtype=np.float64)
-        for j in range(nfreq):
-            # SIGEL = 0.6653e-24 * XNE / RHO (atlas7v.for line 7815)
-            sigel[:, j] = 0.6653e-24 * xne / rho
+        # SIGEL = 0.6653e-24 * XNE / RHO (atlas7v.for line 7815)
+        sigel[:, :] = (0.6653e-24 * xne / rho)[:, np.newaxis]
 
     # HRAYOP: Hydrogen Rayleigh scattering (atlas12.for lines 5989-6006)
     # atlas12 uses a simple polynomial cross-section, clamping freq at Lyman-alpha.
     xnfph1 = None
     if ifop[3] == 1 and atmosphere.xnf_h is not None:
-        logger.info("Computing HRAYOP (hydrogen Rayleigh scattering, atlas12)...")
+        logger.debug("Computing HRAYOP (hydrogen Rayleigh scattering, atlas12)...")
         xnf_h_total = np.asarray(atmosphere.xnf_h, dtype=np.float64)
         xnfph1 = compute_ground_state_hydrogen(xnf_h_total, temp)
     elif ifop[3] == 1 and atmosphere.xnfph is not None:
@@ -1760,13 +1861,11 @@ def compute_kapp_continuum(
         bhyd1 = bhyd[:, 0] if bhyd.shape[1] > 0 else np.ones(n_layers)
         pop_hray = xnfph1 * 2.0 * bhyd1 / rho
 
-        for j in range(nfreq):
-            f = freq[j]
-            # atlas12.for line 6000: W = c_AA / DMIN1(FREQ, 2.463D15)
-            w = 2.99792458e18 / min(f, 2.463e15)
-            ww = w * w
-            sig = (5.799e-13 + 1.422e-6 / ww + 2.784 / (ww * ww)) / (ww * ww)
-            sigh[:, j] = sig * pop_hray
+        # atlas12.for line 6000: W = c_AA / DMIN1(FREQ, 2.463D15)
+        w = 2.99792458e18 / np.minimum(freq, 2.463e15)
+        ww = w * w
+        sig = (5.799e-13 + 1.422e-6 / ww + 2.784 / (ww * ww)) / (ww * ww)
+        sigh[:, :] = pop_hray[:, np.newaxis] * sig[np.newaxis, :]
 
     # HERAOP: Helium Rayleigh scattering (atlas7v.for line 5818-5832)
     # CRITICAL: Fortran only calls HERAOP if IFOP(8) == 1 (atlas7v.for line 4046)
@@ -1775,33 +1874,31 @@ def compute_kapp_continuum(
     if (
         ifop[7] == 1 and atmosphere.xnf_he1 is not None
     ):  # IFOP(8) in Fortran = ifop[7] in Python (0-indexed)
-        logger.info("Computing HERAOP (helium Rayleigh scattering)...")
+        logger.debug("Computing HERAOP (helium Rayleigh scattering)...")
         xnfphe = np.asarray(atmosphere.xnf_he1, dtype=np.float64)
         if xnfphe.ndim == 1:
             xnfphe = xnfphe[:, np.newaxis]  # Make it 2D
         bhe1 = atlas_tables.get("bhe1", np.ones((n_layers, 29), dtype=np.float64))
 
-        for j in range(nfreq):
-            f = freq[j]
-            # WAVE = 2.99792458e18 / min(FREQ, 5.15e15) (atlas7v.for line 5826)
-            wave = 2.99792458e18 / min(f, 5.15e15)
-            ww = wave**2
-            # SIG = 5.484e-14 / WW / WW * (1. + (2.44e5 + 5.94e10 / (WW - 2.90e5)) / WW)^2 (atlas7v.for line 5828)
-            sig = (
-                5.484e-14
-                / (ww * ww)
-                * (1.0 + (2.44e5 + 5.94e10 / max(ww - 2.90e5, 1e-10)) / ww) ** 2
-            )
-            xnfphe1 = xnfphe[:, 0] if xnfphe.shape[1] > 0 else np.ones(n_layers)
-            bhe1_1 = bhe1[:, 0] if bhe1.shape[1] > 0 else np.ones(n_layers)
-            sighe[:, j] = sig * xnfphe1 / rho * bhe1_1
+        # WAVE = 2.99792458e18 / min(FREQ, 5.15e15) (atlas7v.for line 5826)
+        wave = 2.99792458e18 / np.minimum(freq, 5.15e15)
+        ww = wave**2
+        # SIG = 5.484e-14 / WW / WW * (1. + (2.44e5 + 5.94e10 / (WW - 2.90e5)) / WW)^2 (atlas7v.for line 5828)
+        sig = (
+            5.484e-14
+            / (ww * ww)
+            * (1.0 + (2.44e5 + 5.94e10 / np.maximum(ww - 2.90e5, 1e-10)) / ww) ** 2
+        )
+        xnfphe1 = xnfphe[:, 0] if xnfphe.shape[1] > 0 else np.ones(n_layers)
+        bhe1_1 = bhe1[:, 0] if bhe1.shape[1] > 0 else np.ones(n_layers)
+        sighe[:, :] = (xnfphe1 / rho * bhe1_1)[:, np.newaxis] * sig[np.newaxis, :]
     else:
-        logger.info("Skipping HERAOP (helium Rayleigh scattering) - IFOP(8)=0")
+        logger.debug("Skipping HERAOP (helium Rayleigh scattering) - IFOP(8)=0")
 
     # H2RAOP: H2 Rayleigh scattering (atlas12.for lines 9659-9694)
     # CRITICAL: Fortran only calls H2RAOP if IFOP(13) == 1
     if ifop[12] == 1 and xnfph1 is not None:
-        logger.info("Computing H2RAOP (H2 Rayleigh scattering)...")
+        logger.debug("Computing H2RAOP (H2 Rayleigh scattering)...")
         bhyd1 = bhyd[:, 0] if bhyd.shape[1] > 0 else np.ones(n_layers)
 
         # Compute XNH2 (H2 number density cm^-3) using the EQUILH2 tabulated
@@ -1817,21 +1914,19 @@ def compute_kapp_continuum(
         # Zero out layers where T > 20000K (Fortran: IF(T(J).GT.20000.) GO TO 11)
         xnh2 = np.where(temp > 20000.0, 0.0, xnh2)
 
-        for j in range(nfreq):
-            f = freq[j]
-            # Wave in Angstrom, capped at frequency 2.922e15 Hz
-            wave = 2.99792458e18 / min(f, 2.922e15)
-            ww = wave**2
+        # Wave in Angstrom, capped at frequency 2.922e15 Hz
+        wave = 2.99792458e18 / np.minimum(freq, 2.922e15)
+        ww = wave**2
 
-            # Cross-section formula (atlas12.for line 9688)
-            sig = (8.14e-13 + 1.28e-6 / ww + 1.61 / (ww * ww)) / (ww * ww)
+        # Cross-section formula (atlas12.for line 9688)
+        sig = (8.14e-13 + 1.28e-6 / ww + 1.61 / (ww * ww)) / (ww * ww)
 
-            # atlas12.for line 9692: SIGH2(J) = SIG * XNH2(J) / RHO(J)
-            sigh2[:, j] = sig * xnh2 / rho
+        # atlas12.for line 9692: SIGH2(J) = SIG * XNH2(J) / RHO(J)
+        sigh2[:, :] = (xnh2 / rho)[:, np.newaxis] * sig[np.newaxis, :]
 
-        logger.info(f"  SIGH2[0] at first freq: {sigh2[0, 0]:.6e}")
+        logger.debug("  SIGH2[0] at first freq: %.6e", sigh2[0, 0])
     else:
-        logger.info("Skipping H2RAOP (H2 Rayleigh scattering) - IFOP(13)=0 or no XNFPH")
+        logger.debug("Skipping H2RAOP (H2 Rayleigh scattering) - IFOP(13)=0 or no XNFPH")
 
     # XSOP: Dummy scattering (atlas7v.for line 8083-8091) - does nothing
     # sigx remains zeros
@@ -1841,7 +1936,7 @@ def compute_kapp_continuum(
     # Fortran: XNFP(J,21), 1-based → Python index 20.
     xnfpc = np.asarray(atmosphere.xnfp_all[:, 20], dtype=np.float64)
     if ifop[8] == 1 and np.any(xnfpc > 0):
-        logger.info("Computing C1OP (Carbon I opacity)...")
+        logger.debug("Computing C1OP (Carbon I opacity)...")
         _RYD = 109732.298
         _c1_elev = np.array([
             79314.86, 78731.27, 78529.62, 78309.76, 78226.35,
@@ -1964,7 +2059,7 @@ def compute_kapp_continuum(
     # Fortran: XNFP(J,78), 1-based → Python index 77.
     xnfpmg = np.asarray(atmosphere.xnfp_all[:, 77], dtype=np.float64)
     if ifop[8] == 1 and np.any(xnfpmg > 0):
-        logger.info("Computing MG1OP (Magnesium I opacity)...")
+        logger.debug("Computing MG1OP (Magnesium I opacity)...")
         _RYD_MG = 109732.298
         _mg1_elev = np.array([
             54676.710, 54676.438, 54192.284, 53134.642, 49346.729,
@@ -2050,7 +2145,7 @@ def compute_kapp_continuum(
     # Fortran: FE1OP uses XNFP(J,351) — POPSALL slot 351, 1-based → index 350.
     xnfpfe = np.asarray(atmosphere.xnfp_all[:, 350], dtype=np.float64)
     if ifop[8] == 1 and np.any(xnfpfe > 0):
-        logger.info("Computing FE1OP (Iron I opacity)...")
+        logger.debug("Computing FE1OP (Iron I opacity)...")
         bfe1 = atlas_tables.get("bfe1", np.ones((n_layers, 15), dtype=np.float64))
         bsi1 = atlas_tables.get("bsi1", np.ones((n_layers, 11), dtype=np.float64))
 
@@ -2217,34 +2312,40 @@ def compute_kapp_continuum(
             dtype=np.float64,
         )
 
-        # FE1OP processes all frequencies - individual transitions are checked inside
-        for j in range(nfreq):
-            wno = waveno[j]
-            if wno < 21000.0:  # Skip if below Fe I first edge
-                continue
+        # FE1OP processes all frequencies; individual transitions are checked inside.
+        active = waveno >= 21000.0
+        if np.any(active):
+            h = np.zeros((n_layers, nfreq), dtype=np.float64)
+            # Sum contributions from all transitions (atlas7v.for line 6655-6660)
+            for i in range(len(fe1_wno)):
+                use = fe1_wno[i] <= waveno
+                if not np.any(use):
+                    continue
+                xsect = np.zeros(nfreq, dtype=np.float64)
+                xsect[use] = 3e-18 / (
+                    1.0 + ((fe1_wno[i] + 3000.0 - waveno[use]) / fe1_wno[i] / 0.1) ** 4
+                )
+                h += (
+                    fe1_g[i]
+                    * np.exp(-fe1_e[i] * hckt)[:, np.newaxis]
+                    * xsect[np.newaxis, :]
+                )
 
-            bnu_j = bnu_all[:, j]
-            ehvkt_j = ehvkt[:, j]
-            stim_j = stim[:, j]
+            # Fortran: COOLOP assembles FE1OP(J)*XNFP(J,351)*STIM(J)/RHO(J)
+            afe1[:, active] = (
+                h[:, active]
+                * stim[:, active]
+                * xnfpfe[:, np.newaxis]
+                / rho[:, np.newaxis]
+            )
 
             # BFUDGE = BSI1(J,1) (atlas7v.for line 6652)
             bfudge = bsi1[:, 0] if bsi1.shape[1] > 0 else np.ones(n_layers)
-
-            h = np.zeros(n_layers)
-
-            # Sum contributions from all transitions (atlas7v.for line 6655-6660)
-            for i in range(len(fe1_wno)):
-                if fe1_wno[i] <= wno:
-                    xsect = 3e-18 / (
-                        1.0 + ((fe1_wno[i] + 3000.0 - wno) / fe1_wno[i] / 0.1) ** 4
-                    )
-                    h = h + xsect * fe1_g[i] * np.exp(-fe1_e[i] * hckt)
-
-            # Fortran: COOLOP assembles FE1OP(J)*XNFP(J,351)*STIM(J)/RHO(J)
-            h = h * stim_j * xnfpfe / rho
-
-            afe1[:, j] = h
-            sfe1[:, j] = bnu_j * stim_j / np.maximum(bfudge - ehvkt_j, 1e-40)
+            sfe1[:, active] = (
+                bnu_all[:, active]
+                * stim[:, active]
+                / np.maximum(bfudge[:, np.newaxis] - ehvkt[:, active], 1e-40)
+            )
 
     # AL1OP: Aluminum I opacity — atlas12.for lines 6897-6912.
     # In atlas12, AL1OP is a FUNCTION (not subroutine), returning cross-section * partition.
@@ -2252,34 +2353,33 @@ def compute_kapp_continuum(
     # Fortran: XNFP(J,91), 1-based → Python index 90.
     xnfpal = np.asarray(atmosphere.xnfp_all[:, 90], dtype=np.float64)
     if ifop[8] == 1 and np.any(xnfpal > 0):
-        logger.info("Computing AL1OP (Aluminum I opacity)...")
+        logger.debug("Computing AL1OP (Aluminum I opacity)...")
         _al1_elim = 48278.37
 
-        for j in range(nfreq):
-            f = freq[j]
-            wno = waveno[j]
-            stim_j = stim[:, j]
-
-            if f > 3.28805e15:
-                continue
-
-            al1op_val = 0.0
+        active = freq <= 3.28805e15
+        if np.any(active):
+            al1op_val = np.zeros(nfreq, dtype=np.float64)
             # 3s2 3p 2P3/2 edge at (ELIM - 112.061) cm^-1
-            if wno >= _al1_elim - 112.061:
-                al1op_val = 6.5e-17 * ((_al1_elim - 112.061) / wno) ** 5 * 4.0
+            use = active & (waveno >= _al1_elim - 112.061)
+            al1op_val[use] = 6.5e-17 * ((_al1_elim - 112.061) / waveno[use]) ** 5 * 4.0
             # 3s2 3p 2P1/2 edge at ELIM cm^-1
-            if wno >= _al1_elim:
-                al1op_val += 6.5e-17 * (_al1_elim / wno) ** 5 * 2.0
+            use = active & (waveno >= _al1_elim)
+            al1op_val[use] += 6.5e-17 * (_al1_elim / waveno[use]) ** 5 * 2.0
 
             # COOLOP: AAL1(J) = AL1OP(J) * XNFP(J,91) * STIM(J) / RHO(J)
-            aal1[:, j] = al1op_val * xnfpal * stim_j / rho
-            sal1[:, j] = bnu_all[:, j]
+            aal1[:, active] = (
+                xnfpal[:, np.newaxis]
+                * stim[:, active]
+                / rho[:, np.newaxis]
+                * al1op_val[active][np.newaxis, :]
+            )
+            sal1[:, active] = bnu_all[:, active]
 
     # SI1OP: Silicon I opacity — atlas12.for lines 6913-7342.
     # Fortran: XNFP(J,105), 1-based → Python index 104.
     xnfpsi = np.asarray(atmosphere.xnfp_all[:, 104], dtype=np.float64)
     if ifop[8] == 1 and np.any(xnfpsi > 0):
-        logger.info("Computing SI1OP (Silicon I opacity)...")
+        logger.debug("Computing SI1OP (Silicon I opacity)...")
         _RYD_SI = 109732.298
         _si1_elev = np.array([
             59962.284, 59100., 59077.112, 58893.40, 58801.529,
@@ -2419,7 +2519,7 @@ def compute_kapp_continuum(
     # Computes: N1OP, O1OP, MG2OP, SI2OP, CA2OP
     # Only computed if IFOP(10) = 1
     if ifop[9] == 1:  # IFOP(10) in Fortran = ifop[9] in Python (0-indexed)
-        logger.info("Computing LUKEOP (N1, O1, Mg2, Si2, Ca2 opacity)...")
+        logger.debug("Computing LUKEOP (N1, O1, Mg2, Si2, Ca2 opacity)...")
         xnfp_all = np.asarray(atmosphere.xnfp_all, dtype=np.float64)
 
         def _xnfp_stage(start_1based: int, ion_stage_1based: int) -> np.ndarray:
@@ -2698,13 +2798,13 @@ def compute_kapp_continuum(
                         reason="xnfp_c2_mg2_si2",
                     )
     else:
-        logger.info("Skipping LUKEOP - IFOP(10)=0")
+        logger.debug("Skipping LUKEOP - IFOP(10)=0")
 
     # HOTOP: Hot star opacity (atlas7v.for line 9124-9251)
     # Free-free from C, N, O, Ne, Mg, Si, S, Fe ionization stages I-V
     # Only computed if IFOP(11) = 1
     if ifop[10] == 1:  # IFOP(11) in Fortran = ifop[10] in Python (0-indexed)
-        logger.info("Computing HOTOP (hot star opacity)...")
+        logger.debug("Computing HOTOP (hot star opacity)...")
         xne = np.asarray(atmosphere.electron_density, dtype=np.float64)
         tlog_arr = np.log(np.maximum(temp, 1e-10))
         tkev = KBOLTZ_EV * temp
@@ -2785,7 +2885,7 @@ def compute_kapp_continuum(
 
             ahot[:, i0:i1] = ahot_chunk * stim_chunk / rho[:, np.newaxis]
     else:
-        logger.info("Skipping HOTOP - IFOP(11)=0")
+        logger.debug("Skipping HOTOP - IFOP(11)=0")
 
     # Molecular opacities for COOLOP (atlas12.for SUBROUTINE COOLOP lines 6411-6439)
     # ACOOL = AC1 + AMG1 + AAL1 + ASI1 + AFE1 + CHOP*XNFPCH + OHOP*XNFPOH + AH2COLL
@@ -2796,7 +2896,7 @@ def compute_kapp_continuum(
     # Check if we have cool temperatures (molecular opacities only matter for T < 9000K)
     t_min = temp.min()
     if t_min < 9000.0 and ifop[8] == 1:  # IFOP(9) = COOLOP enabled
-        logger.info("Computing molecular opacities (CHOP, OHOP, H2COLL) for COOLOP...")
+        logger.debug("Computing molecular opacities (CHOP, OHOP, H2COLL) for COOLOP...")
 
         # CH/OH molecular populations come from POPSALL slots used by atlas12:
         # XNFP(:,846) for CH and XNFP(:,848) for OH (1-based indexing).
@@ -2821,27 +2921,24 @@ def compute_kapp_continuum(
                 ohop_xsect = _ohop_opacity(f, temp)
                 acool_mol[:, j] += ohop_xsect * xnfpoh / rho * stim_j
 
-            # H2COLL: H2 collision-induced absorption
-            # This is computed from H2 equilibrium, not a stored population
-            if xnfph1 is not None:
-                xnfhe1_arr = (
-                    np.asarray(atmosphere.xnf_he1, dtype=np.float64)
-                )
-                h2coll = _h2_collision_opacity(
-                    f,
-                    temp,
-                    xnfph1,
-                    bhyd[:, 0] if bhyd.shape[1] > 0 else np.ones(n_layers),
-                    xnfhe1_arr,
-                    rho,
-                    tkev_arr,
-                    tlog_arr,
-                    stim_j,
-                )
-                acool_mol[:, j] += h2coll
+        # H2COLL: H2 collision-induced absorption. Fortran computes XNH2 once
+        # into COMMON /XNF/ via H2RAOP and H2COLLOP reuses it for every frequency.
+        if xnfph1 is not None:
+            xnfhe1_arr = np.asarray(atmosphere.xnf_he1, dtype=np.float64)
+            acool_mol += _h2_collision_opacity_grid(
+                freq,
+                temp,
+                xnfph1,
+                bhyd[:, 0] if bhyd.shape[1] > 0 else np.ones(n_layers),
+                xnfhe1_arr,
+                rho,
+                stim,
+            )
 
-        logger.info(
-            f"  Molecular opacity range: [{acool_mol.min():.6e}, {acool_mol.max():.6e}]"
+        logger.debug(
+            "  Molecular opacity range: [%.6e, %.6e]",
+            acool_mol.min(),
+            acool_mol.max(),
         )
 
     # Sum ACONT/SCONT using atlas12-style dispatcher semantics:
@@ -2951,8 +3048,10 @@ def compute_kapp_continuum(
                     reason="sigh2_sigx",
                 )
 
-    logger.info(
-        f"KAPP continuum computed: ACONT range [{acont.min():.6e}, {acont.max():.6e}]"
+    logger.debug(
+        "KAPP continuum computed: ACONT range [%.6e, %.6e]",
+        acont.min(),
+        acont.max(),
     )
 
     return acont, sigmac, scont

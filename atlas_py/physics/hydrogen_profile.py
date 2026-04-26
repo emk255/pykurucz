@@ -8,7 +8,14 @@ from pathlib import Path
 import re
 
 import numpy as np
-from .trace_runtime import trace_emit, trace_in_focus
+
+try:
+    import numba
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    _NUMBA_AVAILABLE = False
+
+from .trace_runtime import trace_emit, trace_enabled, trace_in_focus
 
 _C_LIGHT_A = 2.99792458e18
 _C_LIGHT_CM = 2.99792458e10
@@ -463,6 +470,373 @@ def _sofbet(beta: float, p: float, n: int, m: int, tables: HydrogenProfileTables
     return (1.5 / sb + 27.0 / b2) / b2 * corr
 
 
+if _NUMBA_AVAILABLE:
+    @numba.njit(cache=True)
+    def _fastex_nb(x: float, extab: np.ndarray, extabf: np.ndarray) -> float:
+        if x < 0.0 or x >= 1001.0:
+            return 0.0
+        i = int(x)
+        j = int((x - float(i)) * 1000.0 + 1.5)
+        if j < 1:
+            j = 1
+        if j > 1001:
+            j = 1001
+        return float(extab[i] * extabf[j - 1])
+
+
+    @numba.njit(cache=True)
+    def _faste1_nb(x: float, faste1_tbl: np.ndarray) -> float:
+        if x > 20.0:
+            return 0.0
+        if x >= 0.5:
+            idx = int(x * 100.0 + 0.5)
+            if idx < 1:
+                idx = 1
+            if idx > 2000:
+                idx = 2000
+            return float(faste1_tbl[idx - 1])
+        if x <= 0.0:
+            return 0.0
+        return (1.0 - 0.22464 * x) * x - np.log(x) - 0.57721
+
+
+    @numba.njit(cache=True)
+    def _sofbet_nb(
+        beta: float,
+        p: float,
+        n: int,
+        m: int,
+        propbm: np.ndarray,
+        c_arr: np.ndarray,
+        d_arr: np.ndarray,
+        pp_arr: np.ndarray,
+        beta_arr: np.ndarray,
+    ) -> float:
+        corr = 1.0
+        b2 = beta * beta
+        sb = np.sqrt(max(beta, 1.0e-300))
+        if beta <= 500.0:
+            indx = 7
+            mmn = m - n
+            if n <= 3 and mmn <= 2:
+                indx = 2 * (n - 1) + mmn
+            im = min(int(5.0 * p) + 1, 4)
+            if im < 1:
+                im = 1
+            ip = im + 1
+            wtpp = 5.0 * (p - float(pp_arr[im - 1]))
+            wtpm = 1.0 - wtpp
+            if beta <= 25.12:
+                j = 1
+                for idx in range(beta_arr.size):
+                    if beta_arr[idx] >= beta:
+                        j = idx
+                        break
+                if j < 1:
+                    j = 1
+                if j > 14:
+                    j = 14
+                jm = j - 1
+                jp = j
+                denom = float(beta_arr[jp] - beta_arr[jm])
+                wtbp = 0.0 if denom == 0.0 else (beta - float(beta_arr[jm])) / denom
+                wtbm = 1.0 - wtbp
+                cbp = float(propbm[ip - 1, jp, indx - 1]) * wtpp + float(propbm[im - 1, jp, indx - 1]) * wtpm
+                cbm = float(propbm[ip - 1, jm, indx - 1]) * wtpp + float(propbm[im - 1, jm, indx - 1]) * wtpm
+                corr = 1.0 + cbp * wtbp + cbm * wtbm
+                pr1 = 0.0
+                pr2 = 0.0
+                wt = max(min(0.5 * (10.0 - beta), 1.0), 0.0)
+                if beta <= 10.0:
+                    pr1 = 8.0 / (83.0 + (2.0 + 0.95 * b2) * beta)
+                if beta >= 8.0:
+                    pr2 = (1.5 / sb + 27.0 / b2) / b2
+                return (pr1 * wt + pr2 * (1.0 - wt)) * corr
+            cc = float(c_arr[ip - 1, indx - 1]) * wtpp + float(c_arr[im - 1, indx - 1]) * wtpm
+            dd = float(d_arr[ip - 1, indx - 1]) * wtpp + float(d_arr[im - 1, indx - 1]) * wtpm
+            corr = 1.0 + dd / (cc + beta * sb)
+        return (1.5 / sb + 27.0 / b2) / b2 * corr
+
+
+    @numba.njit(cache=True)
+    def _stark_profile_nb(
+        n: int,
+        m: int,
+        dbeta: float,
+        c1con: float,
+        c2con: float,
+        y1num: float,
+        y1wht: float,
+        freq4: float,
+        delstark: float,
+        dop: float,
+        fo: float,
+        xne: float,
+        y1s: float,
+        y1b: float,
+        c1d: float,
+        c2d: float,
+        gcon1: float,
+        gcon2: float,
+        pp: float,
+        xnf_h2: float,
+        extab: np.ndarray,
+        extabf: np.ndarray,
+        faste1_tbl: np.ndarray,
+        propbm: np.ndarray,
+        c_arr: np.ndarray,
+        d_arr: np.ndarray,
+        pp_arr: np.ndarray,
+        beta_arr: np.ndarray,
+        cutoff_h2_plus: np.ndarray,
+    ) -> float:
+        if fo <= 0.0:
+            return 0.0
+        wty1 = 1.0 / (1.0 + xne / y1wht)
+        y1scal = y1num * y1s * wty1 + y1b * (1.0 - wty1)
+        c1 = c1d * c1con * y1scal
+        c2 = c2d * c2con
+        if c1 <= 0.0:
+            c1 = 0.0
+        if c2 <= 0.0:
+            c2 = 0.0
+        g1 = 6.77 * np.sqrt(max(c1, 0.0))
+        logterm = 0.0
+        if c1 > 0.0 and c2 > 0.0:
+            logterm = np.log(np.sqrt(c2) / c1)
+        gnot = g1 * max(0.0, 0.2114 + logterm) * (1.0 - gcon1 - gcon2)
+        beta = abs(delstark) / fo * dbeta
+        y1 = c1 * beta
+        y2 = c2 * beta * beta
+        gam = gnot
+        if not (y2 <= 1.0e-4 and y1 <= 1.0e-5):
+            gam = g1 * (
+                0.5 * _fastex_nb(min(80.0, y1), extab, extabf)
+                + _faste1_nb(y1, faste1_tbl)
+                - 0.5 * _faste1_nb(y2, faste1_tbl)
+            ) * (
+                1.0
+                - gcon1 / (1.0 + (90.0 * y1) ** 3)
+                - gcon2 / (1.0 + 2000.0 * y1)
+            )
+            if gam <= 1.0e-20:
+                gam = 0.0
+
+        prqs = _sofbet_nb(beta, pp, n, m, propbm, c_arr, d_arr, pp_arr, beta_arr)
+        hprof = 0.0
+        if m <= 2:
+            prqs = prqs * 0.5
+            if freq4 >= (82259.105 - 20000.0) * _C_LIGHT_CM:
+                if freq4 <= (82259.105 - 4000.0) * _C_LIGHT_CM:
+                    freq15000 = (82259.105 - 15000.0) * _C_LIGHT_CM
+                    spacing = 100.0 * _C_LIGHT_CM
+                    if freq4 < freq15000:
+                        cutoff = (cutoff_h2_plus[1] - cutoff_h2_plus[0]) / spacing * (freq4 - freq15000) + cutoff_h2_plus[0]
+                    else:
+                        icut = int((freq4 - freq15000) / spacing)
+                        if icut < 0:
+                            icut = 0
+                        if icut > cutoff_h2_plus.size - 2:
+                            icut = cutoff_h2_plus.size - 2
+                        cutfreq = icut * spacing + freq15000
+                        cutoff = (cutoff_h2_plus[icut + 1] - cutoff_h2_plus[icut]) / spacing * (freq4 - cutfreq) + cutoff_h2_plus[icut]
+                    cutoff = (10.0 ** (cutoff - 14.0)) / _C_LIGHT_CM * xnf_h2
+                    hprof += cutoff * _SQRT_PI_SCALE * dop
+                else:
+                    beta4000 = 4000.0 * _C_LIGHT_CM / fo * dbeta
+                    prqsp4000 = _sofbet_nb(beta4000, pp, n, m, propbm, c_arr, d_arr, pp_arr, beta_arr) * 0.5 / fo * dbeta
+                    cutoff4000 = (10.0 ** (-11.07 - 14.0)) / _C_LIGHT_CM * xnf_h2
+                    if prqsp4000 != 0.0:
+                        hprof += cutoff4000 / prqsp4000 * prqs / fo * dbeta * _SQRT_PI_SCALE * dop
+
+        f = 0.0
+        if gam > 0.0:
+            f = gam / _PI / (gam * gam + beta * beta)
+        p1 = (0.9 * y1) ** 2
+        fns = (p1 + 0.03 * np.sqrt(max(y1, 0.0))) / (p1 + 1.0)
+        hprof += (prqs * (1.0 + fns) + f) / fo * dbeta * _SQRT_PI_SCALE * dop
+        return hprof
+
+
+    @numba.njit(cache=True)
+    def _doppler_profile_nb(
+        finest: np.ndarray,
+        finswt: np.ndarray,
+        freqnm: float,
+        freq4: float,
+        dop: float,
+        extab: np.ndarray,
+        extabf: np.ndarray,
+    ) -> float:
+        out = 0.0
+        for i in range(finest.size):
+            d = abs(freq4 - freqnm - float(finest[i])) / dop
+            if d <= 7.0:
+                out += _fastex_nb(d * d, extab, extabf) * float(finswt[i])
+        return out
+
+
+    @numba.njit(cache=True)
+    def _lorentz_profile_nb(
+        n: int,
+        m: int,
+        freqnm: float,
+        wavenm: float,
+        radamp: float,
+        resont: float,
+        vdw: float,
+        freq4: float,
+        delt: float,
+        dop: float,
+        hwres: float,
+        hwvdw: float,
+        hwrad: float,
+        xnfp_h1: float,
+        cutoff_h2: np.ndarray,
+    ) -> float:
+        if n == 1 and m == 2:
+            hwres = hwres * 4.0
+            hwlor = hwres + hwvdw + hwrad
+            hhw = freqnm * hwlor
+            if freq4 > (82259.105 - 4000.0) * _C_LIGHT_CM:
+                hprofres = hwres * freqnm / _PI / (delt * delt + hhw * hhw) * _SQRT_PI_SCALE * dop
+            else:
+                cutoff = 0.0
+                if freq4 >= 50000.0 * _C_LIGHT_CM:
+                    spacing = 200.0 * _C_LIGHT_CM
+                    freq22000 = (82259.105 - 22000.0) * _C_LIGHT_CM
+                    if freq4 < freq22000:
+                        cutoff = (cutoff_h2[1] - cutoff_h2[0]) / spacing * (freq4 - freq22000) + cutoff_h2[0]
+                    else:
+                        icut = int((freq4 - freq22000) / spacing)
+                        if icut < 0:
+                            icut = 0
+                        if icut > cutoff_h2.size - 2:
+                            icut = cutoff_h2.size - 2
+                        cutfreq = icut * spacing + freq22000
+                        cutoff = (cutoff_h2[icut + 1] - cutoff_h2[icut]) / spacing * (freq4 - cutfreq) + cutoff_h2[icut]
+                    cutoff = (10.0 ** (cutoff - 14.0)) * xnfp_h1 * 2.0 / _C_LIGHT_CM
+                hprofres = cutoff * _SQRT_PI_SCALE * dop
+            hprofrad = hwrad * freqnm / _PI / (delt * delt + hhw * hhw) * _SQRT_PI_SCALE * dop
+            if freq4 <= 2.463e15:
+                hprofrad = 0.0
+            hprofvdw = hwvdw * freqnm / _PI / (delt * delt + hhw * hhw) * _SQRT_PI_SCALE * dop
+            if freq4 < 1.8e15:
+                hprofvdw = 0.0
+            return hprofres + hprofrad + hprofvdw
+
+        hhw = freqnm * (hwres + hwvdw + hwrad)
+        if hhw <= 0.0:
+            return 0.0
+        return hhw / _PI / (delt * delt + hhw * hhw) * _SQRT_PI_SCALE * dop
+
+
+    @numba.njit(cache=True)
+    def _profile_for_setup_nb(
+        n: int,
+        m: int,
+        freqnm: float,
+        wavenm: float,
+        dbeta: float,
+        c1con: float,
+        c2con: float,
+        radamp: float,
+        resont: float,
+        vdw: float,
+        stark: float,
+        y1num: float,
+        y1wht: float,
+        finest: np.ndarray,
+        finswt: np.ndarray,
+        j0: int,
+        delw_nm: float,
+        xne_arr: np.ndarray,
+        xnf_h1: np.ndarray,
+        xnf_h2: np.ndarray,
+        xnfp_h1: np.ndarray,
+        dopple_h1: np.ndarray,
+        fo_arr: np.ndarray,
+        pp_arr_h: np.ndarray,
+        y1s_arr: np.ndarray,
+        y1b_arr: np.ndarray,
+        t3nhe_arr: np.ndarray,
+        t3nh2_arr: np.ndarray,
+        c1d_arr: np.ndarray,
+        c2d_arr: np.ndarray,
+        gcon1_arr: np.ndarray,
+        gcon2_arr: np.ndarray,
+        extab: np.ndarray,
+        extabf: np.ndarray,
+        faste1_tbl: np.ndarray,
+        propbm: np.ndarray,
+        c_arr: np.ndarray,
+        d_arr: np.ndarray,
+        pp_tab: np.ndarray,
+        beta_arr: np.ndarray,
+        cutoff_h2: np.ndarray,
+        cutoff_h2_plus: np.ndarray,
+    ) -> float:
+        delstark = -10.0 * delw_nm / wavenm * freqnm
+        wl = wavenm + delw_nm * 10.0
+        if wl <= 0.0:
+            return 0.0
+        freq4 = _C_LIGHT_A / wl
+        delt = abs(freq4 - freqnm)
+        dopple = float(dopple_h1[j0])
+        if dopple <= 0.0:
+            return 0.0
+        hwstk = stark * float(fo_arr[j0])
+        hwvdw = vdw * float(t3nhe_arr[j0]) + 2.0 * vdw * float(t3nh2_arr[j0])
+        hwrad = radamp
+        hwres = resont * float(xnf_h1[j0])
+        hwlor = hwres + hwvdw + hwrad
+        nwid = 1
+        if not (dopple >= hwstk and dopple >= hwlor):
+            nwid = 2
+            if hwlor < hwstk:
+                nwid = 3
+        hfwid = freqnm * max(dopple, hwlor, hwstk)
+        ifcore = abs(delt) <= hfwid
+        dop = freqnm * dopple
+        if dop <= 0.0:
+            return 0.0
+        out = 0.0
+        if ifcore:
+            if nwid == 1:
+                out = _doppler_profile_nb(finest, finswt, freqnm, freq4, dop, extab, extabf)
+            elif nwid == 2:
+                out = _lorentz_profile_nb(
+                    n, m, freqnm, wavenm, radamp, resont, vdw, freq4, delt, dop,
+                    hwres, hwvdw, hwrad, float(xnfp_h1[j0]), cutoff_h2,
+                )
+            else:
+                out = _stark_profile_nb(
+                    n, m, dbeta, c1con, c2con, y1num, y1wht, freq4, delstark, dop,
+                    float(fo_arr[j0]), float(xne_arr[j0]), float(y1s_arr[j0]), float(y1b_arr[j0]),
+                    float(c1d_arr[j0]), float(c2d_arr[j0]), float(gcon1_arr[j0]), float(gcon2_arr[j0]),
+                    float(pp_arr_h[j0]), float(xnf_h2[j0]), extab, extabf, faste1_tbl, propbm,
+                    c_arr, d_arr, pp_tab, beta_arr, cutoff_h2_plus,
+                )
+        else:
+            out = (
+                _doppler_profile_nb(finest, finswt, freqnm, freq4, dop, extab, extabf)
+                + _lorentz_profile_nb(
+                    n, m, freqnm, wavenm, radamp, resont, vdw, freq4, delt, dop,
+                    hwres, hwvdw, hwrad, float(xnfp_h1[j0]), cutoff_h2,
+                )
+                + _stark_profile_nb(
+                    n, m, dbeta, c1con, c2con, y1num, y1wht, freq4, delstark, dop,
+                    float(fo_arr[j0]), float(xne_arr[j0]), float(y1s_arr[j0]), float(y1b_arr[j0]),
+                    float(c1d_arr[j0]), float(c2d_arr[j0]), float(gcon1_arr[j0]), float(gcon2_arr[j0]),
+                    float(pp_arr_h[j0]), float(xnf_h2[j0]), extab, extabf, faste1_tbl, propbm,
+                    c_arr, d_arr, pp_tab, beta_arr, cutoff_h2_plus,
+                )
+            )
+        if out < 0.0:
+            return 0.0
+        return out
+
+
 @dataclass(frozen=True)
 class _LineSetup:
     n: int
@@ -505,6 +879,8 @@ class HydrogenProfileEvaluator:
     gcon2: np.ndarray = field(init=False)
     extab: np.ndarray = field(init=False)
     extabf: np.ndarray = field(init=False)
+    faste1_tbl: np.ndarray = field(init=False)
+    trace_active: bool = field(init=False)
     _line_cache: dict[tuple[int, int], _LineSetup] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -534,6 +910,8 @@ class HydrogenProfileEvaluator:
         self.gcon1 = 0.2 + 0.09 * np.sqrt(np.maximum(t4, 0.0)) / (1.0 + xne / 1.0e13)
         self.gcon2 = 0.2 / (1.0 + xne / 1.0e15)
         self.extab, self.extabf = _build_exptabs()
+        self.faste1_tbl = _faste1_table()
+        self.trace_active = trace_enabled()
         self._line_cache: dict[tuple[int, int], _LineSetup] = {}
 
     def _line_setup(self, n: int, m: int) -> _LineSetup | None:
@@ -627,7 +1005,70 @@ class HydrogenProfileEvaluator:
         setup = self._line_setup(int(n), int(m))
         if setup is None:
             return 0.0
+        return self.profile_for_setup(
+            setup,
+            j,
+            delw_nm,
+            trace_line_1b=trace_line_1b,
+            trace_nu_1b=trace_nu_1b,
+        )
+
+    def profile_for_setup(
+        self,
+        setup: _LineSetup,
+        j: int,
+        delw_nm: float,
+        trace_line_1b: int = -1,
+        trace_nu_1b: int = 0,
+    ) -> float:
         j0 = int(j)
+        if _NUMBA_AVAILABLE and not self.trace_active:
+            return float(
+                _profile_for_setup_nb(
+                    setup.n,
+                    setup.m,
+                    setup.freqnm,
+                    setup.wavenm,
+                    setup.dbeta,
+                    setup.c1con,
+                    setup.c2con,
+                    setup.radamp,
+                    setup.resont,
+                    setup.vdw,
+                    setup.stark,
+                    setup.y1num,
+                    setup.y1wht,
+                    setup.finest,
+                    setup.finswt,
+                    j0,
+                    float(delw_nm),
+                    self.xne,
+                    self.xnf_h1,
+                    self.xnf_h2,
+                    self.xnfp_h1,
+                    self.dopple_h1,
+                    self.fo,
+                    self.pp,
+                    self.y1s,
+                    self.y1b,
+                    self.t3nhe,
+                    self.t3nh2,
+                    self.c1d,
+                    self.c2d,
+                    self.gcon1,
+                    self.gcon2,
+                    self.extab,
+                    self.extabf,
+                    self.faste1_tbl,
+                    self.tables.propbm,
+                    self.tables.c,
+                    self.tables.d,
+                    self.tables.pp,
+                    self.tables.beta,
+                    self.tables.cutoff_h2,
+                    self.tables.cutoff_h2_plus,
+                )
+            )
         delstark = -10.0 * float(delw_nm) / setup.wavenm * setup.freqnm
         wl = setup.wavenm + float(delw_nm) * 10.0
         if wl <= 0.0:
@@ -668,7 +1109,7 @@ class HydrogenProfileEvaluator:
                 0.0,
             )
         wl_nm = wl / 10.0
-        if trace_in_focus(wlvac_nm=wl_nm, j0=j0):
+        if self.trace_active and trace_in_focus(wlvac_nm=wl_nm, j0=j0):
             trace_emit(
                 event="hprof4_return",
                 iter_num=1,
@@ -687,6 +1128,18 @@ class HydrogenProfileEvaluator:
         return out
 
     def _doppler_profile(self, setup: _LineSetup, freq4: float, dop: float) -> float:
+        if _NUMBA_AVAILABLE:
+            return float(
+                _doppler_profile_nb(
+                    setup.finest,
+                    setup.finswt,
+                    setup.freqnm,
+                    freq4,
+                    dop,
+                    self.extab,
+                    self.extabf,
+                )
+            )
         out = 0.0
         for offset, wt in zip(setup.finest, setup.finswt, strict=False):
             d = abs(freq4 - setup.freqnm - float(offset)) / dop
@@ -705,6 +1158,26 @@ class HydrogenProfileEvaluator:
         hwvdw: float,
         hwrad: float,
     ) -> float:
+        if _NUMBA_AVAILABLE:
+            return float(
+                _lorentz_profile_nb(
+                    setup.n,
+                    setup.m,
+                    setup.freqnm,
+                    setup.wavenm,
+                    setup.radamp,
+                    setup.resont,
+                    setup.vdw,
+                    freq4,
+                    delt,
+                    dop,
+                    hwres,
+                    hwvdw,
+                    hwrad,
+                    float(self.xnfp_h1[j0]),
+                    self.tables.cutoff_h2,
+                )
+            )
         n = setup.n
         m = setup.m
         if n == 1 and m == 2:
@@ -744,6 +1217,40 @@ class HydrogenProfileEvaluator:
         return hhw / _PI / (delt * delt + hhw * hhw) * _SQRT_PI_SCALE * dop
 
     def _stark_profile(self, setup: _LineSetup, j0: int, freq4: float, delstark: float, dop: float) -> float:
+        if _NUMBA_AVAILABLE:
+            return float(
+                _stark_profile_nb(
+                    setup.n,
+                    setup.m,
+                    setup.dbeta,
+                    setup.c1con,
+                    setup.c2con,
+                    setup.y1num,
+                    setup.y1wht,
+                    freq4,
+                    delstark,
+                    dop,
+                    float(self.fo[j0]),
+                    float(self.xne[j0]),
+                    float(self.y1s[j0]),
+                    float(self.y1b[j0]),
+                    float(self.c1d[j0]),
+                    float(self.c2d[j0]),
+                    float(self.gcon1[j0]),
+                    float(self.gcon2[j0]),
+                    float(self.pp[j0]),
+                    float(self.xnf_h2[j0]),
+                    self.extab,
+                    self.extabf,
+                    self.faste1_tbl,
+                    self.tables.propbm,
+                    self.tables.c,
+                    self.tables.d,
+                    self.tables.pp,
+                    self.tables.beta,
+                    self.tables.cutoff_h2_plus,
+                )
+            )
         fo = float(self.fo[j0])
         if fo <= 0.0:
             return 0.0
