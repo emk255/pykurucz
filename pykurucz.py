@@ -568,7 +568,7 @@ def synthesize(
     use_molecular_lines: bool = True,
     include_tio: bool = True,
     include_h2o: bool = True,
-    atlas_iterations: int = 1,
+    atlas_iterations: int = 30,
     n_workers: Optional[int] = None,
 ) -> Path:
     """Generate a synthetic spectrum from stellar parameters.
@@ -609,8 +609,8 @@ def synthesize(
     include_tio, include_h2o : bool
         Include Schwenke TiO / Partridge–Schwenke H₂O (default True).
     atlas_iterations : int
-        Number of atlas_py outer iterations (default 1 for quick runs; use
-        30 to match the full Fortran-style validation pipeline).
+        Number of atlas_py outer iterations (default 30, matching the full
+        Fortran-style validation/convergence pipeline).
     n_workers : int, optional
         Worker count for synthe_py.cli (default: all logical CPUs).
 
@@ -756,8 +756,8 @@ Examples:
   # Low-resolution run
   python pykurucz.py --teff 5770 --logg 4.44 --resolution 50000
 
-  # Full ATLAS-style iteration count used in end-to-end Fortran validation
-  python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 30
+  # Fast diagnostic atmosphere pass only (not recommended for science output)
+  python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 1
 
 Notes:
   --mh scales ALL metals uniformly (like [Fe/H] in a standard grid).
@@ -803,10 +803,10 @@ Notes:
     parser.add_argument(
         "--atlas-iterations",
         type=int,
-        default=1,
+        default=30,
         help=(
-            "Number of atlas_py atmosphere iterations (default: 1 for quick runs; "
-            "use 30 for the full Fortran-style validation/convergence path)."
+            "Number of atlas_py atmosphere iterations (default: 30 for the full "
+            "Fortran-style validation/convergence path; use 1 only for fast diagnostics)."
         ),
     )
     parser.add_argument("--output-dir", type=str, default=None,

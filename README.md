@@ -101,11 +101,11 @@ python -m synthe_py.cli path/to/model.atm lines/gfallvac.latest \
 pip install torch
 python pykurucz.py --teff 5770 --logg 4.44 --wl-start 500 --wl-end 510
 
-# Full ATLAS-style atmosphere iteration count used in validation
-python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 30
+# Fast diagnostic atmosphere pass only, not recommended for science output
+python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 1
 ```
 
-Both produce a `.spec` file with wavelength, flux, and continuum columns. Use a narrow wavelength range (like 500–510 nm above) for a quick first run; the full 300–1800 nm range is slower but covers the complete optical+NIR.
+Both produce a `.spec` file with wavelength, flux, and continuum columns. By default, `pykurucz.py` runs 30 `atlas_py` atmosphere iterations so the model is not left at the warm-start/single-step stage. Use a narrow wavelength range (like 500–510 nm above) for a quicker first run; the full 300–1800 nm range is slower but covers the complete optical+NIR.
 
 
 ## Why this exists
@@ -159,7 +159,7 @@ kurucz-a1 emulator ──► warm-start .atm ──► atlas_py (MOLECULES ON)
                                      └──► iterated .atm ──► synthe_py ──► .spec
 ```
 
-The emulator plays the same role as `READ DECK6` in the Fortran pipeline: it supplies the starting layer structure so that `atlas_py` converges quickly rather than starting from a grey approximation. `atlas_py` then self-consistently iterates the atmospheric structure with the same physics as Fortran ATLAS12 (always `MOLECULES ON`, matching the Fortran deck), so the downstream SYNTHE spectrum stays in parity with Fortran references. The CLI defaults to one atmosphere iteration for quick exploratory runs; use `--atlas-iterations 30` for the full Fortran-style validation/convergence path.
+The emulator plays the same role as `READ DECK6` in the Fortran pipeline: it supplies the starting layer structure so that `atlas_py` converges quickly rather than starting from a grey approximation. `atlas_py` then self-consistently iterates the atmospheric structure with the same physics as Fortran ATLAS12 (always `MOLECULES ON`, matching the Fortran deck), so the downstream SYNTHE spectrum stays in parity with Fortran references. The CLI defaults to 30 atmosphere iterations, matching the full Fortran-style validation/convergence path; use `--atlas-iterations 1` only for fast diagnostics.
 
 Requires `data/` to be populated once via `python scripts/download_data.py` (see Quick start above).
 
@@ -167,8 +167,8 @@ Requires `data/` to be populated once via `python scripts/download_data.py` (see
 # Solar-type star, full wavelength range
 python pykurucz.py --teff 5770 --logg 4.44
 
-# Same star with the full ATLAS-style iteration count
-python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 30
+# Fast diagnostic atmosphere pass only (not recommended for science output)
+python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 1
 
 # Metal-poor K giant with alpha enhancement
 python pykurucz.py --teff 4500 --logg 2.0 --mh -1.5 --am 0.3
@@ -267,7 +267,7 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
               (wavelength, flux, continuum)
 ```
 
-**Stage 1 — Atmosphere**: Mode A reads your `.atm` file directly. Mode B runs the kurucz-a1 emulator for a warm-start and then iterates it with `atlas_py` (full Python ATLAS12, `MOLECULES ON`). The default is one iteration for faster exploratory runs; pass `--atlas-iterations 30` when you want the full Fortran-style iteration count used in end-to-end validation.
+**Stage 1 — Atmosphere**: Mode A reads your `.atm` file directly. Mode B runs the kurucz-a1 emulator for a warm-start and then iterates it with `atlas_py` (full Python ATLAS12, `MOLECULES ON`). The default is 30 iterations, matching the full Fortran-style iteration count used in end-to-end validation; pass `--atlas-iterations 1` only when you intentionally want a fast diagnostic atmosphere pass.
 
 **Stage 2 — Preprocessing** (`convert_atm_to_npz.py`): Reads the `.atm` file and computes Saha–Boltzmann populations, molecular equilibrium (~300 species), continuous opacity coefficients (H⁻, H I, He, metals, scattering), and Doppler widths at each atmospheric layer.
 
