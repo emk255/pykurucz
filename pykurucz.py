@@ -351,6 +351,9 @@ def run_atlas_py(
     kurucz_root: Optional[Path] = None,
     iterations: int = 1,
     fort12_bin: Optional[Path] = None,
+    convergence_epsilon: Optional[float] = None,
+    convergence_min_iterations: int = 5,
+    convergence_consecutive: int = 1,
 ) -> Path:
     """Run ``atlas_py.cli`` on *input_atm* and write iterated output to *output_atm*.
 
@@ -378,6 +381,9 @@ def run_atlas_py(
         Optional Fortran ``fort12`` line-selection binary to replay for
         exact parity with a previous Fortran ATLAS run.  Used only by the
         validation harness — unused in the user-facing flow.
+    convergence_epsilon:
+        Optional early-stop threshold on max normalized changes across
+        physical atmosphere columns.  ``iterations`` remains the maximum.
     """
     root = (kurucz_root or _default_kurucz_root()).resolve()
     lines_dir = root / "lines"
@@ -419,6 +425,14 @@ def run_atlas_py(
         "--enable-molecules",
         "--molecules", str(molecules_new),
     ]
+    if convergence_epsilon is not None:
+        cmd.extend(
+            [
+                "--convergence-epsilon", str(convergence_epsilon),
+                "--convergence-min-iterations", str(convergence_min_iterations),
+                "--convergence-consecutive", str(convergence_consecutive),
+            ]
+        )
     if fort12_bin is not None and fort12_bin.exists():
         cmd.extend(["--line-selection-bin", str(fort12_bin)])
 
@@ -569,6 +583,9 @@ def synthesize(
     include_tio: bool = True,
     include_h2o: bool = True,
     atlas_iterations: int = 30,
+    atlas_convergence_epsilon: Optional[float] = 1.0e-3,
+    atlas_convergence_min_iterations: int = 5,
+    atlas_convergence_consecutive: int = 1,
     n_workers: Optional[int] = None,
 ) -> Path:
     """Generate a synthetic spectrum from stellar parameters.
@@ -609,8 +626,10 @@ def synthesize(
     include_tio, include_h2o : bool
         Include Schwenke TiO / Partridge–Schwenke H₂O (default True).
     atlas_iterations : int
-        Number of atlas_py outer iterations (default 30, matching the full
-        Fortran-style validation/convergence pipeline).
+        Maximum number of atlas_py outer iterations (default 30).
+    atlas_convergence_epsilon : float, optional
+        Early-stop threshold on physical atmosphere column changes.  Defaults
+        to 1e-3; set to None to force all ``atlas_iterations``.
     n_workers : int, optional
         Worker count for synthe_py.cli (default: all logical CPUs).
 
@@ -691,6 +710,9 @@ def synthesize(
             output_atm=atm_path,
             log_path=atlas_log,
             iterations=atlas_iterations,
+            convergence_epsilon=atlas_convergence_epsilon,
+            convergence_min_iterations=atlas_convergence_min_iterations,
+            convergence_consecutive=atlas_convergence_consecutive,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"ERROR in atlas_py: {exc}")
@@ -805,9 +827,35 @@ Notes:
         type=int,
         default=30,
         help=(
-            "Number of atlas_py atmosphere iterations (default: 30 for the full "
-            "Fortran-style validation/convergence path; use 1 only for fast diagnostics)."
+            "Maximum number of atlas_py atmosphere iterations (default: 30; "
+            "early convergence may stop sooner unless disabled)."
         ),
+    )
+    parser.add_argument(
+        "--atlas-convergence-epsilon",
+        type=float,
+        default=1.0e-3,
+        help=(
+            "Early-stop threshold for physical atmosphere column changes "
+            "(default: 1e-3; use --no-atlas-convergence to force all iterations)."
+        ),
+    )
+    parser.add_argument(
+        "--atlas-convergence-min-iterations",
+        type=int,
+        default=5,
+        help="Minimum atlas_py iterations before early stopping can trigger (default: 5).",
+    )
+    parser.add_argument(
+        "--atlas-convergence-consecutive",
+        type=int,
+        default=1,
+        help="Consecutive converged iterations required before early stopping (default: 1).",
+    )
+    parser.add_argument(
+        "--no-atlas-convergence",
+        action="store_true",
+        help="Disable convergence early stopping and run exactly --atlas-iterations.",
     )
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: results/)")
@@ -833,6 +881,15 @@ Notes:
     atlas_iterations = int(args.atlas_iterations)
     if atlas_iterations < 1:
         parser.error("--atlas-iterations must be >= 1")
+    if args.atlas_convergence_min_iterations < 1:
+        parser.error("--atlas-convergence-min-iterations must be >= 1")
+    if args.atlas_convergence_consecutive < 1:
+        parser.error("--atlas-convergence-consecutive must be >= 1")
+    atlas_convergence_epsilon = (
+        None if args.no_atlas_convergence else float(args.atlas_convergence_epsilon)
+    )
+    if atlas_convergence_epsilon is not None and atlas_convergence_epsilon <= 0.0:
+        parser.error("--atlas-convergence-epsilon must be positive")
 
     individual = None
     if args.abund:
@@ -848,6 +905,9 @@ Notes:
         wl_end=args.wl_end,
         resolution=args.resolution,
         atlas_iterations=atlas_iterations,
+        atlas_convergence_epsilon=atlas_convergence_epsilon,
+        atlas_convergence_min_iterations=args.atlas_convergence_min_iterations,
+        atlas_convergence_consecutive=args.atlas_convergence_consecutive,
         abundances=individual,
         output_dir=args.output_dir,
         use_molecular_lines=not args.no_molecular_lines,

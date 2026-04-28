@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 
 from numba import jit
@@ -204,10 +206,24 @@ def _xkarsas_grid_jit(
     return out
 
 
+_XKARSAS_GRID_CACHE: dict[tuple[tuple[int, str, bytes], float, int, int], np.ndarray] = {}
+
+
+def _freq_grid_cache_key(freq: np.ndarray) -> tuple[np.ndarray, tuple[int, str, bytes]]:
+    freq_arr = np.ascontiguousarray(freq, dtype=np.float64)
+    digest = hashlib.blake2b(freq_arr.view(np.uint8), digest_size=16).digest()
+    return freq_arr, (int(freq_arr.size), freq_arr.dtype.str, digest)
+
+
 def xkarsas_grid(freq: np.ndarray, zeff_squared: float, n: int, ell: int) -> np.ndarray:
     """Return Karsas cross-sections for a frequency grid."""
-    return _xkarsas_grid_jit(
-        np.asarray(freq, dtype=np.float64),
+    freq_arr, freq_key = _freq_grid_cache_key(freq)
+    key = (freq_key, float(zeff_squared), int(n), int(ell))
+    cached = _XKARSAS_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached.copy()
+    out = _xkarsas_grid_jit(
+        freq_arr,
         zeff_squared,
         n,
         ell,
@@ -217,3 +233,5 @@ def xkarsas_grid(freq: np.ndarray, zeff_squared: float, n: int, ell: int) -> np.
         EKARSAS,
         LN10,
     )
+    _XKARSAS_GRID_CACHE[key] = out
+    return out.copy()

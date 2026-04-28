@@ -74,6 +74,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional .npz output path for internal EOS state arrays",
     )
+    parser.add_argument(
+        "--convergence-epsilon",
+        type=float,
+        default=None,
+        help=(
+            "Optional early-stop threshold on max normalized change across "
+            "physical atmosphere columns (RHOX,T,P,XNE,ABROSS,VTURB). "
+            "Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--convergence-min-iterations",
+        type=int,
+        default=5,
+        help="Minimum iterations before convergence early stopping can trigger (default: 5)",
+    )
+    parser.add_argument(
+        "--convergence-consecutive",
+        type=int,
+        default=1,
+        help="Consecutive converged iterations required before early stopping (default: 1)",
+    )
     return parser
 
 
@@ -104,6 +126,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         iterations=args.iterations,
         enable_molecules=args.enable_molecules,
+        convergence_epsilon=args.convergence_epsilon,
+        convergence_min_iterations=args.convergence_min_iterations,
+        convergence_consecutive=args.convergence_consecutive,
     )
     run_atlas(cfg)
     return 0

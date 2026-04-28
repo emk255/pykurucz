@@ -105,7 +105,7 @@ python pykurucz.py --teff 5770 --logg 4.44 --wl-start 500 --wl-end 510
 python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 1
 ```
 
-Both produce a `.spec` file with wavelength, flux, and continuum columns. By default, `pykurucz.py` runs 30 `atlas_py` atmosphere iterations so the model is not left at the warm-start/single-step stage. Use a narrow wavelength range (like 500–510 nm above) for a quicker first run; the full 300–1800 nm range is slower but covers the complete optical+NIR.
+Both produce a `.spec` file with wavelength, flux, and continuum columns. By default, `pykurucz.py` allows up to 30 `atlas_py` atmosphere iterations so the model is not left at the warm-start/single-step stage, but it can stop earlier once the physical atmosphere columns converge (`--atlas-convergence-epsilon`, default `1e-3`). Use `--no-atlas-convergence` to force all requested iterations. Use a narrow wavelength range (like 500-510 nm above) for a quicker first run; the full 300-1800 nm range is slower but covers the complete optical+NIR.
 
 
 ## Why this exists
@@ -159,7 +159,7 @@ kurucz-a1 emulator ──► warm-start .atm ──► atlas_py (MOLECULES ON)
                                      └──► iterated .atm ──► synthe_py ──► .spec
 ```
 
-The emulator plays the same role as `READ DECK6` in the Fortran pipeline: it supplies the starting layer structure so that `atlas_py` converges quickly rather than starting from a grey approximation. `atlas_py` then self-consistently iterates the atmospheric structure with the same physics as Fortran ATLAS12 (always `MOLECULES ON`, matching the Fortran deck), so the downstream SYNTHE spectrum stays in parity with Fortran references. The CLI defaults to 30 atmosphere iterations, matching the full Fortran-style validation/convergence path; use `--atlas-iterations 1` only for fast diagnostics.
+The emulator plays the same role as `READ DECK6` in the Fortran pipeline: it supplies the starting layer structure so that `atlas_py` converges quickly rather than starting from a grey approximation. `atlas_py` then self-consistently iterates the atmospheric structure with the same physics as Fortran ATLAS12 (always `MOLECULES ON`, matching the Fortran deck), so the downstream SYNTHE spectrum stays in parity with Fortran references. The CLI defaults to a maximum of 30 atmosphere iterations, matching the full Fortran-style validation/convergence path, and stops early when the physical columns (`RHOX`, `T`, `P`, `XNE`, `ABROSS`, `VTURB`) change by less than `1e-3` after at least five iterations. `ACCRAD` is logged as a diagnostic but is not part of the stop rule. Use `--no-atlas-convergence` to force the full iteration count, or `--atlas-iterations 1` only for fast diagnostics.
 
 Requires `data/` to be populated once via `python scripts/download_data.py` (see Quick start above).
 
@@ -169,6 +169,9 @@ python pykurucz.py --teff 5770 --logg 4.44
 
 # Fast diagnostic atmosphere pass only (not recommended for science output)
 python pykurucz.py --teff 5770 --logg 4.44 --atlas-iterations 1
+
+# Force all 30 atmosphere iterations, disabling convergence early stopping
+python pykurucz.py --teff 5770 --logg 4.44 --no-atlas-convergence
 
 # Metal-poor K giant with alpha enhancement
 python pykurucz.py --teff 4500 --logg 2.0 --mh -1.5 --am 0.3
@@ -217,7 +220,9 @@ Plus supporting physics: Saha–Boltzmann populations with detailed partition fu
 
 ### Validated against the Fortran original
 
-Both codes were run with identical inputs: same `.atm` files, same line list, same wavelength range (300–1800 nm), same resolution (R=300,000). The end-to-end `atlas_py` + `synthe_py` validation uses normalized flux (`F/F_cont`) as the scientific comparison target; recent 30-iteration checks across six stellar atmospheres passed with no wavelength exceeding the `0.10` outlier threshold.
+Both codes were run with identical inputs: same `.atm` files, same line list, same wavelength range (300–1800 nm), same resolution (R=300,000). The end-to-end `atlas_py` + `synthe_py` validation uses normalized flux (`F/F_cont`) as the scientific comparison target; matched Fortran-reference checks are counted only when the Fortran ATLAS30 → SYNTHE pipeline itself produces a valid reference spectrum. For those valid matched references, recent checks passed with no wavelength exceeding the `0.10` outlier threshold.
+
+Very cool, edge-of-grid giants can be difficult for the original Fortran validation pipeline as well; if Fortran ATLAS30 or Fortran SYNTHE cannot produce a clean reference spectrum for a case, that case is treated as an invalid reference sample rather than a Python pass/fail. Use such edge cases cautiously until a trusted external atmosphere/reference is available.
 
 | Model | $T_{\text{eff}}$ | $\log g$ | Type | Median Δ | 95th pctl | 99th pctl |
 |-------|-------|-------|------|----------|-----------|-----------|
@@ -267,7 +272,7 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
               (wavelength, flux, continuum)
 ```
 
-**Stage 1 — Atmosphere**: Mode A reads your `.atm` file directly. Mode B runs the kurucz-a1 emulator for a warm-start and then iterates it with `atlas_py` (full Python ATLAS12, `MOLECULES ON`). The default is 30 iterations, matching the full Fortran-style iteration count used in end-to-end validation; pass `--atlas-iterations 1` only when you intentionally want a fast diagnostic atmosphere pass.
+**Stage 1 — Atmosphere**: Mode A reads your `.atm` file directly. Mode B runs the kurucz-a1 emulator for a warm-start and then iterates it with `atlas_py` (full Python ATLAS12, `MOLECULES ON`). The default is `--atlas-iterations 30` as the maximum, with convergence early stopping enabled at `--atlas-convergence-epsilon 1e-3` after at least five iterations. Pass `--no-atlas-convergence` when you intentionally want exactly the full iteration count, or `--atlas-iterations 1` only when you want a fast diagnostic atmosphere pass.
 
 **Stage 2 — Preprocessing** (`convert_atm_to_npz.py`): Reads the `.atm` file and computes Saha–Boltzmann populations, molecular equilibrium (~300 species), continuous opacity coefficients (H⁻, H I, He, metals, scattering), and Doppler widths at each atmospheric layer.
 
@@ -428,6 +433,11 @@ python pykurucz.py --teff <Teff> --logg <logg> [options]
 | `--wl-start` | 300 | Start wavelength (nm) |
 | `--wl-end` | 1800 | End wavelength (nm) |
 | `--resolution` | 300000 | Resolving power $\lambda / \Delta\lambda$ |
+| `--atlas-iterations` | 30 | Maximum number of `atlas_py` atmosphere iterations |
+| `--atlas-convergence-epsilon` | 1e-3 | Early-stop threshold on physical atmosphere column changes |
+| `--atlas-convergence-min-iterations` | 5 | Minimum iterations before convergence early stopping can trigger |
+| `--atlas-convergence-consecutive` | 1 | Consecutive converged iterations required before stopping |
+| `--no-atlas-convergence` | off | Disable convergence early stopping and run exactly `--atlas-iterations` |
 | `--output-dir` | results/ | Output directory |
 | `--no-molecular-lines` | off | Disable all molecular line opacity (GFALL only) |
 | `--no-tio` | off | Exclude Schwenke TiO (when molecular lines are enabled) |

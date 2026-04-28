@@ -16,7 +16,10 @@ except ImportError:
 
 from .hydrogen_profile import (
     HydrogenProfileEvaluator,
-    _profile_for_setup_nb,
+    _C_LIGHT_A,
+    _doppler_profile_nb,
+    _lorentz_profile_nb,
+    _stark_profile_nb,
     compute_xnh2,
     load_hydrogen_profile_tables_from_atlas12,
 )
@@ -749,6 +752,94 @@ if _NUMBA_AVAILABLE:
             lineused += 1
         return xlines, lineused
 
+    @_njit
+    def _profile_for_setup_precomputed_nb(
+        n: int,
+        m: int,
+        freqnm: float,
+        wavenm: float,
+        dbeta: float,
+        c1con: float,
+        c2con: float,
+        radamp: float,
+        resont: float,
+        vdw: float,
+        y1num: float,
+        y1wht: float,
+        finest: np.ndarray,
+        finswt: np.ndarray,
+        delw_nm: float,
+        dopple: float,
+        dop: float,
+        hwres: float,
+        hwvdw: float,
+        hwrad: float,
+        hwlor: float,
+        hfwid: float,
+        nwid: int,
+        fo_j: float,
+        xne_j: float,
+        y1s_j: float,
+        y1b_j: float,
+        c1d_j: float,
+        c2d_j: float,
+        gcon1_j: float,
+        gcon2_j: float,
+        pp_h_j: float,
+        xnf_h2_j: float,
+        xnfp_h1_j: float,
+        extab: np.ndarray,
+        extabf: np.ndarray,
+        faste1_tbl: np.ndarray,
+        propbm: np.ndarray,
+        c_arr: np.ndarray,
+        d_arr: np.ndarray,
+        pp_tab: np.ndarray,
+        beta_arr: np.ndarray,
+        cutoff_h2: np.ndarray,
+        cutoff_h2_plus: np.ndarray,
+    ) -> float:
+        wl = wavenm + delw_nm * 10.0
+        if wl <= 0.0 or dopple <= 0.0 or dop <= 0.0:
+            return 0.0
+        freq4 = _C_LIGHT_A / wl
+        delt = abs(freq4 - freqnm)
+        delstark = -10.0 * delw_nm / wavenm * freqnm
+        ifcore = abs(delt) <= hfwid
+        out = 0.0
+        if ifcore:
+            if nwid == 1:
+                out = _doppler_profile_nb(finest, finswt, freqnm, freq4, dop, extab, extabf)
+            elif nwid == 2:
+                out = _lorentz_profile_nb(
+                    n, m, freqnm, wavenm, radamp, resont, vdw, freq4, delt, dop,
+                    hwres, hwvdw, hwrad, xnfp_h1_j, cutoff_h2,
+                )
+            else:
+                out = _stark_profile_nb(
+                    n, m, dbeta, c1con, c2con, y1num, y1wht, freq4, delstark, dop,
+                    fo_j, xne_j, y1s_j, y1b_j, c1d_j, c2d_j, gcon1_j, gcon2_j,
+                    pp_h_j, xnf_h2_j, extab, extabf, faste1_tbl, propbm, c_arr,
+                    d_arr, pp_tab, beta_arr, cutoff_h2_plus,
+                )
+        else:
+            out = (
+                _doppler_profile_nb(finest, finswt, freqnm, freq4, dop, extab, extabf)
+                + _lorentz_profile_nb(
+                    n, m, freqnm, wavenm, radamp, resont, vdw, freq4, delt, dop,
+                    hwres, hwvdw, hwrad, xnfp_h1_j, cutoff_h2,
+                )
+                + _stark_profile_nb(
+                    n, m, dbeta, c1con, c2con, y1num, y1wht, freq4, delstark, dop,
+                    fo_j, xne_j, y1s_j, y1b_j, c1d_j, c2d_j, gcon1_j, gcon2_j,
+                    pp_h_j, xnf_h2_j, extab, extabf, faste1_tbl, propbm, c_arr,
+                    d_arr, pp_tab, beta_arr, cutoff_h2_plus,
+                )
+            )
+        if out < 0.0:
+            return 0.0
+        return out
+
     @_njit_parallel
     def _xlinop_type_minus1_kernel_nb(
         xlines,
@@ -853,6 +944,29 @@ if _NUMBA_AVAILABLE:
                 if den == 0.0:
                     continue
                 wcon = 1.0e7 / den
+                dopple = float(dopple_h1[j0])
+                if dopple <= 0.0:
+                    continue
+                setup_freq = float(setup_freqnm[iline])
+                setup_vdw_i = float(setup_vdw[iline])
+                setup_resont_i = float(setup_resont[iline])
+                setup_radamp_i = float(setup_radamp[iline])
+                setup_stark_i = float(setup_stark[iline])
+                fo_j = float(fo_arr[j0])
+                hwstk = setup_stark_i * fo_j
+                hwvdw = setup_vdw_i * float(t3nhe_arr[j0]) + 2.0 * setup_vdw_i * float(t3nh2_arr[j0])
+                hwrad = setup_radamp_i
+                hwres = setup_resont_i * float(xnf_h1[j0])
+                hwlor = hwres + hwvdw + hwrad
+                nwid = 1
+                if not (dopple >= hwstk and dopple >= hwlor):
+                    nwid = 2
+                    if hwlor < hwstk:
+                        nwid = 3
+                hfwid = setup_freq * max(dopple, hwlor, hwstk)
+                dop = setup_freq * dopple
+                if dop <= 0.0:
+                    continue
 
                 ired_hi = min(nu0 + 2001, numnu)
                 for iw in range(nu0, ired_hi):
@@ -860,39 +974,41 @@ if _NUMBA_AVAILABLE:
                         continue
                     delw = np.float32(float(waveset[iw]) - wlvac)
                     hprof = np.float32(
-                        _profile_for_setup_nb(
+                        _profile_for_setup_precomputed_nb(
                             int(setup_n[iline]),
                             int(setup_m[iline]),
-                            float(setup_freqnm[iline]),
+                            setup_freq,
                             float(setup_wavenm[iline]),
                             float(setup_dbeta[iline]),
                             float(setup_c1con[iline]),
                             float(setup_c2con[iline]),
-                            float(setup_radamp[iline]),
-                            float(setup_resont[iline]),
-                            float(setup_vdw[iline]),
-                            float(setup_stark[iline]),
+                            setup_radamp_i,
+                            setup_resont_i,
+                            setup_vdw_i,
                             float(setup_y1num[iline]),
                             float(setup_y1wht[iline]),
                             setup_finest[iline],
                             setup_finswt[iline],
-                            j0,
                             float(delw),
-                            xne_arr,
-                            xnf_h1,
-                            xnf_h2,
-                            xnfp_h1,
-                            dopple_h1,
-                            fo_arr,
-                            pp_arr_h,
-                            y1s_arr,
-                            y1b_arr,
-                            t3nhe_arr,
-                            t3nh2_arr,
-                            c1d_arr,
-                            c2d_arr,
-                            gcon1_arr,
-                            gcon2_arr,
+                            dopple,
+                            dop,
+                            hwres,
+                            hwvdw,
+                            hwrad,
+                            hwlor,
+                            hfwid,
+                            nwid,
+                            fo_j,
+                            float(xne_arr[j0]),
+                            float(y1s_arr[j0]),
+                            float(y1b_arr[j0]),
+                            float(c1d_arr[j0]),
+                            float(c2d_arr[j0]),
+                            float(gcon1_arr[j0]),
+                            float(gcon2_arr[j0]),
+                            float(pp_arr_h[j0]),
+                            float(xnf_h2[j0]),
+                            float(xnfp_h1[j0]),
                             extab_h,
                             extabf_h,
                             faste1_tbl,
@@ -918,39 +1034,41 @@ if _NUMBA_AVAILABLE:
                         break
                     delw = np.float32(float(waveset[iw]) - wlvac)
                     hprof = np.float32(
-                        _profile_for_setup_nb(
+                        _profile_for_setup_precomputed_nb(
                             int(setup_n[iline]),
                             int(setup_m[iline]),
-                            float(setup_freqnm[iline]),
+                            setup_freq,
                             float(setup_wavenm[iline]),
                             float(setup_dbeta[iline]),
                             float(setup_c1con[iline]),
                             float(setup_c2con[iline]),
-                            float(setup_radamp[iline]),
-                            float(setup_resont[iline]),
-                            float(setup_vdw[iline]),
-                            float(setup_stark[iline]),
+                            setup_radamp_i,
+                            setup_resont_i,
+                            setup_vdw_i,
                             float(setup_y1num[iline]),
                             float(setup_y1wht[iline]),
                             setup_finest[iline],
                             setup_finswt[iline],
-                            j0,
                             float(delw),
-                            xne_arr,
-                            xnf_h1,
-                            xnf_h2,
-                            xnfp_h1,
-                            dopple_h1,
-                            fo_arr,
-                            pp_arr_h,
-                            y1s_arr,
-                            y1b_arr,
-                            t3nhe_arr,
-                            t3nh2_arr,
-                            c1d_arr,
-                            c2d_arr,
-                            gcon1_arr,
-                            gcon2_arr,
+                            dopple,
+                            dop,
+                            hwres,
+                            hwvdw,
+                            hwrad,
+                            hwlor,
+                            hfwid,
+                            nwid,
+                            fo_j,
+                            float(xne_arr[j0]),
+                            float(y1s_arr[j0]),
+                            float(y1b_arr[j0]),
+                            float(c1d_arr[j0]),
+                            float(c2d_arr[j0]),
+                            float(gcon1_arr[j0]),
+                            float(gcon2_arr[j0]),
+                            float(pp_arr_h[j0]),
+                            float(xnf_h2[j0]),
+                            float(xnfp_h1[j0]),
                             extab_h,
                             extabf_h,
                             faste1_tbl,
@@ -1448,26 +1566,52 @@ def xlinop(
             special_mask = ~normal_mask
             if not np.any(special_mask):
                 return LineOpacityState(xlines=xlines, lineused=int(lineused_normal))
-            special_state = xlinop(
-                records=_subset_xline_records(records, special_mask),
-                wave_set_nm=waveset,
-                i_wavetab=iwavetab,
-                tabcont=tab,
-                temperature_k=t,
-                hckt=hckt_arr,
-                xne=xne_arr,
-                xnf=xnf_arr,
-                xnfp=xnfp_arr,
-                rho=rho_arr,
-                xnfdop=xnfdop_arr,
-                dopple=dopple_arr,
-                ifop15_enabled=True,
-                base_xlines=xlines,
-                nulo=nulo,
-                nuhi=nuhi,
-            )
-            special_state.lineused += int(lineused_normal)
-            return special_state
+            lineused_total = int(lineused_normal)
+            hyd_mask = special_mask & ((records.type_code == -1) | (records.type_code == 2))
+            if np.any(hyd_mask):
+                hyd_state = xlinop(
+                    records=_subset_xline_records(records, hyd_mask),
+                    wave_set_nm=waveset,
+                    i_wavetab=iwavetab,
+                    tabcont=tab,
+                    temperature_k=t,
+                    hckt=hckt_arr,
+                    xne=xne_arr,
+                    xnf=xnf_arr,
+                    xnfp=xnfp_arr,
+                    rho=rho_arr,
+                    xnfdop=xnfdop_arr,
+                    dopple=dopple_arr,
+                    ifop15_enabled=True,
+                    base_xlines=xlines,
+                    nulo=nulo,
+                    nuhi=nuhi,
+                )
+                xlines = hyd_state.xlines
+                lineused_total += int(hyd_state.lineused)
+            rare_mask = special_mask & ~hyd_mask
+            if np.any(rare_mask):
+                rare_state = xlinop(
+                    records=_subset_xline_records(records, rare_mask),
+                    wave_set_nm=waveset,
+                    i_wavetab=iwavetab,
+                    tabcont=tab,
+                    temperature_k=t,
+                    hckt=hckt_arr,
+                    xne=xne_arr,
+                    xnf=xnf_arr,
+                    xnfp=xnfp_arr,
+                    rho=rho_arr,
+                    xnfdop=xnfdop_arr,
+                    dopple=dopple_arr,
+                    ifop15_enabled=True,
+                    base_xlines=xlines,
+                    nulo=nulo,
+                    nuhi=nuhi,
+                )
+                rare_state.lineused += lineused_total
+                return rare_state
+            return LineOpacityState(xlines=xlines, lineused=lineused_total)
 
     bolth = np.exp(-np.outer(hckt_arr, eh)) * xnfdop_arr[:, 0:1]
     hyd_tables = load_hydrogen_profile_tables_from_atlas12()

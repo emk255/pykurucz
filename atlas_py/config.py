@@ -48,4 +48,7 @@ class AtlasConfig:
     print_level: int = 1
     punch_level: int = 1
     log_level: str = "INFO"
+    convergence_epsilon: Optional[float] = None
+    convergence_min_iterations: int = 5
+    convergence_consecutive: int = 1
 

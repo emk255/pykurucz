@@ -605,6 +605,47 @@ def _chop_opacity(freq: float, temp: np.ndarray) -> np.ndarray:
     return result
 
 
+def _chop_opacity_grid(freq: np.ndarray, temp: np.ndarray) -> np.ndarray:
+    """Vectorized CHOP over all frequencies, preserving `_chop_opacity` math."""
+
+    freq_arr = np.asarray(freq, dtype=np.float64)
+    temp_arr = np.asarray(temp, dtype=np.float64)
+    n_layers = temp_arr.size
+    out = np.zeros((n_layers, freq_arr.size), dtype=np.float64)
+
+    evolt = (freq_arr / 2.99792458e10) / 8065.479
+    n = np.asarray(evolt * 10.0, dtype=np.int64)
+    valid_freq = (n >= 20) & (n < 105)
+    cool = temp_arr < 9000.0
+    if not np.any(valid_freq) or not np.any(cool):
+        return out
+
+    idx = n[valid_freq]
+    en = idx.astype(np.float64) * 0.1
+    frac_e = (evolt[valid_freq] - en) / 0.1
+    cross = _CH_CROSSSECT[idx, :] + (
+        _CH_CROSSSECT[idx + 1, :] - _CH_CROSSSECT[idx, :]
+    ) * frac_e[:, np.newaxis]
+
+    it_part = np.clip(np.asarray((temp_arr - 1000.0) / 200.0, dtype=np.int64), 0, 39)
+    tn_part = it_part.astype(np.float64) * 200.0 + 1000.0
+    part = _CH_PARTITION[it_part] + (
+        _CH_PARTITION[it_part + 1] - _CH_PARTITION[it_part]
+    ) * (temp_arr - tn_part) / 200.0
+
+    it_cross = np.clip(np.asarray((temp_arr - 2000.0) / 500.0, dtype=np.int64), 0, 13)
+    tn_cross = it_cross.astype(np.float64) * 500.0 + 2000.0
+    frac_t = (temp_arr - tn_cross) / 500.0
+    log_xsect = cross[:, it_cross] + (
+        cross[:, it_cross + 1] - cross[:, it_cross]
+    ) * frac_t[np.newaxis, :]
+
+    vals = np.exp(log_xsect * 2.30258509299405).T * part[:, np.newaxis]
+    out[:, valid_freq] = vals
+    out[~cool, :] = 0.0
+    return out
+
+
 # OH cross-section table (atlas12.for OHOP, DATA C1..C13 lines 7673-7940)
 # Shape: (130, 15) - 130 energy bins (2.1-15.0 eV), row k = Fortran CROSSOH(IT, k) (N=1..130)
 # Second dimension: 15 temperature points (2000K to 9000K in 500K steps)
@@ -685,6 +726,47 @@ def _ohop_opacity(freq: float, temp: np.ndarray) -> np.ndarray:
         result[j] = np.exp(log_xsect * 2.30258509299405) * part
 
     return result
+
+
+def _ohop_opacity_grid(freq: np.ndarray, temp: np.ndarray) -> np.ndarray:
+    """Vectorized OHOP over all frequencies, preserving `_ohop_opacity` math."""
+
+    freq_arr = np.asarray(freq, dtype=np.float64)
+    temp_arr = np.asarray(temp, dtype=np.float64)
+    n_layers = temp_arr.size
+    out = np.zeros((n_layers, freq_arr.size), dtype=np.float64)
+
+    evolt = (freq_arr / 2.99792458e10) / 8065.479
+    n = np.asarray(evolt * 10.0, dtype=np.int64) - 20
+    valid_freq = (n > 0) & (n < 130)
+    cool = temp_arr < 9000.0
+    if not np.any(valid_freq) or not np.any(cool):
+        return out
+
+    idx = n[valid_freq] - 1
+    en = n[valid_freq].astype(np.float64) * 0.1 + 2.0
+    frac_e = (evolt[valid_freq] - en) / 0.1
+    cross = _OH_CROSSSECT[idx, :] + (
+        _OH_CROSSSECT[idx + 1, :] - _OH_CROSSSECT[idx, :]
+    ) * frac_e[:, np.newaxis]
+
+    it_part = np.clip(np.asarray((temp_arr - 1000.0) / 200.0, dtype=np.int64), 0, 39)
+    tn_part = it_part.astype(np.float64) * 200.0 + 1000.0
+    part = _OH_PARTITION[it_part] + (
+        _OH_PARTITION[it_part + 1] - _OH_PARTITION[it_part]
+    ) * (temp_arr - tn_part) / 200.0
+
+    it_cross = np.clip(np.asarray((temp_arr - 2000.0) / 500.0, dtype=np.int64), 0, 13)
+    tn_cross = it_cross.astype(np.float64) * 500.0 + 2000.0
+    frac_t = (temp_arr - tn_cross) / 500.0
+    log_xsect = cross[:, it_cross] + (
+        cross[:, it_cross + 1] - cross[:, it_cross]
+    ) * frac_t[np.newaxis, :]
+
+    vals = np.exp(log_xsect * 2.30258509299405).T * part[:, np.newaxis]
+    out[:, valid_freq] = vals
+    out[~cool, :] = 0.0
+    return out
 
 
 # H2 collision-induced absorption tables (atlas7v.for lines 8733-8912)
@@ -1381,32 +1463,28 @@ def compute_kapp_continuum(
             [xkarsas_grid(freq, 1.0, n, n) for n in range(1, 9)]
         )
 
-        for j in range(nfreq):
-            f = float(freq[j])
-            stim_j = stim[:, j]
-            ehvkt_j = ehvkt[:, j]
-            bnu_j = bnu_all[:, j]
-            cont = cont_h[:, j]
-            freq3 = max(f * f * f, 1e-300)
-            cfree = 3.6919e8 / freq3
-            cterm = 2.815e29 / freq3
-            coulff_arr = coulff_h[:, j]
-            ex = boltex.copy()
-            if f < 4.05933e13:
-                ex = exlim / np.maximum(ehvkt_j, 1e-300)
-            h = (
-                cont[6] * bolt[:, 6]
-                + cont[7] * bolt[:, 7]
-                + (ex - exlim) * cterm
-                + coulff_arr * freet * cfree
-            ) * stim_j
-            s = h * bnu_j
-            for n in range(6):
-                bh = np.maximum(bhyd[:, n], 1e-300)
-                h = h + cont[n] * bolt[:, n] * (1.0 - ehvkt_j / bh)
-                s = s + cont[n] * bolt[:, n] * bnu_j * stim_j / bh
-            ahyd[:, j] = h
-            shyd[:, j] = np.where(h > 0.0, s / np.maximum(h, 1e-300), bnu_j)
+        freq3 = np.maximum(freq * freq * freq, 1e-300)
+        cfree = 3.6919e8 / freq3
+        cterm = 2.815e29 / freq3
+        ex = np.broadcast_to(boltex[:, np.newaxis], (n_layers, nfreq)).copy()
+        low_freq = freq < 4.05933e13
+        if np.any(low_freq):
+            ex[:, low_freq] = exlim[:, np.newaxis] / np.maximum(ehvkt[:, low_freq], 1e-300)
+
+        h = (
+            cont_h[6, :][np.newaxis, :] * bolt[:, 6][:, np.newaxis]
+            + cont_h[7, :][np.newaxis, :] * bolt[:, 7][:, np.newaxis]
+            + (ex - exlim[:, np.newaxis]) * cterm[np.newaxis, :]
+            + coulff_h * freet[:, np.newaxis] * cfree[np.newaxis, :]
+        ) * stim
+        s = h * bnu_all
+        for n in range(6):
+            bh = np.maximum(bhyd[:, n], 1e-300)
+            term = cont_h[n, :][np.newaxis, :] * bolt[:, n][:, np.newaxis]
+            h = h + term * (1.0 - ehvkt / bh[:, np.newaxis])
+            s = s + term * bnu_all * stim / bh[:, np.newaxis]
+        ahyd[:, :] = h
+        shyd[:, :] = np.where(h > 0.0, s / np.maximum(h, 1e-300), bnu_all)
 
     # H2PLOP: H2+ opacity (atlas7v.for line 5189-5211)
     if ifop[1] == 1 and atmosphere.xnfph is not None:
@@ -2903,23 +2981,12 @@ def compute_kapp_continuum(
         xnfpch = np.asarray(atmosphere.xnfpch, dtype=np.float64)
         xnfpoh = np.asarray(atmosphere.xnfpoh, dtype=np.float64)
 
-        # Use hydrogen and helium populations for H2 collision-induced
-        tkev_arr = KBOLTZ_EV * temp
-        tlog_arr = np.log(temp)
-
-        for j in range(nfreq):
-            f = freq[j]
-            stim_j = stim[:, j]
-
-            # CHOP: CH molecular opacity (scaled by CH population)
-            if xnfpch is not None:
-                chop_xsect = _chop_opacity(f, temp)
-                acool_mol[:, j] += chop_xsect * xnfpch / rho * stim_j
-
-            # OHOP: OH molecular opacity (scaled by OH population)
-            if xnfpoh is not None:
-                ohop_xsect = _ohop_opacity(f, temp)
-                acool_mol[:, j] += ohop_xsect * xnfpoh / rho * stim_j
+        # CHOP/OHOP: vectorized form of the Fortran per-frequency table
+        # interpolation, scaled by molecular populations and stimulated emission.
+        if xnfpch is not None:
+            acool_mol += _chop_opacity_grid(freq, temp) * (xnfpch / rho)[:, np.newaxis] * stim
+        if xnfpoh is not None:
+            acool_mol += _ohop_opacity_grid(freq, temp) * (xnfpoh / rho)[:, np.newaxis] * stim
 
         # H2COLL: H2 collision-induced absorption. Fortran computes XNH2 once
         # into COMMON /XNF/ via H2RAOP and H2COLLOP reuses it for every frequency.

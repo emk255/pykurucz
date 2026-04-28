@@ -202,6 +202,27 @@ def _build_kapp_adapter(
     )
 
 
+def _max_normalized_column_delta(
+    before: np.ndarray,
+    after: np.ndarray,
+    *,
+    floor: float = 1.0e-300,
+    symmetric: bool = False,
+) -> float:
+    """Max layer-wise normalized change for convergence diagnostics."""
+    before_arr = np.asarray(before, dtype=np.float64)
+    after_arr = np.asarray(after, dtype=np.float64)
+    if before_arr.shape != after_arr.shape or before_arr.size == 0:
+        return float("nan")
+    if symmetric:
+        denom = np.maximum.reduce(
+            [np.abs(before_arr), np.abs(after_arr), np.full(before_arr.shape, floor)]
+        )
+    else:
+        denom = np.maximum(np.abs(before_arr), floor)
+    return float(np.max(np.abs(after_arr - before_arr) / denom))
+
+
 def _convec_fd_samples(
     *,
     atm: AtlasAtmosphere,
@@ -470,6 +491,15 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     numits = max(1, cfg.iterations)
     if deck is not None and deck.numits > 0:
         numits = deck.numits
+    convergence_epsilon = (
+        float(cfg.convergence_epsilon)
+        if cfg.convergence_epsilon is not None and cfg.convergence_epsilon > 0.0
+        else None
+    )
+    convergence_min_iterations = max(1, int(cfg.convergence_min_iterations))
+    convergence_consecutive_required = max(1, int(cfg.convergence_consecutive))
+    convergence_consecutive_count = 0
+    completed_iterations = 0
 
     gravity_cgs = _gravity_from_atm_metadata(atm)
     if deck is not None and deck.grav > 0.0:
@@ -613,10 +643,20 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
 
     for iter_idx in range(numits):
         iter_no = iter_idx + 1
+        completed_iterations = iter_no
         itemp_counter += iter_no
         itemp = itemp_counter
         _t_stage = time.perf_counter()
         temp_before_iter = atm.temperature.copy()
+        convergence_before = {
+            "RHOX": atm.rhox.copy(),
+            "T": atm.temperature.copy(),
+            "P": state.p.copy(),
+            "XNE": state.xne.copy(),
+            "ABROSS": atm.abross.copy(),
+            "VTURB": atm.vturb.copy(),
+            "ACCRAD": atm.accrad.copy(),
+        }
         # Turbulence pressure update (atlas12.for TURB subroutine, lines 5199-5214).
         # When IFTURB=1: call TURB to recompute VTURB and PTURB each iteration.
         # When IFTURB=0: PTURB stays at initial model values (zero from CALCULATE).
@@ -1141,6 +1181,7 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             tau1lg=-6.875,
         )
         pradk0_prev = float(radst.pradk0)
+        physical_convergence_max = float("inf")
         if tcres is not None:
             if flxcnv_out is not None:
                 # Fortran TCORR mode=3 updates FLXCNV only for J=2..NRHOX-1
@@ -1225,6 +1266,51 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                 float(tauros_out[layer_idx]) if tauros_out is not None else float("nan"),
                 photo_msg,
             )
+            convergence_after = {
+                "RHOX": atm.rhox,
+                "T": atm.temperature,
+                "P": state.p,
+                "XNE": state.xne,
+                "ABROSS": atm.abross,
+                "VTURB": atm.vturb,
+                "ACCRAD": atm.accrad,
+            }
+            convergence_metrics = {
+                name: _max_normalized_column_delta(
+                    convergence_before[name],
+                    value,
+                    floor=1.0e-300,
+                    symmetric=(name in {"VTURB", "ACCRAD"}),
+                )
+                for name, value in convergence_after.items()
+            }
+            physical_convergence_max = max(
+                convergence_metrics[name]
+                for name in ("RHOX", "T", "P", "XNE", "ABROSS", "VTURB")
+                if np.isfinite(convergence_metrics[name])
+            )
+            convergence_max = max(
+                value for value in convergence_metrics.values() if np.isfinite(value)
+            )
+            logger.info(
+                "Convergence iteration %d/%d: physical_max=%.3e max_col=%.3e %s",
+                iter_no,
+                numits,
+                physical_convergence_max,
+                convergence_max,
+                " ".join(
+                    f"{name}={value:.3e}" for name, value in convergence_metrics.items()
+                ),
+            )
+            converged_this_iter = (
+                convergence_epsilon is not None
+                and iter_no >= convergence_min_iterations
+                and physical_convergence_max < convergence_epsilon
+            )
+            if converged_this_iter:
+                convergence_consecutive_count += 1
+            else:
+                convergence_consecutive_count = 0
         # STATEQ MODE=3: solve H departure coefficients after frequency loop.
         if stateq_acc is not None:
             stateq_solve(
@@ -1236,9 +1322,24 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                 bhyd=state.bhyd,
                 bmin=state.bmin,
             )
+        if (
+            convergence_epsilon is not None
+            and convergence_consecutive_count >= convergence_consecutive_required
+        ):
+            logger.info(
+                "Convergence early stop at iteration %d/%d: "
+                "physical_max=%.3e epsilon=%.3e min_iterations=%d consecutive=%d",
+                iter_no,
+                numits,
+                physical_convergence_max,
+                convergence_epsilon,
+                convergence_min_iterations,
+                convergence_consecutive_required,
+            )
+            break
 
     out_metadata = atm.metadata.copy()
-    out_metadata["begin_line"] = f"BEGIN                    ITERATION{numits:4d} COMPLETED"
+    out_metadata["begin_line"] = f"BEGIN                    ITERATION{completed_iterations:4d} COMPLETED"
     out_metadata["pradk_line"] = f"PRADK {float(radst.pradk0):.4E}"
     out_extra1 = np.asarray(flxcnv_out, dtype=np.float64) if flxcnv_out is not None else atm.extra1.copy()
     out_extra2 = np.asarray(vconv_out, dtype=np.float64) if vconv_out is not None else atm.extra2.copy()
@@ -1263,7 +1364,7 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             cfg.outputs.debug_state_path,
             atm=atm,
             state=state,
-            iterations=numits,
+            iterations=completed_iterations,
             enable_molecules=ifmol,
             abross_out=abross_out,
             tauros_out=tauros_out,

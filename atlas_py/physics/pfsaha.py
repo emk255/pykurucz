@@ -6,6 +6,7 @@ Fortran reference: `kurucz/src/atlas12.for`, `SUBROUTINE PFSAHA` (line ~3137).
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -455,7 +456,7 @@ def _special_partition(n: int, hckt: float) -> tuple[float, float, bool]:
     return 1.0, 0.0, False
 
 
-def pfsaha_depth(
+def _pfsaha_depth_uncached(
     temperature_k: float,
     electron_density_cm3: float,
     xnatom_cm3: float,
@@ -668,4 +669,57 @@ def pfsaha_depth(
     else:
         raise NotImplementedError(f"PFSAHA mode {mode} is not implemented")
     return out
+
+
+@lru_cache(maxsize=262_144)
+def _pfsaha_depth_cached(
+    temperature_k: float,
+    electron_density_cm3: float,
+    xnatom_cm3: float,
+    xabund_linear: float,
+    atomic_number: int,
+    nion: int,
+    mode: int,
+    chargesq_cm3: float | None,
+) -> tuple[float, ...]:
+    out = _pfsaha_depth_uncached(
+        temperature_k=temperature_k,
+        electron_density_cm3=electron_density_cm3,
+        xnatom_cm3=xnatom_cm3,
+        xabund_linear=xabund_linear,
+        atomic_number=atomic_number,
+        nion=nion,
+        mode=mode,
+        chargesq_cm3=chargesq_cm3,
+    )
+    return tuple(float(x) for x in out)
+
+
+def pfsaha_depth(
+    temperature_k: float,
+    electron_density_cm3: float,
+    xnatom_cm3: float,
+    xabund_linear: float,
+    atomic_number: int,
+    nion: int,
+    mode: int,
+    chargesq_cm3: float | None = None,
+) -> np.ndarray:
+    """Compute PFSAHA-like output for one depth and one element.
+
+    The scalar PFSAHA result is reused heavily by NMOLEC Newton iterations for
+    identical thermodynamic inputs. Cache immutable tuples and return a fresh
+    array so callers retain the original mutable-array contract.
+    """
+    cached = _pfsaha_depth_cached(
+        float(temperature_k),
+        float(electron_density_cm3),
+        float(xnatom_cm3),
+        float(xabund_linear),
+        int(atomic_number),
+        int(nion),
+        int(mode),
+        None if chargesq_cm3 is None else float(chargesq_cm3),
+    )
+    return np.asarray(cached, dtype=np.float64)
 

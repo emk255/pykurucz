@@ -389,6 +389,15 @@ def nmolec(*_args, **_kwargs):
     if ctx.ifedns == 0:
         ctx.xnsave[:, :nequa] = ctx.xnz[:, :nequa]
 
+    if ctx.ifedns == 1:
+        # Fortran NMOLEC jumps directly to label 160 when IFEDNS=1
+        # (atlas12.for line 4351), skipping the XNFP/partition-function
+        # conversion block below. CONVEC only needs XNMOL/RHO/EDENS samples.
+        ctx.state.edens[:] = 1.5 * np.asarray(ctx.gas_pressure, dtype=np.float64) / np.maximum(
+            ctx.state.rho, 1e-300
+        )
+        return
+
     if mode in (2, 12):
         return
 
