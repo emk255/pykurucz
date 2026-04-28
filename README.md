@@ -224,6 +224,10 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
 
 Very cool, edge-of-grid giants can be difficult for the original Fortran validation pipeline as well; if Fortran ATLAS30 or Fortran SYNTHE cannot produce a clean reference spectrum for a case, that case is treated as an invalid reference sample rather than a Python pass/fail. Use such edge cases cautiously until a trusted external atmosphere/reference is available.
 
+### Runtime
+
+Runtime depends strongly on stellar type, wavelength range, line-list density, worker count, and whether atmosphere convergence triggers early. In matched 300–1800 nm, R=300,000 validation on the same machine, a 4000 K dwarf with a valid Fortran30 reference took about 3230 s for the full Fortran+Python comparison run: the Python branch (`atlas_py` + `synthe_py`) took about 1095 s, while the Fortran branch took about 2136 s, so Python was roughly 2x faster for that case. Solar-like runs benefit more from convergence early stopping; for one 5770 K validation case, Python ATLAS stopped at 18/30 iterations and took about 233 s for the atmosphere stage.
+
 | Model | $T_{\text{eff}}$ | $\log g$ | Type | Median Δ | 95th pctl | 99th pctl |
 |-------|-------|-------|------|----------|-----------|-----------|
 | `t02500g-1.0` | 2500 K | −1.0 | Cool giant | 0.0006% | 0.023% | 0.065% |
