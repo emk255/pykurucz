@@ -1,0 +1,1357 @@
+/* =====================================================================
+   pykurucz — editorial documentation theme (MkDocs Material override)
+   Cool paper neutrals · single navy accent · serif body, sans UI, mono code
+
+   This CSS ports the "pykurucz-docs" design (Source Serif 4 + Inter Tight +
+   JetBrains Mono on a quiet paper background with a deep navy accent) to
+   the Material for MkDocs theme. Both light and dark schemes are defined.
+   ===================================================================== */
+
+/* --- Webfonts (kept off the critical path; Material loads its own) --- */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+/* =====================================================================
+   1. DESIGN TOKENS
+   ===================================================================== */
+:root,
+[data-md-color-scheme="default"] {
+  /* Cool paper neutrals */
+  --pk-bg:        #fbfbfa;
+  --pk-bg-soft:   #f4f4f2;
+  --pk-bg-sunken: #efeeec;
+  --pk-surface:   #ffffff;
+  --pk-ink:       #14161a;
+  --pk-ink-2:     #2a2d33;
+  --pk-muted:     #5b6068;
+  --pk-muted-2:   #80858d;
+  --pk-faint:     #a8acb3;
+  --pk-rule:      #e5e4e1;
+  --pk-rule-2:    #ececea;
+  --pk-rule-strong: #d2d1cd;
+
+  /* Single accent: deep restrained navy/indigo */
+  --pk-accent:        oklch(0.46 0.12 258);
+  --pk-accent-2:      oklch(0.40 0.13 258);
+  --pk-accent-soft:   oklch(0.96 0.02 258);
+  --pk-accent-rule:   oklch(0.88 0.04 258);
+
+  /* Code surfaces (dim, neutral) */
+  --pk-code-bg:    #14181f;
+  --pk-code-bg-2:  #1c2129;
+  --pk-code-ink:   #d8dde4;
+  --pk-code-mute:  #8b94a3;
+  --pk-code-rule:  #262c36;
+
+  /* Semantic admonition tints (very low saturation) */
+  --pk-note:    oklch(0.55 0.10 258);
+  --pk-tip:     oklch(0.50 0.08 165);
+  --pk-warn:    oklch(0.58 0.12 60);
+  --pk-physics: oklch(0.50 0.10 290);
+
+  /* Type scale */
+  --pk-serif: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --pk-sans:  "Inter", "Inter Tight", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --pk-mono:  "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --pk-ease: cubic-bezier(.2,.7,.2,1);
+
+  /* Wire Material's variables to ours so built-in components inherit */
+  --md-primary-fg-color:        var(--pk-ink);
+  --md-primary-fg-color--light: var(--pk-ink-2);
+  --md-primary-fg-color--dark:  #000;
+  --md-primary-bg-color:        var(--pk-bg);
+  --md-primary-bg-color--light: var(--pk-bg-soft);
+
+  --md-accent-fg-color:         var(--pk-accent);
+  --md-accent-fg-color--transparent: var(--pk-accent-soft);
+  --md-accent-bg-color:         var(--pk-bg);
+  --md-accent-bg-color--light:  var(--pk-accent-soft);
+
+  --md-default-bg-color:        var(--pk-bg);
+  --md-default-fg-color:        var(--pk-ink-2);
+  --md-default-fg-color--light: var(--pk-muted);
+  --md-default-fg-color--lighter: var(--pk-muted-2);
+  --md-default-fg-color--lightest: var(--pk-faint);
+
+  --md-code-bg-color:           var(--pk-bg-soft);
+  --md-code-fg-color:           var(--pk-ink);
+
+  --md-typeset-color:           var(--pk-ink-2);
+  --md-typeset-a-color:         var(--pk-accent);
+}
+
+[data-md-color-scheme="slate"] {
+  --pk-bg:        #0e1015;
+  --pk-bg-soft:   #14171d;
+  --pk-bg-sunken: #0a0c10;
+  --pk-surface:   #14171d;
+  --pk-ink:       #ecedef;
+  --pk-ink-2:     #cfd2d8;
+  --pk-muted:     #8e939c;
+  --pk-muted-2:   #71757d;
+  --pk-faint:     #4f535b;
+  --pk-rule:      #232831;
+  --pk-rule-2:    #1d2129;
+  --pk-rule-strong: #2c323d;
+
+  --pk-accent:        oklch(0.74 0.10 258);
+  --pk-accent-2:      oklch(0.80 0.10 258);
+  --pk-accent-soft:   oklch(0.22 0.04 258);
+  --pk-accent-rule:   oklch(0.32 0.06 258);
+
+  --pk-code-bg:    #0a0c10;
+  --pk-code-bg-2:  #14171d;
+  --pk-code-ink:   #d8dde4;
+  --pk-code-mute:  #71757d;
+  --pk-code-rule:  #1d2229;
+
+  --md-primary-fg-color:        var(--pk-bg-soft);
+  --md-primary-bg-color:        var(--pk-ink);
+  --md-default-bg-color:        var(--pk-bg);
+  --md-default-fg-color:        var(--pk-ink-2);
+  --md-default-fg-color--light: var(--pk-muted);
+  --md-default-fg-color--lighter: var(--pk-muted-2);
+  --md-default-fg-color--lightest: var(--pk-faint);
+  --md-code-bg-color:           var(--pk-bg-soft);
+  --md-code-fg-color:           var(--pk-ink);
+  --md-typeset-color:           var(--pk-ink-2);
+}
+
+/* =====================================================================
+   2. BASE TYPOGRAPHY
+   ===================================================================== */
+body, .md-typeset {
+  font-family: var(--pk-serif);
+  font-feature-settings: "ss01", "kern";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.md-typeset {
+  font-size: 17px;
+  line-height: 1.78;
+  color: var(--pk-ink-2);
+  font-feature-settings: "ss01", "kern", "liga";
+}
+
+.md-typeset p,
+.md-typeset ul,
+.md-typeset ol {
+  max-width: 68ch;
+}
+
+.md-typeset p {
+  margin: 0 0 1.125rem;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-typeset h4,
+.md-typeset h5,
+.md-typeset h6 {
+  font-family: var(--pk-sans);
+  color: var(--pk-ink);
+  letter-spacing: -0.02em;
+  font-weight: 600;
+  text-wrap: balance;
+}
+
+.md-typeset h1 {
+  font-size: 38px;
+  font-weight: 700;
+  line-height: 1.08;
+  letter-spacing: -0.025em;
+  margin: 0 0 0.75rem;
+}
+
+.md-typeset h2 {
+  font-size: 24px;
+  line-height: 1.25;
+  margin: 3.5rem 0 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--pk-rule);
+}
+
+.md-typeset h3 {
+  font-size: 18px;
+  line-height: 1.3;
+  margin: 2rem 0 0.625rem;
+}
+
+.md-typeset h4 {
+  font-size: 15px;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.md-typeset h5 {
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pk-muted-2);
+  margin: 1.25rem 0 0.5rem;
+}
+
+.md-typeset strong { color: var(--pk-ink); font-weight: 600; }
+.md-typeset em { font-style: italic; }
+
+.md-typeset a {
+  color: var(--pk-accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s var(--pk-ease);
+}
+.md-typeset a:hover {
+  border-bottom-color: var(--pk-accent);
+}
+
+::selection { background: var(--pk-accent-soft); color: var(--pk-ink); }
+
+/* Lists */
+.md-typeset ul li,
+.md-typeset ol li { margin-bottom: 0.375rem; }
+.md-typeset ul li::marker { color: var(--pk-faint); }
+.md-typeset ol li::marker { color: var(--pk-muted-2); font-family: var(--pk-mono); font-size: 0.85em; }
+
+/* =====================================================================
+   3. LAYOUT — header, tabs, sidebars
+   ===================================================================== */
+.md-grid { max-width: 1320px; }
+.md-sidebar { width: 270px; }
+.md-sidebar--secondary { width: 240px; }
+
+.md-header {
+  background: color-mix(in oklab, var(--pk-bg) 88%, transparent) !important;
+  backdrop-filter: saturate(140%) blur(10px);
+  -webkit-backdrop-filter: saturate(140%) blur(10px);
+  border-bottom: 1px solid var(--pk-rule);
+  box-shadow: none !important;
+  color: var(--pk-ink);
+}
+
+.md-header__title {
+  font-family: var(--pk-sans);
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  color: var(--pk-ink);
+}
+.md-header__title .md-ellipsis { color: var(--pk-ink); }
+.md-header__topic:first-child { font-weight: 600; }
+
+.md-header__button { color: var(--pk-ink-2); }
+
+.md-tabs {
+  background: transparent !important;
+  border-bottom: 1px solid var(--pk-rule);
+  color: var(--pk-ink-2);
+}
+
+.md-tabs__link {
+  font-family: var(--pk-sans);
+  font-size: 13.5px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  text-transform: none;
+  opacity: 0.72;
+  color: var(--pk-ink-2);
+  transition: opacity 0.15s var(--pk-ease), color 0.15s var(--pk-ease);
+}
+.md-tabs__link:hover,
+.md-tabs__link--active {
+  opacity: 1;
+  color: var(--pk-ink);
+}
+.md-tabs__link--active { font-weight: 600; }
+
+/* =====================================================================
+   4. SIDEBAR NAV
+   ===================================================================== */
+.md-nav {
+  font-family: var(--pk-sans);
+  font-size: 13.5px;
+  color: var(--pk-ink-2);
+}
+
+.md-nav__title {
+  font-family: var(--pk-sans);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--pk-muted-2);
+  padding: 0.5rem 0.625rem 0.25rem;
+  background: transparent;
+  box-shadow: none;
+}
+
+.md-nav__link {
+  padding: 0.3rem 0.625rem;
+  border-radius: 6px;
+  border-left: 2px solid transparent;
+  margin-left: -2px;
+  line-height: 1.5;
+  font-weight: 450;
+  color: var(--pk-ink-2);
+  transition: background-color 0.15s var(--pk-ease), color 0.15s var(--pk-ease);
+}
+
+.md-nav__link:hover {
+  color: var(--pk-ink);
+  background: var(--pk-bg-soft);
+}
+
+.md-nav__link--active,
+.md-nav__item--active > .md-nav__link {
+  color: var(--pk-accent);
+  background: var(--pk-accent-soft);
+  border-left-color: var(--pk-accent);
+  font-weight: 550;
+}
+
+/* Right-side TOC */
+.md-nav--secondary .md-nav__title { font-size: 11px; }
+.md-nav--secondary .md-nav__link {
+  border-left: 2px solid var(--pk-rule);
+  border-radius: 0;
+  margin-left: 0;
+  padding: 0.25rem 0 0.25rem 0.75rem;
+  font-size: 13px;
+  color: var(--pk-muted);
+}
+.md-nav--secondary .md-nav__link:hover { background: transparent; color: var(--pk-ink); }
+.md-nav--secondary .md-nav__link--active {
+  color: var(--pk-accent);
+  border-left-color: var(--pk-accent);
+  background: transparent;
+  font-weight: 500;
+}
+
+/* =====================================================================
+   5. SEARCH
+   ===================================================================== */
+.md-search__form {
+  border-radius: 8px;
+  background: var(--pk-surface);
+  border: 1px solid var(--pk-rule);
+  height: 36px;
+}
+.md-search__form:hover { border-color: var(--pk-rule-strong); }
+.md-search__input {
+  font-family: var(--pk-sans);
+  font-size: 13px;
+  color: var(--pk-ink-2);
+}
+.md-search__input::placeholder { color: var(--pk-muted-2); }
+.md-search__icon { color: var(--pk-muted-2); }
+
+/* =====================================================================
+   6. CODE
+   ===================================================================== */
+.md-typeset code {
+  font-family: var(--pk-mono);
+  font-size: 0.86em;
+  font-weight: 500;
+  padding: 1px 6px;
+  border: 1px solid var(--pk-rule);
+  border-radius: 4px;
+  background: var(--pk-bg-soft);
+  color: var(--pk-ink);
+}
+
+.md-typeset pre > code,
+.md-typeset .highlight pre {
+  font-family: var(--pk-mono);
+  font-size: 13px;
+  line-height: 1.65;
+  background: var(--pk-code-bg);
+  color: var(--pk-code-ink);
+  border: 1px solid var(--pk-rule);
+  border-radius: 10px;
+  padding: 1rem 1.125rem;
+}
+
+.md-typeset pre > code { padding: 0; border: none; background: transparent; }
+
+.md-typeset .highlight {
+  border: 1px solid var(--pk-rule);
+  border-radius: 10px;
+  background: var(--pk-code-bg);
+  margin: 1.25rem 0 1.5rem;
+  overflow: hidden;
+}
+
+.md-typeset .highlight pre {
+  border: none;
+  border-radius: 0;
+  margin: 0;
+}
+
+.md-typeset .highlight .filename,
+.md-typeset .highlight > span:first-child {
+  font-family: var(--pk-mono);
+  font-size: 12px;
+  color: var(--pk-code-mute);
+  background: var(--pk-code-bg-2);
+  border-bottom: 1px solid var(--pk-code-rule);
+  padding: 0.5rem 0.875rem;
+  display: block;
+}
+
+/* Copy button */
+.md-clipboard {
+  color: var(--pk-code-mute);
+  font-family: var(--pk-mono);
+}
+.md-clipboard:hover { color: var(--pk-code-ink); }
+
+/* ---------------------------------------------------------------------
+   Pygments token colors — for dark code blocks
+   The Material defaults are tuned for a LIGHT code background, so on our
+   dark slabs `.n` / `.nb` / `.o` etc. render near-black and become unread-
+   able. These overrides are scoped to .highlight (code blocks), so inline
+   code on light surface is unaffected.
+   --------------------------------------------------------------------- */
+.md-typeset .highlight .c,
+.md-typeset .highlight .ch,
+.md-typeset .highlight .cm,
+.md-typeset .highlight .c1,
+.md-typeset .highlight .cs,
+.md-typeset .highlight .cp,
+.md-typeset .highlight .cpf  { color: #6e7785; font-style: italic; }   /* comments */
+
+.md-typeset .highlight .k,
+.md-typeset .highlight .kc,
+.md-typeset .highlight .kd,
+.md-typeset .highlight .kn,
+.md-typeset .highlight .kp,
+.md-typeset .highlight .kr,
+.md-typeset .highlight .kt    { color: #d6a6ff; font-weight: 500; }    /* keywords */
+
+.md-typeset .highlight .s,
+.md-typeset .highlight .sa,
+.md-typeset .highlight .sb,
+.md-typeset .highlight .sc,
+.md-typeset .highlight .dl,
+.md-typeset .highlight .sd,
+.md-typeset .highlight .s2,
+.md-typeset .highlight .se,
+.md-typeset .highlight .sh,
+.md-typeset .highlight .si,
+.md-typeset .highlight .sx,
+.md-typeset .highlight .sr,
+.md-typeset .highlight .s1,
+.md-typeset .highlight .ss    { color: #b6e0a3; }                      /* strings */
+
+.md-typeset .highlight .m,
+.md-typeset .highlight .mb,
+.md-typeset .highlight .mf,
+.md-typeset .highlight .mh,
+.md-typeset .highlight .mi,
+.md-typeset .highlight .il,
+.md-typeset .highlight .mo    { color: #f1c27a; }                      /* numbers */
+
+.md-typeset .highlight .nf,
+.md-typeset .highlight .fm    { color: #8ec5ff; }                      /* function */
+
+.md-typeset .highlight .nb,
+.md-typeset .highlight .bp    { color: #8ec5ff; font-weight: 500; }    /* builtins */
+
+.md-typeset .highlight .n,
+.md-typeset .highlight .na,
+.md-typeset .highlight .nn,
+.md-typeset .highlight .nc,
+.md-typeset .highlight .nd,
+.md-typeset .highlight .ne,
+.md-typeset .highlight .nv,
+.md-typeset .highlight .vc,
+.md-typeset .highlight .vg,
+.md-typeset .highlight .vi,
+.md-typeset .highlight .nl,
+.md-typeset .highlight .nx    { color: var(--pk-code-ink); }            /* identifiers */
+
+.md-typeset .highlight .o,
+.md-typeset .highlight .ow,
+.md-typeset .highlight .p,
+.md-typeset .highlight .w     { color: #aab1bd; }                      /* operators / punctuation */
+
+.md-typeset .highlight .nt    { color: #f1c27a; }                      /* tag */
+.md-typeset .highlight .err   { color: #ff8a8a; background: transparent; border: none; }
+.md-typeset .highlight .l,
+.md-typeset .highlight .ld    { color: var(--pk-code-ink); }
+.md-typeset .highlight .gh,
+.md-typeset .highlight .gu    { color: #d6a6ff; font-weight: 600; }
+.md-typeset .highlight .gd    { color: #ff8a8a; }
+.md-typeset .highlight .gi    { color: #b6e0a3; }
+
+/* CLI / shell — flag-ish tokens */
+.md-typeset .highlight .gp    { color: #6e7785; user-select: none; }   /* prompt */
+
+/* Linenos column (if enabled) */
+.md-typeset .highlight .linenos,
+.md-typeset .highlight .linenodiv pre { color: var(--pk-code-mute); background: var(--pk-code-bg-2); border-right: 1px solid var(--pk-code-rule); }
+
+/* Inline code accent (sparingly used by Material in headings) */
+.md-typeset h1 code,
+.md-typeset h2 code,
+.md-typeset h3 code,
+.md-typeset h4 code {
+  background: var(--pk-bg-soft);
+  border-color: var(--pk-rule);
+  color: var(--pk-accent);
+  font-weight: 500;
+}
+
+/* =====================================================================
+   7. ADMONITIONS
+   ===================================================================== */
+.md-typeset .admonition,
+.md-typeset details {
+  font-family: var(--pk-serif);
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--pk-ink-2);
+  background: var(--pk-bg-soft);
+  border: none;
+  border-left: 3px solid var(--pk-note);
+  border-radius: 0 8px 8px 0;
+  box-shadow: none;
+  margin: 1.75rem 0;
+  max-width: 70ch;
+  padding: 1rem 1.375rem 1.125rem 1.25rem;
+}
+
+.md-typeset .admonition > .admonition-title,
+.md-typeset details > summary {
+  font-family: var(--pk-sans);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: -0.005em;
+  text-transform: none;
+  color: var(--pk-note);
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0 0 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  line-height: 1.4;
+}
+.md-typeset .admonition > .admonition-title::before,
+.md-typeset details > summary::before {
+  content: '' !important;
+  display: inline-block !important;
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor !important;
+  -webkit-mask: none !important;
+          mask: none !important;
+  margin: 0 !important;
+  position: static !important;
+}
+/* Force serif on EVERYTHING inside an admonition except the title — Material
+   sets a sans rule with high specificity that we have to beat with !important. */
+.md-typeset .admonition,
+.md-typeset .admonition p,
+.md-typeset .admonition li,
+.md-typeset .admonition ul,
+.md-typeset .admonition ol,
+.md-typeset .admonition blockquote,
+.md-typeset details,
+.md-typeset details p,
+.md-typeset details li,
+.md-typeset details ul,
+.md-typeset details ol,
+.md-typeset details blockquote {
+  font-family: var(--pk-serif) !important;
+}
+.md-typeset .admonition > p,
+.md-typeset details > p {
+  padding: 0;
+  margin: 0;
+  max-width: none;
+  font-size: 16px;
+  line-height: 1.68;
+  color: var(--pk-ink-2);
+}
+.md-typeset .admonition > p + p { margin-top: 0.5rem; }
+.md-typeset .admonition > ul,
+.md-typeset details > ul,
+.md-typeset .admonition > ol,
+.md-typeset details > ol { margin: 0.5rem 0 0; padding-left: 1.25rem; }
+.md-typeset .admonition code,
+.md-typeset details code { font-size: 0.92em; }
+
+/* Tip / success */
+.md-typeset .admonition.tip,
+.md-typeset details.tip,
+.md-typeset .admonition.success,
+.md-typeset details.success,
+.md-typeset .admonition.hint,
+.md-typeset details.hint { border-left-color: var(--pk-tip); }
+.md-typeset .tip > .admonition-title, .md-typeset .tip > summary,
+.md-typeset .success > .admonition-title, .md-typeset .success > summary,
+.md-typeset .hint > .admonition-title, .md-typeset .hint > summary { color: var(--pk-tip); }
+
+/* Warning / danger */
+.md-typeset .admonition.warning,
+.md-typeset details.warning,
+.md-typeset .admonition.danger,
+.md-typeset details.danger,
+.md-typeset .admonition.caution,
+.md-typeset details.caution { border-left-color: var(--pk-warn); }
+.md-typeset .warning > .admonition-title, .md-typeset .warning > summary,
+.md-typeset .danger > .admonition-title, .md-typeset .danger > summary,
+.md-typeset .caution > .admonition-title, .md-typeset .caution > summary { color: var(--pk-warn); }
+
+/* Custom: physics & fortran */
+.md-typeset .admonition.physics, .md-typeset details.physics { border-left-color: var(--pk-physics); }
+.md-typeset .physics > .admonition-title, .md-typeset .physics > summary { color: var(--pk-physics); }
+
+.md-typeset .admonition.fortran, .md-typeset details.fortran { border-left-color: var(--pk-warn); }
+.md-typeset .fortran > .admonition-title, .md-typeset .fortran > summary { color: var(--pk-warn); }
+
+/* =====================================================================
+   8. TABLES
+   ===================================================================== */
+.md-typeset table:not([class]) {
+  font-family: var(--pk-sans);
+  font-size: 13.5px;
+  border: 1px solid var(--pk-rule);
+  border-radius: 8px;
+  border-collapse: separate;
+  border-spacing: 0;
+  overflow: hidden;
+  margin: 1.25rem 0 1.75rem;
+  box-shadow: none;
+}
+
+.md-typeset table:not([class]) th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pk-muted);
+  padding: 0.625rem 0.875rem;
+  background: var(--pk-bg-soft);
+  border-bottom: 1px solid var(--pk-rule);
+}
+.md-typeset table:not([class]) td {
+  padding: 0.625rem 0.875rem;
+  border-top: 1px solid var(--pk-rule-2);
+  color: var(--pk-ink-2);
+  vertical-align: top;
+  background: var(--pk-bg);
+}
+.md-typeset table:not([class]) tbody tr:first-child td { border-top: none; }
+.md-typeset table:not([class]) tbody td:first-child {
+  color: var(--pk-ink);
+  font-weight: 500;
+}
+.md-typeset table:not([class]) td code { font-size: 12.5px; }
+.md-typeset table:not([class]) tr:nth-child(even) td { background: var(--pk-bg-soft); }
+
+/* =====================================================================
+   9. TABS (pymdownx.tabbed)
+   ===================================================================== */
+.md-typeset .tabbed-set {
+  border: 1px solid var(--pk-rule);
+  border-radius: 10px;
+  margin: 1.25rem 0 1.5rem;
+  background: var(--pk-surface);
+}
+.md-typeset .tabbed-labels {
+  border-bottom: 1px solid var(--pk-rule);
+  background: var(--pk-bg-soft);
+  border-radius: 10px 10px 0 0;
+}
+.md-typeset .tabbed-labels > label {
+  font-family: var(--pk-sans);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--pk-muted);
+  padding: 0.625rem 1rem;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s var(--pk-ease), border-color 0.15s var(--pk-ease);
+}
+.md-typeset .tabbed-labels > label:hover { color: var(--pk-ink); }
+.md-typeset .tabbed-set > input:checked + label,
+.md-typeset .tabbed-labels > label.md-tab__active {
+  color: var(--pk-accent);
+  border-bottom-color: var(--pk-accent);
+  background: transparent;
+}
+.md-typeset .tabbed-content { padding: 1rem 1.125rem; }
+
+/* =====================================================================
+   10. BLOCKQUOTE / HR
+   ===================================================================== */
+.md-typeset blockquote {
+  border-left: 3px solid var(--pk-accent);
+  background: var(--pk-accent-soft);
+  border-radius: 0 8px 8px 0;
+  padding: 0.875rem 1.125rem;
+  margin: 1.5rem 0;
+  font-style: italic;
+  color: var(--pk-ink-2);
+}
+.md-typeset blockquote p { margin: 0; }
+
+.md-typeset hr {
+  border: none;
+  height: 1px;
+  background: var(--pk-rule);
+  margin: 2rem 0;
+}
+
+/* =====================================================================
+   11. FOOTER (prev/next + site)
+   ===================================================================== */
+.md-footer { background: transparent; color: var(--pk-muted); }
+.md-footer-meta { background: var(--pk-bg-sunken); }
+
+.md-footer__inner { padding: 1rem 0; }
+
+.md-footer__link {
+  border: 1px solid var(--pk-rule);
+  border-radius: 10px;
+  background: var(--pk-surface);
+  padding: 1rem 1.125rem;
+  transition: border-color 0.15s var(--pk-ease);
+}
+.md-footer__link:hover { border-color: var(--pk-rule-strong); opacity: 1; }
+.md-footer__direction {
+  font-family: var(--pk-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--pk-muted);
+}
+.md-footer__title {
+  font-family: var(--pk-sans);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--pk-ink);
+  letter-spacing: -0.01em;
+}
+.md-footer__button { color: var(--pk-ink-2); }
+.md-footer-copyright { font-family: var(--pk-sans); font-size: 12.5px; }
+
+/* =====================================================================
+   12. HOMEPAGE HERO
+   ===================================================================== */
+.md-typeset .pk-hero {
+  border-bottom: 1px solid var(--pk-rule);
+  padding: 3rem 0 2rem;
+  margin-bottom: 2.5rem;
+  max-width: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+  gap: 3rem;
+  align-items: stretch;          /* let the right column match left card height */
+}
+.md-typeset .pk-hero__main { min-width: 0; }
+.md-typeset .pk-hero > .pk-spectrum { grid-column: 1 / -1; }
+@media (max-width: 1000px) {
+  .md-typeset .pk-hero { grid-template-columns: 1fr; gap: 2rem; }
+  .md-typeset .pk-hero__aside { order: -1; max-width: 480px; margin: 0 auto; }
+}
+
+/* Bob Kurucz interactive ASCII portrait — sits in the right hero column.
+   Inherits the paper background; the JS draws ink-toned glyphs directly
+   on the page so it visually merges with the hero rather than living in
+   a dark inset. */
+.md-typeset .pk-hero__aside {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  font-family: var(--pk-sans);
+  min-width: 0;
+}
+.md-typeset .pk-bob {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;                  /* aspect-ratio set by the JS */
+  background: transparent;       /* blend with hero paper */
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  cursor: crosshair;
+}
+.md-typeset .pk-bob__caption {
+  margin-top: 0.875rem;
+  font-size: 11.5px;
+  font-family: var(--pk-mono);
+  color: var(--pk-muted);
+  letter-spacing: 0.02em;
+  text-align: center;
+  max-width: 36ch;
+}
+.md-typeset .pk-bob__caption a { color: var(--pk-muted); border-bottom: 1px solid transparent; }
+.md-typeset .pk-bob__caption a:hover { color: var(--pk-ink); border-bottom-color: var(--pk-rule-strong); }
+.md-typeset .pk-hero__eyebrow {
+  font-family: var(--pk-mono);
+  font-size: 12px;
+  color: var(--pk-muted);
+  letter-spacing: 0.04em;
+  margin-bottom: 1.125rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.md-typeset .pk-hero__eyebrow::before {
+  content: '';
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--pk-accent);
+}
+.md-typeset .pk-hero h1 {
+  font-family: var(--pk-sans);
+  font-size: clamp(40px, 5.4vw, 52px);
+  line-height: 1.04;
+  letter-spacing: -0.035em;
+  font-weight: 700;
+  color: var(--pk-ink);
+  margin: 0 0 1.125rem;
+  max-width: 18ch;
+  text-wrap: balance;
+  border: none;
+  padding: 0;
+}
+.md-typeset .pk-hero h1 em {
+  font-style: italic;
+  font-family: var(--pk-serif);
+  font-weight: 500;
+  color: var(--pk-accent);
+}
+.md-typeset .pk-hero__sub {
+  font-family: var(--pk-serif);
+  font-size: 19px;
+  line-height: 1.55;
+  color: var(--pk-muted);
+  max-width: 56ch;
+  margin: 0 0 1.75rem;
+}
+.md-typeset .pk-hero__cta {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.75rem;
+}
+.md-typeset .pk-hero__cta .md-button {
+  font-family: var(--pk-sans);
+  font-weight: 500;
+  font-size: 14px;
+  padding: 0.5625rem 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--pk-rule-strong);
+  background: var(--pk-surface);
+  color: var(--pk-ink);
+  letter-spacing: -0.005em;
+  transition: border-color 0.15s var(--pk-ease), background 0.15s var(--pk-ease);
+}
+.md-typeset .pk-hero__cta .md-button:hover { border-color: var(--pk-ink-2); background: var(--pk-bg-soft); }
+.md-typeset .pk-hero__cta .md-button--primary {
+  background: var(--pk-ink);
+  color: var(--pk-bg);
+  border-color: var(--pk-ink);
+}
+.md-typeset .pk-hero__cta .md-button--primary:hover { background: var(--pk-ink-2); border-color: var(--pk-ink-2); }
+.md-typeset .pk-hero__meta {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  font-family: var(--pk-mono);
+  font-size: 12px;
+  color: var(--pk-muted);
+  flex-wrap: wrap;
+}
+.md-typeset .pk-hero__meta b { color: var(--pk-ink); font-weight: 600; }
+.md-typeset .pk-hero__meta .dot {
+  width: 4px; height: 4px;
+  background: var(--pk-faint);
+  border-radius: 50%;
+  display: inline-block;
+}
+.md-typeset .pk-byline {
+  font-family: var(--pk-sans);
+  font-size: 13px;
+  color: var(--pk-muted);
+  letter-spacing: -0.005em;
+  margin: 0.875rem 0 0;
+  max-width: 64ch;
+}
+.md-typeset .pk-byline strong { color: var(--pk-ink); font-weight: 600; }
+.md-typeset .pk-byline a { border-bottom: 1px solid transparent; }
+.md-typeset .pk-byline a:hover { border-bottom-color: var(--pk-accent); }
+
+.md-typeset .pk-spectrum {
+  margin-top: 1.75rem;
+  display: block;
+  width: 100%;
+  height: 80px;
+  color: var(--pk-accent);
+  opacity: 0.85;
+}
+/* Section header (numbered rule with title) */
+.md-typeset .pk-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin: 3.5rem 0 1.5rem;
+}
+.md-typeset .pk-section-head__num {
+  font-family: var(--pk-mono);
+  font-size: 12px;
+  color: var(--pk-muted);
+  letter-spacing: 0.04em;
+}
+.md-typeset .pk-section-head__title {
+  font-family: var(--pk-sans);
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--pk-ink);
+  margin: 0;
+  flex: none;
+  border: none;
+  padding: 0;
+}
+.md-typeset .pk-section-head::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--pk-rule);
+}
+
+/* Feature grid (replaces grid cards, used on homepage) */
+.md-typeset .pk-features {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0;
+  margin: 0 0 3rem;
+  border-top: 1px solid var(--pk-rule);
+  border-left: 1px solid var(--pk-rule);
+  max-width: none;
+}
+@media (max-width: 800px) { .md-typeset .pk-features { grid-template-columns: 1fr; } }
+.md-typeset .pk-feature {
+  padding: 1.75rem 1.75rem 2rem;
+  border-right: 1px solid var(--pk-rule);
+  border-bottom: 1px solid var(--pk-rule);
+  background: var(--pk-bg);
+  transition: background 0.2s var(--pk-ease);
+}
+.md-typeset .pk-feature:hover { background: var(--pk-bg-soft); }
+.md-typeset .pk-feature__tag {
+  font-family: var(--pk-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--pk-muted);
+  margin-bottom: 1rem;
+  display: block;
+}
+.md-typeset .pk-feature h3 {
+  font-family: var(--pk-sans);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--pk-ink);
+  margin: 0 0 0.5rem;
+  border: none;
+  padding: 0;
+}
+.md-typeset .pk-feature p {
+  font-family: var(--pk-serif);
+  font-size: 15.5px;
+  line-height: 1.55;
+  color: var(--pk-muted);
+  margin: 0;
+  max-width: 42ch;
+}
+
+/* Doc-index grid (homepage navigation) */
+.md-typeset .pk-docindex {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0;
+  border-top: 1px solid var(--pk-rule);
+  margin-bottom: 3rem;
+  max-width: none;
+}
+@media (max-width: 800px) { .md-typeset .pk-docindex { grid-template-columns: 1fr; } }
+.md-typeset .pk-docindex__cell {
+  padding: 1.5rem 0;
+  border-bottom: 1px solid var(--pk-rule);
+}
+@media (min-width: 801px) {
+  .md-typeset .pk-docindex__cell:nth-child(2n+1) { padding-right: 1.75rem; }
+  .md-typeset .pk-docindex__cell:nth-child(2n)   { padding-left: 1.75rem; border-left: 1px solid var(--pk-rule); }
+}
+.md-typeset .pk-docindex__head {
+  display: flex; align-items: center; gap: 0.625rem;
+  margin-bottom: 0.625rem;
+}
+.md-typeset .pk-docindex__num {
+  font-family: var(--pk-mono);
+  font-size: 11px;
+  color: var(--pk-muted);
+  width: 24px;
+}
+.md-typeset .pk-docindex__title {
+  font-family: var(--pk-sans);
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--pk-ink);
+  letter-spacing: -0.01em;
+}
+.md-typeset .pk-docindex ul {
+  list-style: none;
+  padding: 0; margin: 0 0 0 1.5rem;
+  max-width: none;
+}
+.md-typeset .pk-docindex li {
+  margin: 0;
+  border-top: 1px dashed var(--pk-rule);
+}
+.md-typeset .pk-docindex li:first-child { border-top: none; }
+.md-typeset .pk-docindex a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0;
+  font-family: var(--pk-sans);
+  font-size: 13.5px;
+  font-weight: 450;
+  color: var(--pk-ink-2);
+  border: none;
+}
+.md-typeset .pk-docindex a:hover { color: var(--pk-accent); border: none; }
+.md-typeset .pk-docindex a::after {
+  content: '→';
+  font-family: var(--pk-mono);
+  font-size: 12px;
+  color: var(--pk-faint);
+  transition: transform 0.15s var(--pk-ease), color 0.15s var(--pk-ease);
+}
+.md-typeset .pk-docindex a:hover::after { color: var(--pk-accent); transform: translateX(2px); }
+
+/* Generated figures (gpt-image-2 / matplotlib output) */
+.md-typeset figure.pk-figure {
+  margin: 1.75rem 0 1.25rem;
+  text-align: center;
+  max-width: none;
+}
+.md-typeset figure.pk-figure img {
+  display: block;
+  max-width: 100%;
+  margin: 0 auto 0.625rem;
+  border: 1px solid var(--pk-rule);
+  border-radius: 12px;
+  background: var(--pk-surface);
+}
+.md-typeset figure.pk-figure p {
+  margin: 0;
+  max-width: none;
+}
+.md-typeset figure.pk-figure figcaption {
+  display: block;
+  text-align: center;
+  font-family: var(--pk-serif);
+  font-size: 14.5px;
+  line-height: 1.55;
+  color: var(--pk-ink-2);          /* readable, not muted */
+  margin: 0.5rem auto 0;
+  max-width: 60ch;
+}
+.md-typeset figure.pk-figure figcaption strong { color: var(--pk-ink); }
+.md-typeset figure.pk-figure figcaption code { font-size: 0.92em; }
+
+/* Legacy paragraph-caption fallback (in case any survived migration) */
+.md-typeset .pk-figure-caption,
+.md-typeset p.pk-figure-caption,
+.md-typeset em.pk-figure-caption {
+  display: block;
+  text-align: center;
+  font-family: var(--pk-serif);
+  font-size: 14.5px;
+  color: var(--pk-ink-2);
+  margin: 0.25rem auto 1.75rem;
+  max-width: 60ch;
+}
+
+/* Diagram container */
+.md-typeset .pk-diagram {
+  margin: 1.75rem 0 2rem;
+  padding: 1.5rem;
+  border: 1px solid var(--pk-rule);
+  border-radius: 12px;
+  background: var(--pk-bg-soft);
+  overflow: hidden;
+}
+.md-typeset .pk-diagram svg { display: block; width: 100%; height: auto; }
+
+/* Hide default H1 + nav/toc on the homepage when using hide.navigation */
+.md-typeset .pk-hero + p { display: none; } /* swallow stray paragraphs */
+
+/* =====================================================================
+   13. SCROLLBARS, MISC
+   ===================================================================== */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--pk-rule-strong);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--pk-muted-2); background-clip: padding-box; }
+
+/* =====================================================================
+   mkdocstrings — Python reference rendering
+   ===================================================================== */
+.md-typeset .doc-heading {
+  font-family: var(--pk-sans);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--pk-ink);
+}
+.md-typeset .doc-heading code {
+  background: transparent;
+  border: none;
+  font-weight: 600;
+  font-size: 1em;
+  color: var(--pk-accent);
+  padding: 0;
+}
+
+/* Object signature card — clean, compact */
+.md-typeset .doc-object {
+  margin: 1.5rem 0 2rem;
+  border: 1px solid var(--pk-rule);
+  border-radius: 10px;
+  background: var(--pk-bg);
+  padding: 1rem 1.25rem 1.125rem;
+}
+/* Kill the default heading top-margin / divider when the heading is the
+   first child of a doc-object card — that's where the empty space at the
+   top of every "func" / "class" block was coming from. */
+.md-typeset .doc-object > .doc-heading,
+.md-typeset .doc-object > h2:first-child,
+.md-typeset .doc-object > h3:first-child,
+.md-typeset .doc-object > h4:first-child,
+.md-typeset .doc-object > h5:first-child,
+.md-typeset .doc-object > h6:first-child {
+  margin-top: 0 !important;
+  padding-top: 0 !important;
+  border-top: none !important;
+}
+.md-typeset .doc-object > .doc-heading {
+  margin-bottom: 0.5rem;
+  font-size: 17px;
+  line-height: 1.3;
+}
+.md-typeset .doc-object > .doc-signature,
+.md-typeset .doc-object > div.highlight {
+  margin-top: 0.375rem;
+  margin-bottom: 0.75rem;
+}
+
+.md-typeset .doc-symbol {
+  font-family: var(--pk-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--pk-muted);
+  border: 1px solid var(--pk-rule);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-right: 0.5rem;
+  vertical-align: 2px;
+  background: var(--pk-bg-soft);
+}
+.md-typeset .doc-symbol-class    { color: var(--pk-accent); border-color: var(--pk-accent-rule); background: var(--pk-accent-soft); }
+.md-typeset .doc-symbol-function { color: var(--pk-tip); border-color: color-mix(in oklab, var(--pk-tip) 30%, var(--pk-rule)); }
+.md-typeset .doc-symbol-method   { color: var(--pk-tip); border-color: color-mix(in oklab, var(--pk-tip) 30%, var(--pk-rule)); }
+.md-typeset .doc-symbol-attribute,
+.md-typeset .doc-symbol-property { color: var(--pk-warn); border-color: color-mix(in oklab, var(--pk-warn) 30%, var(--pk-rule)); }
+.md-typeset .doc-symbol-module   { color: var(--pk-physics); border-color: color-mix(in oklab, var(--pk-physics) 30%, var(--pk-rule)); }
+
+/* Signature pre block — wraps under the heading, dark slab */
+.md-typeset .doc-signature {
+  margin: 0.5rem 0 0.75rem;
+}
+.md-typeset .doc-signature .highlight,
+.md-typeset code.doc-signature {
+  margin: 0.5rem 0 0;
+  background: var(--pk-code-bg);
+  border-color: var(--pk-rule);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+/* Parameter / returns / raises sections — compact tables */
+.md-typeset .doc-contents {
+  padding: 0;
+  border: none;
+  margin-top: 0.5rem;
+}
+
+.md-typeset .doc-section-title {
+  font-family: var(--pk-sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pk-muted);
+  margin: 1rem 0 0.375rem;
+  border: none;
+  padding: 0;
+}
+
+.md-typeset .doc-section table {
+  width: 100%;
+  font-family: var(--pk-sans);
+  font-size: 13.5px;
+  border-radius: 6px;
+  margin: 0.25rem 0 0;
+}
+.md-typeset .doc-section table th { font-size: 10.5px; padding: 0.5rem 0.75rem; }
+.md-typeset .doc-section table td { padding: 0.5rem 0.75rem; }
+.md-typeset .doc-section table td:first-child {
+  font-family: var(--pk-mono);
+  font-weight: 500;
+  color: var(--pk-accent);
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+
+/* Children (nested members) */
+.md-typeset .doc-children {
+  margin-top: 1.25rem;
+  padding-left: 0;
+  border: none;
+}
+
+/* Source footer (when shown) */
+.md-typeset .doc-source-link,
+.md-typeset details.quote summary { font-family: var(--pk-mono); font-size: 11px; color: var(--pk-muted); }
+
+/* =====================================================================
+   MathJax — centre DISPLAY equations across the full content column,
+   keep INLINE math inline (never apply block styling to <span> wrappers).
+   pymdownx.arithmatex emits:
+     - <div class="arithmatex">\[ ... \]</div>   for display math
+     - <span class="arithmatex">\( ... \)</span> for inline math
+   MathJax 3 then renders each into an <mjx-container> with display="true"
+   for block math and no display attribute for inline math.
+   ===================================================================== */
+.md-typeset .arithmatex { color: var(--pk-ink); }
+
+/* DISPLAY math: block, full-width parent, centred contents.
+   These selectors only target the BLOCK form (div.arithmatex / mjx-container[display=true]). */
+.md-typeset div.arithmatex {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 1.25rem 0 1.5rem;
+  text-align: center;
+  overflow-x: auto;
+}
+.md-typeset mjx-container[display="true"] {
+  display: block !important;
+  text-align: center !important;
+  margin: 0.5rem auto !important;
+  overflow-x: auto;
+}
+.md-typeset mjx-container[display="true"] > mjx-math {
+  display: inline-block !important;
+  text-align: left;
+}
+
+/* INLINE math: leave the span / non-display container completely alone
+   so it flows inside its paragraph. No display:block, no margins, no
+   text-align overrides. */
+.md-typeset span.arithmatex,
+.md-typeset mjx-container:not([display="true"]) {
+  display: inline;
+}
+
+/* Mermaid containers — frame the rendered diagram */
+.md-typeset .mermaid {
+  background: var(--pk-bg-soft);
+  border: 1px solid var(--pk-rule);
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem 1rem;
+  margin: 1.75rem 0;
+  text-align: center;
+  overflow-x: auto;
+  font-family: var(--pk-sans);
+}
+/* Tighten mermaid edge label backgrounds to match our paper bg */
+.md-typeset .mermaid .edgeLabel,
+.md-typeset .mermaid .edgeLabel rect {
+  background: var(--pk-bg-soft) !important;
+  fill: var(--pk-bg-soft) !important;
+}
+.md-typeset .mermaid .nodeLabel,
+.md-typeset .mermaid .label foreignObject div {
+  font-family: var(--pk-sans) !important;
+  font-size: 13.5px !important;
+  font-weight: 500 !important;
+  letter-spacing: -0.005em;
+  color: var(--pk-ink) !important;
+}
+.md-typeset .mermaid .cluster rect {
+  fill: var(--pk-bg) !important;
+  stroke: var(--pk-rule-strong) !important;
+  stroke-dasharray: 0 !important;
+  rx: 10px;
+  ry: 10px;
+}
+.md-typeset .mermaid .cluster text,
+.md-typeset .mermaid .cluster .nodeLabel {
+  font-family: var(--pk-mono) !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.04em !important;
+  text-transform: uppercase !important;
+  fill: var(--pk-muted) !important;
+  color: var(--pk-muted) !important;
+}
+.md-typeset .mermaid .node rect,
+.md-typeset .mermaid .node circle,
+.md-typeset .mermaid .node ellipse,
+.md-typeset .mermaid .node polygon {
+  rx: 8px;
+  ry: 8px;
+  stroke-width: 1px !important;
+}
+.md-typeset .mermaid .flowchart-link {
+  stroke: var(--pk-muted) !important;
+  stroke-width: 1.25px !important;
+  fill: none !important;
+}
+.md-typeset .mermaid .marker {
+  fill: var(--pk-muted) !important;
+  stroke: var(--pk-muted) !important;
+}
+
+/* Better focus rings */
+:focus-visible {
+  outline: 2px solid var(--pk-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Small viewports */
+@media (max-width: 76.1875em) {
+  .md-typeset .pk-hero h1 { font-size: clamp(32px, 8vw, 44px); }
+  .md-typeset .pk-section-head { margin: 2.5rem 0 1.25rem; }
+}

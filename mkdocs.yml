@@ -1,0 +1,141 @@
+site_name: "pykurucz"
+site_description: "Pure Python ATLAS12 & SYNTHE — Synthetic Stellar Spectra"
+site_author: "pykurucz contributors"
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.tabs.link
+    - content.code.copy
+    - content.code.annotate
+  font:
+    text: "Inter Tight"
+    code: "JetBrains Mono"
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+  - javascripts/bob-portrait.js
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: true
+            show_root_toc_entry: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_category_heading: true
+            group_by_category: true
+            show_signature_annotations: true
+            separate_signature: true
+            line_length: 80
+            merge_init_into_class: true
+            show_if_no_docstring: false
+            heading_level: 3
+  - gen-files:
+      scripts: []
+  - literate-nav
+
+markdown_extensions:
+  - admonition
+  - tables
+  - attr_list
+  - md_in_html
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.critic
+  - pymdownx.caret
+  - pymdownx.tilde
+  - def_list
+  - footnotes
+  - toc:
+      permalink: true
+      toc_depth: 3
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+      - Downloading Data: getting-started/downloading-data.md
+      - First Spectrum: getting-started/first-spectrum.md
+  - User Guide:
+      - Overview: user-guide/overview.md
+      - From Stellar Parameters: user-guide/from-parameters.md
+      - From an Existing Atmosphere: user-guide/from-atmosphere.md
+      - Atmosphere Emulator: user-guide/emulator.md
+      - Output Files: user-guide/output-files.md
+      - CLI Reference: user-guide/cli-reference.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - atlas_py: architecture/atlas-py.md
+      - synthe_py: architecture/synthe-py.md
+      - Atmosphere Emulator: architecture/emulator.md
+      - Data Flows: architecture/data-flows.md
+      - Fortran Parity: architecture/fortran-parity.md
+  - Physics:
+      - Radiative Transfer: physics/radiative-transfer.md
+      - Opacity: physics/opacity.md
+      - Molecular Equilibrium: physics/molecular-equilibrium.md
+      - Line Broadening: physics/line-broadening.md
+      - Hydrogen & Helium: physics/hydrogen-helium.md
+  - Python Reference:
+      - pykurucz: api-reference/pykurucz.md
+      - atlas_py: api-reference/atlas-py.md
+      - synthe_py: api-reference/synthe-py.md
+      - Atmosphere Emulator: api-reference/emulator.md
+  - Examples:
+      - Solar Spectrum: examples/solar-spectrum.md
+      - Cool Star: examples/cool-star.md
+      - Custom Abundances: examples/custom-abundances.md
+      - Resolution Comparison: examples/resolution-comparison.md
+  - About:
+      - Citation: about/citation.md
+      - License: about/license.md
+      - Acknowledgements: about/acknowledgements.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/pykurucz/pykurucz
+  version:
+    provider: mike
