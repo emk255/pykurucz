@@ -8,9 +8,9 @@ By **Elliot M. Kim** (Cornell) &nbsp;·&nbsp; **[Yuan-Sen Ting](https://ysting.s
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-pykurucz.readthedocs.io-1F6FEB.svg)](https://pykurucz.readthedocs.io)
+[![Docs](https://img.shields.io/badge/docs-pykurucz.vercel.app-1F6FEB.svg)](https://pykurucz.vercel.app)
 
-📖 **Full documentation:** **[pykurucz.readthedocs.io](https://pykurucz.readthedocs.io)** — installation, user guide, architecture, physics reference, and worked examples.
+📖 **Full documentation:** **[pykurucz.vercel.app](https://pykurucz.vercel.app)** — installation, user guide, architecture, physics reference, and worked examples.
 
 </div>
 
@@ -79,7 +79,7 @@ python pykurucz.py --teff 4800 --logg 1.5 \
 
 Full documentation with installation guides, architecture deep-dives, physics reference, Python reference, and worked examples:
 
-**→ [pykurucz.readthedocs.io](https://pykurucz.readthedocs.io)** *(or build locally: `pip install -r requirements-docs.txt && mkdocs serve`)*
+**→ [pykurucz.vercel.app](https://pykurucz.vercel.app)** *(or build locally: `pip install -r requirements-docs.txt && mkdocs serve`)*
 
 ## Package layout
 
