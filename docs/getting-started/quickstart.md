@@ -1,46 +1,87 @@
 # Quickstart
 
-This page walks you through the fastest path to a synthetic spectrum. We will show **Stellar Parameters** — the end-to-end pipeline that starts from stellar parameters — and **Existing Atmosphere** — synthesis from an existing `.atm` file.
+This page walks you through the fastest path to a synthetic spectrum. The
+**Stellar Parameters** workflow takes $T_{\rm eff}$, $\log g$, and an
+abundance specification (bulk and/or per-element) and runs the full
+emulator → `atlas_py` → `synthe_py` pipeline. The **Existing Atmosphere**
+workflow takes a pre-computed `.atm` file and skips straight to synthesis.
 
-!!! tip "Not sure which mode to use?"
-    If you have stellar parameters (\(T_{\rm eff}\), \(\log g\), [M/H]) and want a complete spectrum, use **Stellar Parameters**. If you already have a model atmosphere from ATLAS12, MARCS, or PHOENIX, use **Existing Atmosphere**.
+!!! tip "Which mode?"
+    Use **Stellar Parameters** when you want abundance changes — bulk or
+    per-element — to reshape the atmosphere itself. Use **Existing
+    Atmosphere** when you already have a model from ATLAS12, MARCS,
+    PHOENIX, or another code that you trust as-is.
 
 ## Stellar Parameters — End-to-End from Stellar Parameters
 
-The fastest way to generate a spectrum is to let `pykurucz.py` do everything: emulator warm-start → `atlas_py` iteration → `synthe_py` synthesis.
+`pykurucz.py` does the whole thing: emulator warm-start → `atlas_py`
+iteration → `synthe_py` synthesis. Below are the three usage patterns
+you'll hit most often.
 
-### 1. Full pipeline (recommended)
+### 1a. Bulk metallicity (the everyday case)
 
 ```bash
-python pykurucz.py --teff 5770 --logg 4.44 --wl-start 500 --wl-end 510
+# Metal-poor α-enhanced K giant
+python pykurucz.py --teff 4500 --logg 2.0 \
+    --mh -1.5 --am 0.3 \
+    --wl-start 500 --wl-end 510
 ```
 
-This produces:
+`--mh` scales every metal uniformly from solar; `--am` adds an extra
+offset to the standard α-elements. This produces:
 
-- `results/atm/t05770g4.44_mh+0.00_am+0.00_warmstart.atm` — emulator prediction
-- `results/atm/t05770g4.44_mh+0.00_am+0.00.atm` — iterated atmosphere
-- `results/npz/t05770g4.44_mh+0.00_am+0.00.npz` — preprocessed populations
-- `results/spec/t05770g4.44_mh+0.00_am+0.00_500_510.spec` — final spectrum
+- `results/atm/t04500g2.00_mh-1.50_am+0.30_warmstart.atm` — emulator prediction
+- `results/atm/t04500g2.00_mh-1.50_am+0.30.atm` — iterated atmosphere
+- `results/npz/t04500g2.00_mh-1.50_am+0.30.npz` — preprocessed populations
+- `results/spec/t04500g2.00_mh-1.50_am+0.30_500_510.spec` — final spectrum
 
-### 2. Python API
+### 1b. Per-element abundances (peculiar patterns)
+
+For CEMP, Ap, individual α-element overrides, r-process enhancements,
+etc. — pass any number of `--abund SYMBOL:OFFSET_DEX` flags. Per-element
+overrides stack on top of any `--mh`/`--am` you also supply:
+
+```bash
+# CEMP-s star: Fe-poor, C and Ba enhanced
+python pykurucz.py --teff 4800 --logg 1.5 \
+    --abund Fe:-2.5 --abund C:+1.2 --abund Ba:+1.0 \
+    --wl-start 400 --wl-end 700
+```
+
+Internally the offsets are also rolled into an effective scalar
+$\rm[M/H]$/$\rm[\alpha/M]$ to seed the warm-start emulator, then the
+**exact** per-element pattern is written into the `.atm` file's
+abundance card so `atlas_py` and `synthe_py` both see the same numbers.
+See [Stellar Parameters](../user-guide/from-parameters.md#abundances)
+for the full story.
+
+### 2. Same thing from Python
 
 ```python
 from pykurucz import synthesize
 
+# Same metal-poor α-enhanced K giant as 1a
 spec_path = synthesize(
-    teff=5770,
-    logg=4.44,
-    mh=0.0,
-    am=0.0,
-    wl_start=500.0,
-    wl_end=510.0,
+    teff=4500, logg=2.0,
+    mh=-1.5, am=0.3,
+    wl_start=500.0, wl_end=510.0,
     resolution=300_000,
 )
-print(f"Spectrum written to: {spec_path}")
+
+# Or the per-element CEMP-s case (Z → dex offset)
+spec_path = synthesize(
+    teff=4800, logg=1.5,
+    abundances={26: -2.5, 6: +1.2, 56: +1.0},
+    wl_start=400.0, wl_end=700.0,
+)
 ```
 
 !!! note "Convergence and early stopping"
-    By default `atlas_py` runs up to 30 iterations but stops early when the physical columns (`RHOX`, `T`, `P`, `XNE`, `ABROSS`, `VTURB`) change by less than `1e-3` after at least 5 iterations. See [Stellar Parameters](../user-guide/from-parameters.md) for details on tuning these parameters.
+    By default `atlas_py` runs up to 30 iterations but stops early when
+    the physical columns (`RHOX`, `T`, `P`, `XNE`, `ABROSS`, `VTURB`)
+    change by less than `1e-3` after at least 5 iterations. See
+    [Stellar Parameters](../user-guide/from-parameters.md) for details
+    on tuning these parameters.
 
 ## Existing Atmosphere — Synthesis from a Model Atmosphere
 
