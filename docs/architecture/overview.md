@@ -12,15 +12,20 @@ Python packages cross-reference each other internally.
 
 ## Design Principles
 
-### ATLAS12, not ATLAS9: arbitrary abundance patterns
+### ATLAS12, not ATLAS9: opacity sampling for any abundance pattern
 
-The single most important reason `atlas_py` reimplements ATLAS12 (rather than the more widely distributed ATLAS9) is **opacity sampling for arbitrary per-element abundance patterns**.
+The reason `atlas_py` reimplements ATLAS12 (rather than the more widely distributed ATLAS9) is **how it handles opacity**.
 
-ATLAS9 atmospheres are computed against pre-tabulated opacity distribution functions (ODFs) keyed on a small set of bulk-metallicity tags (e.g. solar, $\alpha$-enhanced, scaled by [M/H]). Anything outside that grid — a CEMP star, an Ap star, an iron-poor halo giant with a large $[\alpha$/Fe], any specific element jacked up or knocked down by a dex — is unreachable in ATLAS9 without recomputing the ODF, which most users never do.
+ATLAS9 atmospheres are computed against pre-tabulated **opacity distribution functions** (ODFs) keyed on a fixed set of bulk-metallicity tags (e.g. solar, $\alpha$-enhanced, scaled by $\rm[M/H]$). For a target that lies on those tags — most "give me a metal-poor giant" use cases — ATLAS9 is fast and perfectly adequate. But anything *off* the grid (a CEMP star, an Ap star, an individual α-element offset, an r-process-enhanced halo star) requires re-tabulating the ODF, which most users do not do.
 
-ATLAS12 was Kurucz's answer to this: instead of pre-tabulating opacity for a finite set of abundance patterns, it **directly samples opacity** at each iteration from the actual line list, using whatever per-element abundances you specify. The atmosphere structure then adjusts self-consistently to that opacity.
+ATLAS12 dropped the ODF approach entirely. Instead of pre-tabulating opacity for a finite set of abundance patterns, it does **direct opacity sampling** at each iteration from the actual line list, using whatever per-element abundances you supply. The atmosphere structure then adjusts self-consistently to that opacity.
 
-`atlas_py` preserves this property: any combination of `--abund` flags (or any `abundances` dict in the Python API) propagates straight into the opacity sampling loop, the temperature correction, and the converged atmosphere. The downstream synthesis then uses the **same** abundance pattern for line opacity. There is no inconsistency between "the atmosphere's abundances" and "the spectrum's abundances".
+This means a single pipeline covers both common workflows:
+
+- **Bulk** — set `--mh` / `--am`. Each iteration samples opacity from the line list with metals scaled by $\rm[M/H]$ and α-elements bumped by $\rm[\alpha/M]$.
+- **Per-element** — pass `--abund X:offset` (any number of times). Each iteration samples opacity with each element at its requested abundance.
+
+In either case the converged atmosphere is built around the **specific** opacity pattern you asked for, and the downstream synthesis uses the **same** pattern for line opacity. No inconsistency between "the atmosphere's abundances" and "the spectrum's abundances" — that is the property an ODF-based ATLAS9 cannot give you when you depart from its tags.
 
 ### Fortran Parity
 

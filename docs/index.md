@@ -14,8 +14,9 @@ hide:
 <div class="pk-hero__sub" markdown>
 A faithful, performance-tuned reimplementation of Robert Kurucz's
 **ATLAS12** stellar atmosphere code and **SYNTHE** spectrum synthesis
-code, in pure Python. Go from $T_{\rm eff}$, $\log g$, and an
-**arbitrary per-element abundance pattern** to a self-consistent
+code, in pure Python. Go from $T_{\rm eff}$, $\log g$, and either a
+**bulk metallicity / α-enhancement** ($\rm[M/H]$, $\rm[\alpha/M]$) or
+an **arbitrary per-element abundance pattern**, to a self-consistent
 300–1800 nm spectrum — atmosphere included — on a laptop.
 </div>
 
@@ -129,14 +130,16 @@ never reach the threshold within the iteration budget.
 
 <div class="pk-feature" markdown>
 <span class="pk-feature__tag">04 · ABUNDANCES</span>
-### Per-element control, atmosphere included
-This is **why ATLAS12** rather than a pre-computed grid. Override any
-element relative to solar (`--abund Fe:-1.0 --abund C:+0.4 …`) and
-the atmosphere is **rebuilt from scratch** with the new opacity, so
-line blanketing changes the temperature structure self-consistently —
-not just the spectrum on top of a generic atmosphere. Carbon-rich
-giants, peculiar Ap stars, r-process-enhanced halo stars all become
-tractable in a single command.
+### Bulk and per-element, atmosphere included
+Two common modes, one consistent pipeline. Set bulk **`--mh`** and
+**`--am`** for the standard scaled-solar / α-enhanced cases, or
+override **any individual element** (`--abund Fe:-1.0 --abund C:+0.4 …`)
+when you need a peculiar pattern. Either way, the **atmosphere is
+rebuilt from scratch** with the matching opacity, so line blanketing
+reshapes the temperature structure self-consistently — not just the
+spectrum on top of a generic template. Halo dwarfs, α-rich giants,
+CEMP-s carbon-rich giants, peculiar Ap stars all work end-to-end from
+one command.
 </div>
 
 </div>

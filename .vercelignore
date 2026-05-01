@@ -1,0 +1,32 @@
+# Exclude everything Vercel does not need to build the docs.
+# (Vercel does NOT honour .gitignore; only this file.)
+
+# Multi-GB runtime binaries — downloaded at install time, not for docs build
+data/lines/
+data/molecules/
+lines/gfpred29dec2014.bin
+lines/gfpred29dec2014.bin.part_*
+lines/.py_line_cache/
+
+# Big LFS-tracked atomic line list — not needed by the docs build
+lines/gfallvac.latest
+
+# Other binary line caches
+lines/diatomicspacksrt.bin
+lines/hilines.bin
+lines/lowobsat12.bin
+lines/nltelinobsat12.bin
+
+# Trained PyTorch weights (mkdocstrings imports the module but never loads weights)
+emulator/a_one_weights.pt
+
+# Local dev / OS detritus
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+
+# Already-built docs (Vercel rebuilds it)
+site/
+results/

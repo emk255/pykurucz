@@ -103,7 +103,7 @@ python -m synthe_py.cli your_model.atm lines/gfallvac.latest \
 
 For the **full enumeration** (NLTE, scattering tolerance, microturbulence,
 log level, environment variables), see the
-[CLI reference](cli-reference.md#python--m-synthe_pycli--spectrum-synthesis).
+[CLI reference](cli-reference.md#python-m-synthe_pycli-spectrum-synthesis).
 
 !!! tip "Molecules are on by default"
     If `data/molecules/` is populated, molecular catalogues are

@@ -4,3 +4,14 @@ mkdocstrings[python]
 mkdocs-gen-files
 mkdocs-literate-nav
 pymdown-extensions
+
+# Runtime deps the docs build itself needs because mkdocstrings imports
+# atlas_py / synthe_py / emulator to extract their docstrings. Vercel's
+# clean Python sandbox does not have these otherwise.
+numpy>=1.24
+scipy>=1.10
+numba>=0.58
+# torch — required by `emulator/` module-level imports
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+

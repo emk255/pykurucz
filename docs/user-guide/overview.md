@@ -3,11 +3,14 @@
 This guide explains how to use pykurucz to generate synthetic stellar spectra. The package offers two primary workflows — **Existing Atmosphere** and **Stellar Parameters** — which share the same validated spectrum synthesis core but differ in how the model atmosphere is prepared.
 
 !!! physics "Why ATLAS12 — and what makes pykurucz different"
-    A spectrum-synthesis code on top of a pre-computed atmosphere grid (e.g. SYNTHE alone on a MARCS or ATLAS9 model) treats abundances as a *post-hoc* knob: change [Fe/H] and the *line opacities* change, but the temperature structure, electron density, and continuum opacity stay frozen on whatever atmosphere the grid happened to provide. That is a very good approximation when you are within scaled-solar territory.
+    Two abundance use-cases come up all the time, and pykurucz handles both in the **same pipeline**:
 
-    For anything **abundance-peculiar** — carbon-enhanced metal-poor (CEMP) stars, Ap stars, $\alpha$-rich halo stars, individual elements offset by a dex or more — the line blanketing on the *atmosphere itself* matters: heavy elements absorb in the UV, redistribute flux to the optical, and shift the temperature stratification by tens to hundreds of kelvin. **ATLAS12** was designed for exactly this case: it does direct opacity sampling so you can specify any per-element abundance pattern and the atmosphere is **rebuilt self-consistently** with that opacity. SYNTHE then synthesises a spectrum from *that* atmosphere, not a borrowed one.
+    - **Bulk metallicity / α-enhancement.** The `[M/H]` and `[α/M]` knobs (`--mh`, `--am`) cover the everyday scaled-solar and α-enhanced cases — halo dwarfs, thick-disk giants, anything where the abundance pattern is a uniform multi-element shift. This is the most common workflow.
+    - **Individual-element offsets.** `--abund Fe:-1.0 --abund C:+0.4 …` (or `abundances={26: -1.0, 6: +0.4, ...}` from Python) lets you override any element separately for peculiar patterns — CEMP stars, Ap stars, individual α-elements set independently, r-process-enhanced halo stars.
 
-    pykurucz preserves this property. Whether you call `pykurucz.synthesize(abundances={26: -1.0, 6: +0.4, ...})` from Python or pass `--abund Fe:-1.0 --abund C:+0.4` on the CLI, every offset propagates into the atmosphere iteration and out the other side. See [Stellar Parameters](from-parameters.md#custom-abundances) for the syntax and [Custom Abundances](../examples/custom-abundances.md) for worked examples.
+    The reason to drive ATLAS12 (rather than just SYNTHE on a pre-computed atmosphere grid) is that **either kind of abundance change reshapes the atmosphere itself**: heavy elements absorb in the UV, redistribute flux to the optical, shift the temperature stratification by tens to hundreds of kelvin, and change the electron density. ATLAS12 does direct opacity sampling, so whatever abundance pattern you specify, the atmosphere is **rebuilt self-consistently** with the matching opacity. SYNTHE then synthesises a spectrum from *that* atmosphere, not a borrowed one.
+
+    Whether you go bulk-only (`--mh -1.5 --am 0.3`) or per-element (`--abund …`), every offset propagates into the atmosphere iteration and out the other side. See [Stellar Parameters](from-parameters.md#abundances) for the syntax and [Custom Abundances](../examples/custom-abundances.md) for worked examples.
 
 ## High-Level Pipeline
 

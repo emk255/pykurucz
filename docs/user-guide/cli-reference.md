@@ -58,7 +58,7 @@ python pykurucz.py --teff <Teff> --logg <logg> [options]
     `pykurucz.py` ships with **H₂O on by default** (`include_h2o=True`); the
     standalone `synthe_py.cli` ships with **H₂O off by default** to match the
     Fortran reference compilation (see the
-    [`synthe_py.cli` molecular-lines section](#python--m-synthe_pycli--spectrum-synthesis)
+    [`synthe_py.cli` molecular-lines section](#python-m-synthe_pycli-spectrum-synthesis)
     below). When chasing parity bugs against the Fortran outputs, double-check
     which CLI you're using.
 

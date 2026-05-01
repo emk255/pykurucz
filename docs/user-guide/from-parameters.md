@@ -1,17 +1,22 @@
 # Stellar Parameters — End-to-End Spectrum Synthesis
 
 The Stellar Parameters workflow is pykurucz's flagship: you provide
-**stellar parameters and any per-element abundances you want**, and the
+**stellar parameters and an abundance specification**, and the
 pipeline returns a self-consistent synthetic spectrum. The atmosphere
-is rebuilt with the requested opacity and the spectrum is computed from
-*that* atmosphere — not a generic scaled-solar template.
+is rebuilt with the requested opacity and the spectrum is computed
+from *that* atmosphere — not a generic scaled-solar template.
 
-!!! tip "Abundances are first-class inputs, not an afterthought"
-    The reason to drive the full ATLAS12 pipeline (rather than just
-    SYNTHE on a pre-computed atmosphere) is that you can specify any
-    elemental abundance pattern and the **atmosphere structure**
-    adjusts accordingly. See [Custom abundances](#custom-abundances)
-    below.
+There are two abundance flows, both fully supported and both common:
+
+- **Bulk** — set $\rm[M/H]$ and $\rm[\alpha/M]$ via `--mh` / `--am`.
+  The standard knobs for halo / thick-disk / α-rich grids.
+- **Per-element** — set any individual element offset via `--abund`
+  (repeatable). For carbon-enhanced metal-poor stars, peculiar Ap
+  stars, individual α-element overrides, etc.
+
+You can mix the two: bulk knobs set the baseline pattern, individual
+`--abund` overrides take precedence for the elements you specify. See
+[Abundances](#abundances) below for the syntax.
 
 ## The Pipeline
 
@@ -62,16 +67,52 @@ The most-used flags at a glance:
 For the **full enumeration** (convergence knobs, TiO/H₂O toggles, parallelism,
 diagnostics, environment variables), see the **[CLI reference](cli-reference.md)**.
 
-## Custom abundances
+## Abundances
 
-The `--abund` flag (CLI) and the `abundances` keyword (Python) are the
-**central input** for this workflow whenever your target is not
-scaled-solar. They take per-element offsets in dex relative to solar:
+Two flows, both first-class and frequently used together.
+
+### Bulk: scaled-solar with `--mh` and `--am`
+
+For the everyday case — halo dwarfs, α-rich giants, anywhere the
+target is well-described by a uniform metallicity offset plus a uniform
+α-enhancement:
 
 === "Command line"
 
     ```bash
-    # CEMP-s star: Fe-poor, C and Ba enhanced
+    # Metal-poor α-enhanced K giant
+    python pykurucz.py --teff 4500 --logg 2.0 \
+        --mh -1.5 --am 0.3 \
+        --wl-start 400 --wl-end 700
+    ```
+
+=== "Python"
+
+    ```python
+    from pykurucz import synthesize
+
+    spec_path = synthesize(
+        teff=4500, logg=2.0,
+        mh=-1.5, am=0.3,
+        wl_start=400, wl_end=700,
+    )
+    ```
+
+`--mh` scales every metal uniformly from solar; `--am` adds an extra
+offset to the standard α-elements (O, Ne, Mg, Si, S, Ca, Ti). Both go
+straight into the atmosphere iteration *and* the line opacities.
+
+### Per-element: `--abund` for non-scaled-solar patterns
+
+When the target is abundance-peculiar (CEMP, Ap, individual α-elements
+set separately, r-process enhancement, etc.), specify per-element
+offsets in dex relative to solar. `--abund` is repeatable and stacks
+on top of any bulk `--mh` / `--am`:
+
+=== "Command line"
+
+    ```bash
+    # CEMP-s star: Fe-poor, C and Ba enhanced (no other α offset needed)
     python pykurucz.py --teff 4800 --logg 1.5 \
         --abund Fe:-2.5 \
         --abund C:+1.2 \
@@ -91,21 +132,26 @@ scaled-solar. They take per-element offsets in dex relative to solar:
     )
     ```
 
-What happens internally:
+The `abundances` dict is keyed on atomic number (Z); the CLI accepts
+either symbol (`Fe`) or atomic number (`26`).
 
-1. The offsets are translated into an effective scalar [M/H] and [α/M]
-   so the emulator can produce a sensible warm-start atmosphere.
-2. The **exact** per-element offsets — not the effective scalars — are
-   written into the `.atm` file's abundance card.
-3. `atlas_py` runs its iteration with the true abundance pattern,
-   recomputing opacity and line blanketing for it.
+### What happens internally
+
+Whether you used the bulk knobs, the per-element overrides, or both:
+
+1. The offsets are combined into an **effective scalar** $\rm[M/H]$ and
+   $\rm[\alpha/M]$ so the [emulator](emulator.md) can produce a
+   sensible warm-start atmosphere.
+2. The **exact** per-element abundances — not the effective scalars —
+   are written into the `.atm` abundance card.
+3. `atlas_py` iterates with the true abundance pattern, recomputing
+   opacity and line blanketing self-consistently.
 4. `synthe_py` synthesises lines from the **same** abundance pattern.
 
-The result is that elements you tweak affect both the **atmosphere
-structure** (via opacity feedback) and the **line opacities**
-themselves — which is the right physics, and is what scaled-solar
-template grids cannot give you. See [Custom Abundances](../examples/custom-abundances.md)
-for worked CEMP / Ap / α-enhanced examples.
+So the elements you tweak shape both the atmosphere (via opacity
+feedback) and the spectrum (via line strengths). See
+[Custom Abundances](../examples/custom-abundances.md) for worked
+CEMP / Ap / α-enhanced examples.
 
 ## Using it from Python
 

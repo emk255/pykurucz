@@ -16,7 +16,7 @@ By **Elliot M. Kim** (Cornell) &nbsp;·&nbsp; **[Yuan-Sen Ting](https://ysting.s
 
 > *Dedicated to the memory of **Robert L. Kurucz** (1944–2025), whose ATLAS and SYNTHE codes laid the foundations for modern stellar spectroscopy.*
 
-pykurucz is a faithful, performance-tuned reimplementation of Kurucz's ATLAS12 (stellar atmosphere modeling) and SYNTHE (spectrum synthesis) in pure Python — no Fortran compiler required. The point of using ATLAS12 (rather than a pre-computed grid) is **per-element abundance control**: specify any element offset relative to solar (`--abund Fe:-2.5 --abund C:+1.2 …`) and the atmosphere is rebuilt with the matching opacity, so line blanketing reshapes the temperature structure self-consistently. Numba-JIT'd hot loops keep wall-time competitive with Fortran, and the result is validated end-to-end with sub-0.1% flux differences.
+pykurucz is a faithful, performance-tuned reimplementation of Kurucz's ATLAS12 (stellar atmosphere modeling) and SYNTHE (spectrum synthesis) in pure Python — no Fortran compiler required. Two abundance workflows are first-class: bulk scaling via `--mh` / `--am` for the standard scaled-solar / α-enhanced cases, and per-element overrides via `--abund Fe:-1.0 --abund C:+0.4` for peculiar patterns (CEMP, Ap, etc.). Either way the **atmosphere is rebuilt with the matching opacity** so line blanketing reshapes the temperature structure self-consistently — not just the spectrum on top of a generic atmosphere. Numba-JIT'd hot loops keep wall-time competitive with Fortran, and the result is validated end-to-end with sub-0.1% flux differences.
 
 ## Quick start
 
@@ -61,10 +61,10 @@ python pykurucz.py --teff 4800 --logg 1.5 \
 
 ## Features
 
-- **Per-element abundance control** — override any element relative to
-  solar (e.g. `--abund Fe:-1.0 --abund C:+0.4`); the atmosphere is
-  recomputed self-consistently with the new opacity. CEMP, Ap,
-  α-rich halo, and other peculiar patterns work out of the box.
+- **Bulk and per-element abundance control** — `--mh` / `--am` for
+  standard scaled-solar / α-enhanced runs, or `--abund` (repeatable)
+  to override individual elements for peculiar patterns. Either way
+  the atmosphere is recomputed self-consistently with the new opacity.
 - **Pure Python** — NumPy, SciPy, Numba. No Fortran toolchain.
 - **Fortran-validated** — sub-0.1% flux differences vs. original
   ATLAS12 + SYNTHE on the validation grid.
