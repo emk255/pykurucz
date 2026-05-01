@@ -70,33 +70,65 @@ honoring the legacy of **Robert L. Kurucz** (1944–2025)
   <span class="pk-section-head__title">Quick start</span>
 </div>
 
-Give pykurucz four numbers — effective temperature, surface gravity, metallicity, alpha enhancement — and it returns a synthetic spectrum. Equivalently from Python or the command line:
+Give pykurucz $T_{\rm eff}$, $\log g$, and an abundance specification — bulk, per-element, or both — and it returns a self-consistent synthetic spectrum. Two equivalent ways to drive it:
 
-=== "Python"
+=== "Bulk metallicity (most common)"
 
     ```python
     import pykurucz
 
-    # End-to-end: atmosphere emulator warm-start → atlas_py → synthe_py
+    # Metal-poor α-enhanced K giant (the standard workflow)
     spec_path = pykurucz.synthesize(
-        teff=5770,    logg=4.44,
-        mh=0.0,       am=0.0,
-        wl_start=500.0, wl_end=510.0,
+        teff=4500, logg=2.0,
+        mh=-1.5, am=0.3,
+        wl_start=500, wl_end=510,
         resolution=300_000,
     )
-    print(f"Spectrum written to: {spec_path}")
     ```
-
-=== "Command line"
 
     ```bash
     python pykurucz.py \
-        --teff 5770 --logg 4.44 \
-        --wl-start 500 --wl-end 510 \
-        --resolution 300000
-
-    # ✓ wrote results/spec/t05770g4.44_mh+0.00_am+0.00_500_510.spec
+        --teff 4500 --logg 2.0 \
+        --mh -1.5 --am 0.3 \
+        --wl-start 500 --wl-end 510
     ```
+
+=== "Per-element abundances"
+
+    ```python
+    import pykurucz
+
+    # CEMP-s star: Fe-poor, C and Ba enhanced
+    spec_path = pykurucz.synthesize(
+        teff=4800, logg=1.5,
+        abundances={26: -2.5, 6: +1.2, 56: +1.0},  # Z → dex offset
+        wl_start=400, wl_end=700,
+    )
+    ```
+
+    ```bash
+    python pykurucz.py \
+        --teff 4800 --logg 1.5 \
+        --abund Fe:-2.5 --abund C:+1.2 --abund Ba:+1.0 \
+        --wl-start 400 --wl-end 700
+    ```
+
+=== "Plain solar (sanity check)"
+
+    ```python
+    import pykurucz
+    spec_path = pykurucz.synthesize(
+        teff=5770, logg=4.44, mh=0.0, am=0.0,
+        wl_start=500, wl_end=510,
+    )
+    ```
+
+    ```bash
+    python pykurucz.py --teff 5770 --logg 4.44 \
+        --wl-start 500 --wl-end 510
+    ```
+
+In every case the **atmosphere is rebuilt** from the requested abundances and the spectrum is synthesised on top of it — no scaled-solar template assumption. See [Stellar Parameters](user-guide/from-parameters.md#abundances) for the syntax in detail.
 
 
 <div class="pk-section-head">
