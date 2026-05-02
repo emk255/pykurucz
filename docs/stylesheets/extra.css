@@ -754,7 +754,14 @@ body, .md-typeset {
   align-items: stretch;          /* let the right column match left card height */
 }
 .md-typeset .pk-hero__main { min-width: 0; }
-.md-typeset .pk-hero > .pk-spectrum { grid-column: 1 / -1; }
+/* python-markdown wraps the bare <svg> in a <p>, so the SVG isn't a direct
+   child of .pk-hero. Make the wrapper transparent to the grid so the SVG
+   itself becomes the grid item, then let it span the whole hero width. */
+.md-typeset .pk-hero > p:has(> .pk-spectrum) { display: contents; }
+.md-typeset .pk-hero .pk-spectrum {
+  grid-column: 1 / -1;
+  width: 100%;
+}
 @media (max-width: 1000px) {
   .md-typeset .pk-hero { grid-template-columns: 1fr; gap: 2rem; }
   .md-typeset .pk-hero__aside { order: -1; max-width: 480px; margin: 0 auto; }
