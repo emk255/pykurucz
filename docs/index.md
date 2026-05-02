@@ -17,7 +17,7 @@ A faithful, performance-tuned reimplementation of Robert Kurucz's
 code, in pure Python. Go from $T_{\rm eff}$, $\log g$, and either a
 **bulk metallicity / α-enhancement** ($\rm[M/H]$, $\rm[\alpha/M]$) or
 an **arbitrary per-element abundance pattern**, to a self-consistent
-300–1800 nm spectrum — atmosphere included — on a laptop.
+300–1800 nm spectrum — atmosphere included.
 </div>
 
 <div class="pk-hero__cta" markdown>
