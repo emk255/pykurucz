@@ -148,6 +148,21 @@ For exact line positions, consult the line lists themselves.
 | `atlas_py/io/molecules.py` | Parser for `molecules.new` / `molecules.dat` |
 | `synthe_py/physics/mol_populations.py` | Standalone molecular-equilibrium solver used by `convert_atm_to_npz` |
 
+### How abundance changes propagate
+
+NMOLEC's elemental conservation constraint reads the same per-element
+abundance vector that the rest of the code uses
+(`_build_xabund_from_atm` in `synthe_py/physics/mol_populations.py`,
+or the `xabund` argument inside `atlas_py/physics/nmolec.py`). When you
+change `--mh`, `--am`, or any individual `--abund Z:offset`, the new
+abundance vector is what NMOLEC conserves against — so the partial
+pressures of every species are recomputed for the actual pattern, and
+TiO / H₂O / CO / etc. are not borrowed from a scaled-solar template.
+This matters in particular for CEMP-style cases where C/O > 1 flips
+the carbon-bearing chemistry on its head: the same code path handles
+it correctly with no special casing because the abundance vector is
+the only input that changed.
+
 Where it runs in the pipeline:
 
 - In **Stellar Parameters**, NMOLEC is invoked from inside POPSALL on

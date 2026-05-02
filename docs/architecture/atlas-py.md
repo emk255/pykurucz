@@ -2,6 +2,15 @@
 
 `atlas_py` is a pure Python reimplementation of the ATLAS12 stellar atmosphere code. It iterates a model atmosphere to self-consistency, solving hydrostatic equilibrium, the equation of state, opacity, convection, and the temperature-correction equation.
 
+## Why ATLAS12 (and not ATLAS9)
+
+The point of reimplementing ATLAS**12** specifically — rather than the more widely distributed ATLAS9 — is **how opacity is computed**.
+
+- **ATLAS9** reads pre-tabulated **opacity distribution functions** (ODFs) keyed on a small set of bulk-metallicity tags (solar, α-enhanced, scaled by [M/H]). For targets that sit on one of those tags, this is fast and accurate. For *off-grid* abundance patterns (CEMP, Ap, individual α-elements set independently, r-process enhancements), the ODF would have to be re-tabulated — which most users never do.
+- **ATLAS12** does **direct opacity sampling**: at each iteration, the opacity arrays are evaluated from the actual atomic and molecular line lists *at the abundance pattern you supplied*. The atmosphere then relaxes around *that* opacity.
+
+For pykurucz, the practical consequence is that bulk (`--mh`, `--am`) and per-element (`--abund Z:offset`) abundances are **handled identically by `atlas_py`**: both are converted into the per-element abundance vector that `compute_abundances()` writes into the `.atm` abundance card, and the continuum opacity (`kapcont_baseline`) and line opacity (`linop1` / `xlinop`) modules in `engine/driver.py` read those abundances off the layer-by-layer populations on every iteration. Nothing in the iteration code branches on "is this a scaled-solar or peculiar pattern"; to ATLAS, they are the same.
+
 ## Purpose
 
 Given an input atmosphere (either from the emulator warm-start or an external `.atm` file), `atlas_py` computes:

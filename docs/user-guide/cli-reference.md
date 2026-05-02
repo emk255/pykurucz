@@ -19,14 +19,20 @@ python pykurucz.py --teff <Teff> --logg <logg> [options]
 | `--teff` | float | Effective temperature (K) |
 | `--logg` | float | Surface gravity (\(\log_{10}\) cgs) |
 
-### Stellar parameters
+### Stellar parameters and abundances
+
+There are two abundance flows. They can be used together; the rule is
+that **bulk knobs (`--mh`, `--am`) set the abundance of every metal you
+do not otherwise override**, and **per-element flags (`--abund Z:offset`)
+replace the bulk-derived value for the elements they list, with the
+offset taken absolutely against solar** (not added on top of `--mh`/`--am`).
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mh` | 0.0 | Overall metallicity [M/H] (dex) |
-| `--am` | 0.0 | Alpha enhancement [α/M] (dex) |
+| `--mh` | 0.0 | Bulk metallicity [M/H] (dex). Shifts every metal (Z ≥ 3) uniformly from solar. |
+| `--am` | 0.0 | α-enhancement [α/M] (dex). Adds an extra offset to the standard α-elements (O, Ne, Mg, Si, S, Ca, Ti) on top of `--mh`. |
+| `--abund` | — | Per-element override `ELEM:OFFSET` (repeatable). Sets that element's abundance to `solar + OFFSET`, replacing whatever `--mh`/`--am` would have set. Accepts atomic number or symbol — e.g. `--abund Fe:-1.0` and `--abund 26:-1.0` are equivalent. |
 | `--vturb` | 2.0 | Microturbulent velocity (km/s) |
-| `--abund` | — | Individual element offset `ELEM:OFFSET` (repeatable). Example: `--abund Fe:-1.0` |
 
 ### Wavelength grid
 

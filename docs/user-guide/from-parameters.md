@@ -14,9 +14,13 @@ There are two abundance flows, both fully supported and both common:
   (repeatable). For carbon-enhanced metal-poor stars, peculiar Ap
   stars, individual α-element overrides, etc.
 
-You can mix the two: bulk knobs set the baseline pattern, individual
-`--abund` overrides take precedence for the elements you specify. See
-[Abundances](#abundances) below for the syntax.
+You can mix the two. The bulk knobs set the abundance for **every metal
+that you don't otherwise override**: `--mh` shifts all metals, `--am`
+adds an extra offset to the α-elements. For each element listed in
+`--abund Z:offset`, that bulk-derived value is **replaced** with
+`solar + offset` (the per-element offset is absolute against solar,
+not additive on top of `--mh`/`--am`). See [Abundances](#abundances)
+below for the syntax.
 
 ## The Pipeline
 

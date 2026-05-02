@@ -38,8 +38,10 @@ offset to the standard α-elements. This produces:
 ### 1b. Per-element abundances (peculiar patterns)
 
 For CEMP, Ap, individual α-element overrides, r-process enhancements,
-etc. — pass any number of `--abund SYMBOL:OFFSET_DEX` flags. Per-element
-overrides stack on top of any `--mh`/`--am` you also supply:
+etc. — pass any number of `--abund SYMBOL:OFFSET_DEX` flags. Each
+`--abund Z:offset` sets that element's abundance to **`solar + offset`**
+(the offset is absolute against solar, not added on top of `--mh`/`--am`).
+Elements you don't override still follow the bulk `--mh`/`--am` scaling:
 
 ```bash
 # CEMP-s star: Fe-poor, C and Ba enhanced

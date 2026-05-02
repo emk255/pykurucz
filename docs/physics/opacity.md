@@ -161,6 +161,33 @@ The default `CUTOFF = 1e-3` matches Fortran SYNTHE. Lowering it (e.g.
 roughly linear cost in run time. Raising it speeds up synthesis at the
 expense of fidelity in dense line forests.
 
+## How abundance changes propagate
+
+Both the continuum (KAPP) and the line-opacity (LINES) paths consume
+the same per-element abundance vector that lives on the atmosphere
+object: `atlas_py.physics.kapp` takes a 99-element `xabund` array as
+input, and `synthe_py.physics.mol_populations` calls
+`_build_xabund_from_atm(atm)` to reconstruct the same array on the
+synthesis side. So when you change a `--mh`/`--am` knob or set a
+per-element override with `--abund`, the entire opacity stack
+recalculates against the new pattern with no special-case branches:
+
+- **Continuum**: H⁻ population scales with the new electron donor
+  abundances; metal photoionisation scales with the per-species
+  number density (`xabund[Z]`); Rayleigh and Thomson pieces scale
+  with the resulting H and free-electron densities.
+- **Lines**: each transition's line-centre opacity is proportional to
+  the lower-level population, which is in turn proportional to the
+  element's `xabund` after Saha–Boltzmann ionisation balance.
+- **Molecules**: see
+  [Molecular Equilibrium](molecular-equilibrium.md) — the equilibrium
+  solver receives the same `xabund` and recomputes partial pressures
+  consistently.
+
+This is what makes the ATLAS12-style direct opacity sampling
+worthwhile: there is no abundance-pattern-dependent re-tabulation of
+opacity tables to redo.
+
 ## Implementation
 
 | Subroutine | Where | Role |
