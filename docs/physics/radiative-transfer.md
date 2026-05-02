@@ -168,6 +168,21 @@ and the maximum number of iterations by `--scat-iterations` (default 8).
     version. For typical optical/NIR synthesis the 8-iteration default is
     fine; you only see the limitation in deep UV resonance lines.
 
+## How abundance changes propagate
+
+The JOSH solver itself is **abundance-agnostic**: it integrates the
+moment ODE for $J$ given a total opacity $\kappa_{\rm tot}$ and a source
+function $S_\lambda$ supplied by the caller. Abundance information
+enters one layer up — through KAPP/COOLOP (continuum) and the line
+opacity loop, both of which read the per-element abundance vector
+described in [Opacity → How abundance changes propagate](opacity.md#how-abundance-changes-propagate).
+RT just sees the result.
+
+This separation is what lets the same JOSH code handle a solar
+spectrum and a CEMP-s spectrum without modification: the sole
+difference between the two runs is the $\kappa_{\rm tot}$ and
+$S_\lambda$ vectors that the upstream opacity/EOS layer hands to JOSH.
+
 ## Implementation
 
 The Python implementation lives in two places that share the same JOSH

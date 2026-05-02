@@ -111,6 +111,33 @@ fine-structure components), pykurucz uses a dedicated Numba batch
 kernel (`_compute_helium_voigt_batch`) to evaluate many of them in a
 single pass.
 
+## How abundance changes propagate
+
+H and He are special: **He is fixed** at the constant
+`HE_ABUNDANCE = 0.078370` (mass fraction) — it is *not* a user knob,
+matching the standard ATLAS convention. **H is computed by mass
+conservation**: `compute_h(mh, am, individual)` in `pykurucz.py` sets
+$X_{\rm H} = 1 - X_{\rm He} - \sum_{Z \ge 3} 10^{A_Z}$. So when you
+change `--mh`, `--am`, or any per-element `--abund`, $X_{\rm H}$
+adjusts slightly to keep the total fraction unity. The shift is small
+in the typical regime (metals are trace) but matters at very high
+metallicity.
+
+The **HPROF4** Stark tables for H lines and the **`he1tables.dat`**
+profiles for He I lines are **abundance-independent** quantum-mechanical
+tables — they capture how a hydrogen or helium atom responds to
+electric microfields, not how many of them are present. The actual
+**line widths used at synthesis time** still depend on abundance,
+because they fold the table with the local electron density $N_e$
+(set by Saha–Boltzmann ionisation, which depends on every donor in
+the gas). So a metal-poor halo dwarf and a solar dwarf use the same
+HPROF4 tables but produce noticeably different Balmer wings, because
+the electron-donor budget is different.
+
+The H⁻ and metal-photoionisation continuum pieces are abundance-driven
+through the same Saha–Boltzmann path; see
+[Opacity → How abundance changes propagate](opacity.md#how-abundance-changes-propagate).
+
 ## Why this matters
 
 Skipping any of the hydrogen / helium machinery produces visible

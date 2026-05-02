@@ -149,6 +149,32 @@ introduce visible deviations, so the code falls back to the full
 Faddeeva path. The value is identical to the threshold used by the
 Fortran code, ensuring numerical parity.
 
+## How abundance changes propagate
+
+The Voigt **shape** (Gaussian × Lorentzian convolution) is intrinsic to
+each transition's atomic data and does not depend on abundance. What
+does depend on abundance is what the shape gets multiplied by:
+
+- **Line-centre opacity** $\propto$ lower-level population,
+  which is $f$-value $\times\, N_{\rm species}$, which scales linearly
+  with the element's abundance. Shifting `--abund Fe:-1.0` makes every
+  Fe line ~10× shallower (in the optically-thin regime); going to
+  `Fe:+0.5` makes them ~3× deeper.
+- **Damping parameter $a$** = (Lorentzian half-width) / (Doppler width).
+  The Lorentzian half-width sums natural ($\gamma_{\rm rad}$, fixed by
+  the transition itself), Stark ($\gamma_{\rm Stark} \times N_e$), and
+  van der Waals ($\gamma_{\rm vdW} \times N_{\rm H} \times (T/10^4)^{0.3}$)
+  contributions. **Both $N_e$ and $N_{\rm H}$ depend on the abundance
+  pattern** through Saha–Boltzmann ionisation balance and the
+  $H = 1 - He - \sum_{\rm metals}$ closure, so the wings shift slightly
+  even for non-Fe lines when you change `--mh` or any per-element
+  offset.
+
+That is why pushing carbon up by a dex (`--abund C:+1.0`) does not just
+deepen carbon lines — it also nudges every neighbouring metal line's
+wings via the changed electron-donor balance and the C-bearing
+molecular blanketing in the upstream atmosphere.
+
 ## Wing accumulation
 
 Once the per-line profile shape is known, the opacity is added to the
