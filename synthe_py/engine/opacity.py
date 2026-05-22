@@ -78,10 +78,12 @@ from synthe_py.physics.voigt_jit import compute_helium_voigt_batch as _compute_h
 
 
 @jit(nopython=True, cache=True)
-def _accumulate_metal_profile_kernel(
-    buffer: np.ndarray,
-    continuum_row: np.ndarray,
-    wavelength_grid: np.ndarray,
+def _accumulate_metal_profile_direct(
+    out_wings: np.ndarray,    # metal_wings[depth_idx, :] — accumulated in-place
+    out_sources: np.ndarray,  # metal_sources[depth_idx, :] — accumulated in-place
+    bnu_row: np.ndarray,      # bnu[depth_idx, :] — read only
+    continuum_row: np.ndarray,  # continuum[depth_idx, :] — read only
+    wavelength_grid: np.ndarray,  # full wavelength grid — read only
     center_index: int,
     line_wavelength: float,
     kappa0: float,
@@ -93,8 +95,13 @@ def _accumulate_metal_profile_kernel(
     h0tab: np.ndarray,
     h1tab: np.ndarray,
     h2tab: np.ndarray,
+    profile: np.ndarray,  # Pre-allocated workspace (MAX_PROFILE_STEPS + 1)
 ) -> None:
-    """JIT-compiled kernel for accumulating metal profile wings.
+    """JIT-compiled kernel for accumulating metal profile wings directly.
+
+    Writes directly to out_wings and out_sources, skipping the center index.
+    Eliminates the O(window_len) tmp_buffer zeroing and copying that dominated
+    runtime on large wavelength grids.
 
     EXACTLY matches Fortran synthe.for XLINOP (labels 320-350):
 
@@ -108,9 +115,10 @@ def _accumulate_metal_profile_kernel(
              NSTEP = MAXSTEP
       323: Boundary check, then unconditional wing accumulation
            Red wing: DO 324 ISTEP=MINRED,MIN(LENGTH-NBUFF,NSTEP)
-             BUFFER(NBUFF+ISTEP) += PROFILE(ISTEP)   ← no per-step cutoff
+             out_wings[NBUFF+ISTEP] += PROFILE(ISTEP)   ← no per-step cutoff
            Blue wing: DO 326 ISTEP=MINBLUE,MIN(NBUFF-1,NSTEP)
-             BUFFER(NBUFF-ISTEP) += PROFILE(ISTEP)   ← no per-step cutoff
+             out_wings[NBUFF-ISTEP] += PROFILE(ISTEP)   ← no per-step cutoff
+           Center (ISTEP=0) is SKIPPED — center contribution comes from ASYNTH.
 
     Key Fortran behaviors matched:
     - Early KAPMIN cutoff: NSTEP=k, PROFILE(k) stored (<KAPMIN), no far wings
@@ -122,7 +130,7 @@ def _accumulate_metal_profile_kernel(
     if doppler_width <= 0.0 or kappa0 <= 0.0:
         return
 
-    n_points = buffer.size
+    n_points = wavelength_grid.size
     adamp = max(damping, 1e-12)
 
     # Clamp center_index for continuum access (Fortran: MIN(MAX(NBUFF,1),LENGTH))
@@ -150,24 +158,21 @@ def _accumulate_metal_profile_kernel(
     n10dop = int(10.0 * dopple * resolu)
     n10dop = min(n10dop, MAX_PROFILE_STEPS)
 
-    profile = np.zeros(MAX_PROFILE_STEPS + 1, dtype=np.float64)
     vsteps = 200.0
 
     # Track whether near-wing loop hit KAPMIN cutoff early.
-    # In Fortran, early cutoff → GO TO 323 with NSTEP=k, skipping far wings.
     early_cutoff = False
-    nstep_final = 0  # Fortran's NSTEP at label 323
+    nstep_final = 0
 
     if adamp < 0.2:
         # Fortran: H0TAB/H1TAB table lookup
         tabstep = vsteps / (dopple * resolu) if (dopple * resolu) > 0 else vsteps
-        tabi = 0.5  # 0-based indexing (Fortran uses 1.5 for 1-based arrays)
+        tabi = 0.5
         for nstep in range(1, n10dop + 1):
             tabi = tabi + tabstep
             itab = min(max(int(tabi), 0), len(h0tab) - 1)
             profile[nstep] = kappa0 * (h0tab[itab] + adamp * h1tab[itab])
             if profile[nstep] < kapmin:
-                # Fortran: GO TO 323 with NSTEP = nstep (profile[nstep] stored but < KAPMIN)
                 nstep_final = nstep
                 early_cutoff = True
                 break
@@ -185,7 +190,6 @@ def _accumulate_metal_profile_kernel(
                 break
 
     # ========== FAR WINGS (Fortran lines 580-587) ==========
-    # Only reached if near-wing loop completed WITHOUT early cutoff.
     if not early_cutoff:
         if n10dop > 0 and profile[n10dop] > 0:
             x_far = profile[n10dop] * float(n10dop) ** 2
@@ -205,26 +209,19 @@ def _accumulate_metal_profile_kernel(
         nstep_final = maxstep
 
     # ========== Label 323: Boundary check ==========
-    # Fortran: IF(NBUFF+NSTEP.LT.1.OR.NBUFF-NSTEP.GT.LENGTH)GO TO 350
-    # In 0-indexed: center_index + nstep_final < 0 or center_index - nstep_final >= n_points
     if center_index + nstep_final < 0 or center_index - nstep_final >= n_points:
         return
 
     use_wcon = wcon > 0.0
     use_wtail = wtail > 0.0
 
-    # ========== RED WING (Fortran lines 589-614) ==========
-    # Fortran: IF(NBUFF.GE.LENGTH)GO TO 325  → skip red wing
-    # 0-indexed: center_index >= n_points - 1
+    # ========== RED WING ==========
     if center_index < n_points - 1:
-        # Fortran: MAXRED = MIN0(LENGTH-NBUFF, NSTEP)
-        # 0-indexed: min(n_points - 1 - center_index, nstep_final)
         if center_index >= 0:
             maxred = min(n_points - 1 - center_index, nstep_final)
         else:
             maxred = min(n_points - 1, nstep_final)
 
-        # Fortran: MINRED = MAX0(1, 1-NBUFF) → 0-indexed: max(1, -center_index)
         minred = max(1, -center_index)
 
         for istep in range(minred, maxred + 1):
@@ -232,34 +229,27 @@ def _accumulate_metal_profile_kernel(
             if idx < 0 or idx >= n_points:
                 continue
 
-            # WCON/WTAIL handling (for fort.19 lines only; wcon=-1 for regular fort.12)
             if use_wcon:
                 wave = wavelength_grid[idx]
                 if wave <= wcon:
                     continue
 
-            # Profile value - Fortran: BUFFER(NBUFF+ISTEP) += PROFILE(ISTEP)
-            # Unconditional accumulation (no per-step cutoff!)
             value = profile[istep]
 
-            # Apply tapering if needed (fort.19 only)
             if use_wtail:
                 wave = wavelength_grid[idx]
                 base = wcon if use_wcon else line_wavelength
                 if wave < wtail:
                     value = value * (wave - base) / max(wtail - base, 1e-12)
 
-            buffer[idx] += value
+            out_wings[idx] += value
+            out_sources[idx] += value * bnu_row[idx]
 
-    # ========== Fortran: IF(NBUFF.LE.1)GO TO 350 → skip blue wing ==========
-    # 0-indexed: center_index <= 0
+    # ========== BLUE WING ==========
     if center_index <= 0:
         return
 
-    # ========== BLUE WING (Fortran lines 617-639) ==========
-    # Fortran: MAXBLUE = MIN0(NBUFF-1, NSTEP) → 0-indexed: min(center_index, nstep_final)
     maxblue = min(center_index, nstep_final)
-    # Fortran: MINBLUE = MAX0(1, NBUFF-LENGTH) → 0-indexed: max(1, center_index + 1 - n_points)
     minblue = max(1, center_index + 1 - n_points)
 
     for istep in range(minblue, maxblue + 1):
@@ -267,23 +257,21 @@ def _accumulate_metal_profile_kernel(
         if idx < 0 or idx >= n_points:
             continue
 
-        # WCON/WTAIL handling
         if use_wcon:
             wave = wavelength_grid[idx]
             if wave <= wcon:
-                break  # Blue wing terminates at WCON
+                break
 
-        # Profile value - unconditional accumulation (no per-step cutoff!)
         value = profile[istep]
 
-        # Apply tapering if needed
         if use_wtail:
             wave = wavelength_grid[idx]
             base = wcon if use_wcon else line_wavelength
             if wave < wtail:
                 value = value * (wave - base) / max(wtail - base, 1e-12)
 
-        buffer[idx] += value
+        out_wings[idx] += value
+        out_sources[idx] += value * bnu_row[idx]
 
 
 @jit(nopython=True, parallel=True, cache=True)
@@ -1170,8 +1158,15 @@ def _accumulate_metal_profile(
     wcon_val = wcon if wcon is not None else -1.0
     wtail_val = wtail if wtail is not None else -1.0
 
-    _accumulate_metal_profile_kernel(
+    profile_workspace = np.empty(MAX_PROFILE_STEPS + 1, dtype=np.float64)
+    # Use the direct-accumulation kernel.  Pass buffer as out_wings;
+    # out_sources is a dummy (not needed for the public API path).
+    dummy_sources = np.zeros_like(buffer)
+    dummy_bnu = np.ones_like(buffer)
+    _accumulate_metal_profile_direct(
         buffer,
+        dummy_sources,
+        dummy_bnu,
         continuum_row,
         wavelength_grid,
         center_index,
@@ -1185,6 +1180,7 @@ def _accumulate_metal_profile(
         h0tab,
         h1tab,
         h2tab,
+        profile_workspace,
     )
     return
 
@@ -2631,9 +2627,6 @@ def _process_metal_wings_kernel(
     line_ncon: np.ndarray,  # n_lines (metadata-resolved, 0 if none)
     line_nelionx: np.ndarray,  # n_lines (metadata-resolved, 0 if none)
     line_alpha: np.ndarray,  # n_lines (metadata-resolved, 0 if none)
-    line_start_idx: np.ndarray,  # n_lines (precomputed window start)
-    line_end_idx: np.ndarray,  # n_lines (precomputed window end; exclusive)
-    line_center_local: np.ndarray,  # n_lines (precomputed center within window)
     pop_densities_all: np.ndarray,  # n_elements × n_depths × max_ion_stage
     dop_velocity_all: np.ndarray,  # n_elements × n_depths
     continuum: np.ndarray,  # n_depths × n_wavelengths
@@ -2668,8 +2661,6 @@ def _process_metal_wings_kernel(
     n_elements = pop_densities_all.shape[0]
     max_ion_stage = pop_densities_all.shape[2]
 
-    max_window = 2 * MAX_PROFILE_STEPS + 2
-
     for depth_idx in prange(n_depths):
         rho = mass_density[depth_idx]
         if rho <= 0.0:
@@ -2684,7 +2675,7 @@ def _process_metal_wings_kernel(
         xnf_he1_j = xnf_he1[depth_idx]
         xnf_h2_j = xnf_h2[depth_idx]
 
-        tmp_buffer_full = np.zeros(max_window, dtype=np.float64)
+        profile_workspace = np.empty(MAX_PROFILE_STEPS + 1, dtype=np.float64)
 
         for line_idx in range(n_lines):
             center_index = line_indices[line_idx]
@@ -2764,22 +2755,18 @@ def _process_metal_wings_kernel(
             gamma_total = gamma_rad + gamma_stark * xne + gamma_vdw * txnxn_line
             damping_value = gamma_total / max(dopple, 1e-40)
 
-            # Use precomputed window bounds to reduce integer overhead.
-            start_idx = line_start_idx[line_idx]
-            end_idx = line_end_idx[line_idx]
-            window_len = end_idx - start_idx
-            if window_len <= 0 or window_len > max_window:
-                continue
-
-            tmp_buffer = tmp_buffer_full[:window_len]
-            tmp_buffer.fill(0.0)
-            center_local = line_center_local[line_idx]
-
-            _accumulate_metal_profile_kernel(
-                tmp_buffer,
-                continuum[depth_idx, start_idx:end_idx],
-                wavelength_grid[start_idx:end_idx],
-                center_local,
+            # Accumulate profile wings directly into output arrays.
+            # Center (istep=0) is skipped — center contribution comes from ASYNTH.
+            # This avoids the O(window_len) tmp_buffer zeroing and copying that
+            # dominated runtime when window_len ≈ n_wavelengths.
+            center_index = line_indices[line_idx]
+            _accumulate_metal_profile_direct(
+                metal_wings[depth_idx],
+                metal_sources[depth_idx],
+                bnu[depth_idx],
+                continuum[depth_idx],
+                wavelength_grid,
+                center_index,
                 line_wavelength,
                 kappa0,
                 max(damping_value, 1e-12),
@@ -2790,14 +2777,7 @@ def _process_metal_wings_kernel(
                 h0tab,
                 h1tab,
                 h2tab,
-            )
-
-            if 0 <= center_local < window_len:
-                tmp_buffer[center_local] = 0.0
-
-            metal_wings[depth_idx, start_idx:end_idx] += tmp_buffer
-            metal_sources[depth_idx, start_idx:end_idx] += (
-                tmp_buffer * bnu[depth_idx, start_idx:end_idx]
+                profile_workspace,
             )
 
 
@@ -3627,17 +3607,23 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                 population_cache[element] = (pop_densities, dop_velocity)
         logger.info(f"Pre-computed populations for {len(population_cache)} elements")
 
-        # Determine number of workers for parallelization
-        n_workers_metal = cfg.n_workers
-        if n_workers_metal is None:
+        # cfg.n_workers controls the RT ThreadPool only (see solve_lte_spectrum). Metal-wing
+        # kernels below use @jit(parallel=True)/prange — thread count is OpenMP/NUMBA_NUM_THREADS,
+        # not cfg.n_workers. Log RT pool size here only so logs match --n-workers for debugging.
+        n_workers_rt = cfg.n_workers
+        if n_workers_rt is None:
             import multiprocessing
 
-            n_workers_metal = max(1, multiprocessing.cpu_count())
+            cpu_n = multiprocessing.cpu_count()
             logger.info(
-                f"Auto-detected {multiprocessing.cpu_count()} CPUs, using {n_workers_metal} workers"
+                f"Metal wings: Numba depth-parallel (OpenMP threads independent of --n-workers); "
+                f"radiative transfer will use up to {max(1, cpu_n)} pool workers when grid is large"
             )
         else:
-            logger.info(f"Using {n_workers_metal} workers (from config)")
+            logger.info(
+                f"Metal wings: Numba depth-parallel (OpenMP); radiative transfer pool size "
+                f"from config: {n_workers_rt} worker(s)"
+            )
 
         # Use Numba parallel for metal wings when we have enough layers
         use_numba_parallel = atm.layers >= 10
@@ -3664,7 +3650,8 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
             )
         else:
             logger.info(
-                f"Using sequential processing ({atm.layers} layers, {n_workers_metal} workers)"
+                f"Using sequential metal-wing processing ({atm.layers} layers; "
+                f"RT pool size remains from --n-workers when RT runs)"
             )
 
         # Kernel is now defined at module level (compiles once)
@@ -4392,9 +4379,6 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                     line_ncon,
                     line_nelionx,
                     line_alpha,
-                    line_start_idx,
-                    line_end_idx,
-                    line_center_local,
                     pop_densities_all,
                     dop_velocity_all,
                     buffers.continuum,
@@ -4422,29 +4406,29 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                     batch_start = batch_idx * batch_size
                     batch_end = min(batch_start + batch_size, n_lines)
 
-                # Log first batch (which includes compilation time)
-                if batch_idx == 0:
-                    batch_start_time = time.time()
-                    logger.info(
-                        f"Processing batch 1/{n_batches} (lines 0-{batch_end:,}) - "
-                        "compiling kernel (this may take a few minutes)..."
-                    )
-                else:
-                    batch_start_time = time.time()
-                    elapsed_so_far = batch_start_time - kernel_start_time
-                    progress_pct = 100.0 * batch_idx / n_batches
-                    rate = (
-                        batch_idx * batch_size / elapsed_so_far
-                        if elapsed_so_far > 0
-                        else 0
-                    )
-                    remaining_lines = n_lines - batch_start
-                    eta = remaining_lines / rate if rate > 0 else 0
-                    logger.info(
-                        f"Processing batch {batch_idx + 1}/{n_batches} "
-                        f"({batch_start:,}-{batch_end:,} lines, {progress_pct:.1f}%) - "
-                        f"{rate:.0f} lines/s, ~{eta:.1f}s remaining"
-                    )
+                    # Log progress before starting batch
+                    if batch_idx == 0:
+                        batch_start_time = time.time()
+                        logger.info(
+                            f"Processing batch 1/{n_batches} (lines 0-{batch_end:,}) - "
+                            "compiling kernel (this may take a few minutes)..."
+                        )
+                    else:
+                        batch_start_time = time.time()
+                        elapsed_so_far = batch_start_time - kernel_start_time
+                        progress_pct = 100.0 * batch_idx / n_batches
+                        rate = (
+                            batch_idx * batch_size / elapsed_so_far
+                            if elapsed_so_far > 0
+                            else 0
+                        )
+                        remaining_lines = n_lines - batch_start
+                        eta = remaining_lines / rate if rate > 0 else 0
+                        logger.info(
+                            f"Processing batch {batch_idx + 1}/{n_batches} "
+                            f"({batch_start:,}-{batch_end:,} lines, {progress_pct:.1f}%) - "
+                            f"{rate:.0f} lines/s, ~{eta:.1f}s remaining"
+                        )
 
                     # Create batch slices
                     batch_line_indices = line_indices_arr[batch_start:batch_end]
@@ -4458,9 +4442,6 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                     batch_line_ncon = line_ncon[batch_start:batch_end]
                     batch_line_nelionx = line_nelionx[batch_start:batch_end]
                     batch_line_alpha = line_alpha[batch_start:batch_end]
-                    batch_line_start_idx = line_start_idx[batch_start:batch_end]
-                    batch_line_end_idx = line_end_idx[batch_start:batch_end]
-                    batch_line_center_local = line_center_local[batch_start:batch_end]
                     batch_boltzmann_factor = boltzmann_factor_arr[
                         :, batch_start:batch_end
                     ]
@@ -4481,9 +4462,6 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                         batch_line_ncon,
                         batch_line_nelionx,
                         batch_line_alpha,
-                        batch_line_start_idx,
-                        batch_line_end_idx,
-                        batch_line_center_local,
                         pop_densities_all,
                         dop_velocity_all,
                         buffers.continuum,
@@ -4507,25 +4485,25 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
                         h2tab,
                     )
 
-                # Log batch completion
-                batch_elapsed = time.time() - batch_start_time
-                if batch_idx == 0:
-                    # First batch includes compilation time
-                    logger.info(
-                        f"✓ Batch 1 completed in {batch_elapsed:.2f}s "
-                        f"(includes kernel compilation time)"
-                    )
-                else:
-                    elapsed_total = time.time() - kernel_start_time
-                    progress_pct = 100.0 * batch_end / n_lines
-                    rate = batch_end / elapsed_total if elapsed_total > 0 else 0
-                    remaining_lines = n_lines - batch_end
-                    eta = remaining_lines / rate if rate > 0 else 0
-                    logger.info(
-                        f"✓ Batch {batch_idx + 1}/{n_batches} completed in {batch_elapsed:.2f}s - "
-                        f"{batch_end:,}/{n_lines:,} lines ({progress_pct:.1f}%) - "
-                        f"{rate:.0f} lines/s, ~{eta:.1f}s remaining"
-                    )
+                    # Log batch completion
+                    batch_elapsed = time.time() - batch_start_time
+                    if batch_idx == 0:
+                        # First batch includes compilation time
+                        logger.info(
+                            f"✓ Batch 1 completed in {batch_elapsed:.2f}s "
+                            f"(includes kernel compilation time)"
+                        )
+                    else:
+                        elapsed_total = time.time() - kernel_start_time
+                        progress_pct = 100.0 * batch_end / n_lines
+                        rate = batch_end / elapsed_total if elapsed_total > 0 else 0
+                        remaining_lines = n_lines - batch_end
+                        eta = remaining_lines / rate if rate > 0 else 0
+                        logger.info(
+                            f"✓ Batch {batch_idx + 1}/{n_batches} completed in {batch_elapsed:.2f}s - "
+                            f"{batch_end:,}/{n_lines:,} lines ({progress_pct:.1f}%) - "
+                            f"{rate:.0f} lines/s, ~{eta:.1f}s remaining"
+                        )
 
             elapsed_time = time.time() - start_time
             total_kernel_time = time.time() - kernel_start_time

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +471,194 @@ def _apply_deck_to_atm_abundances(atm: AtlasAtmosphere, deck: AtlasDeck) -> None
             atm.abundances[iz] = base + offset
 
 
+def _run_freq_chunk(
+    inu_start: int,
+    inu_end: int,
+    freq_all: np.ndarray,
+    rco: np.ndarray,
+    hkt: np.ndarray,
+    temp: np.ndarray,
+    rhox: np.ndarray,
+    n_layers: int,
+    acont_all: np.ndarray,
+    sigmac_all: np.ndarray,
+    scont_all: np.ndarray,
+    xlines: np.ndarray,
+    sigmal: np.ndarray,
+    ahline_all: Optional[np.ndarray],
+    shline_all: Optional[np.ndarray],
+    flux: float,
+    teff: float,
+    wave_nm: np.ndarray,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Process frequencies ``[inu_start, inu_end)`` and return partial accumulators.
+
+    Matches the per-frequency body of ``run_atlas`` (JOSH + RADIAP mode 2 +
+    TCORR mode 2 + ROSS mode 2 contributions).  ``ATLAS_KNU_LOG`` /
+    ``ATLAS_RADIAP_LOG`` debug paths are skipped — use ``--n-workers 1`` when
+    those diagnostics are needed.
+    """
+    from ..physics.tcorr import _NUMBA_AVAILABLE as _TC_NUMBA
+
+    if _TC_NUMBA:
+        from ..physics.tcorr import _tcorr_mode2_nb
+    else:
+        from ..physics.josh_math import _deriv
+        from ..physics.tcorr import _expi
+
+    partial_raden = np.zeros(n_layers, dtype=np.float64)
+    partial_h = np.zeros(n_layers, dtype=np.float64)
+    partial_accrad = np.zeros(n_layers, dtype=np.float64)
+    partial_pradk0 = 0.0
+    partial_abross = np.zeros(n_layers, dtype=np.float64)
+    partial_rjmins = np.zeros(n_layers, dtype=np.float64)
+    partial_rdabh = np.zeros(n_layers, dtype=np.float64)
+    partial_rdiagj = np.zeros(n_layers, dtype=np.float64)
+    partial_flxrad = np.zeros(n_layers, dtype=np.float64)
+
+    for inu in range(inu_start, inu_end):
+        freq = float(freq_all[inu])
+        rcowt = float(rco[inu])
+        ehvkt = np.exp(-freq * hkt)
+        stim = np.maximum(1.0 - ehvkt, 1e-300)
+        freq15 = freq / 1.0e15
+        bnu = 1.47439e-2 * (freq15**3) * ehvkt / stim
+        acont = acont_all[:, inu]
+        sigmac = sigmac_all[:, inu]
+        scont = scont_all[:, inu]
+        alines = xlines[:, inu] * stim
+        if ahline_all is not None:
+            ahline = ahline_all[:, inu]
+            shline = shline_all[:, inu]
+            aline = ahline + alines
+        else:
+            ahline = np.zeros(n_layers, dtype=np.float64)
+            aline = alines.copy()
+        sline = bnu.copy()
+        mask = aline > 0.0
+        if np.any(mask) and ahline_all is not None:
+            sline[mask] = (
+                ahline[mask] * shline[mask] + alines[mask] * bnu[mask]
+            ) / aline[mask]
+        jres = josh_depth_profiles(
+            ifscat=1,
+            ifsurf=0,
+            acont=acont,
+            scont=scont,
+            aline=aline,
+            sline=sline,
+            sigmac=sigmac,
+            sigmal=sigmal,
+            rhox=rhox,
+            bnu=bnu,
+            freq_hz=freq,
+            wave_nm=float(wave_nm[inu]),
+        )
+        if np.any(jres.hnu < 0.0):
+            jres.hnu[:] = np.maximum(jres.hnu, 1e-99)
+            jres.jnu[:] = np.maximum(jres.jnu, 1e-99)
+            jres.snu[:] = np.maximum(jres.snu, 1e-99)
+        partial_raden += jres.jnu * rcowt
+        partial_h += jres.hnu * rcowt
+        partial_accrad += jres.abtot * jres.hnu * rcowt
+        partial_pradk0 += jres.knu_surface * rcowt
+        dbdt = bnu * freq * hkt / np.maximum(temp * stim, 1e-300)
+        partial_abross += dbdt / np.maximum(jres.abtot, 1e-300) * rcowt
+        if _TC_NUMBA:
+            _tcorr_mode2_nb(
+                partial_rjmins,
+                partial_rdabh,
+                partial_rdiagj,
+                partial_flxrad,
+                rcowt,
+                rhox,
+                jres.abtot,
+                jres.hnu,
+                jres.jmins,
+                jres.taunu,
+                bnu,
+                freq,
+                hkt,
+                temp,
+                stim,
+                jres.alpha,
+                flux,
+                teff,
+                int(freq_all.size),
+            )
+        else:
+            rhox_a = np.asarray(rhox, dtype=np.float64)
+            abtot_a = np.asarray(jres.abtot, dtype=np.float64)
+            hnu_a = np.asarray(jres.hnu, dtype=np.float64)
+            jmins_a = np.asarray(jres.jmins, dtype=np.float64)
+            taunu_a = np.asarray(jres.taunu, dtype=np.float64)
+            bnu_a = np.asarray(bnu, dtype=np.float64)
+            hkt_a = np.asarray(hkt, dtype=np.float64)
+            temp_a = np.asarray(temp, dtype=np.float64)
+            stim_a = np.asarray(stim, dtype=np.float64)
+            alpha_a = np.asarray(jres.alpha, dtype=np.float64)
+            dabtot = _deriv(rhox_a, abtot_a)
+            partial_rdabh += dabtot / np.maximum(abtot_a, 1e-300) * hnu_a * rcowt
+            partial_rjmins += abtot_a * jmins_a * rcowt
+            partial_flxrad += hnu_a * rcowt
+            term2 = 0.0
+            numnu = int(freq_all.size)
+            for j in range(n_layers):
+                term1 = term2
+                d = 1e-10
+                if j != n_layers - 1:
+                    d = taunu_a[j + 1] - taunu_a[j]
+                d = max(1e-10, float(d))
+                if d <= 0.01:
+                    term2 = (
+                        (0.922784335098467 - np.log(d)) * d / 4.0
+                        + d * d / 12.0
+                        - d**3 / 96.0
+                        + d**4 / 720.0
+                    )
+                else:
+                    ex = 0.0
+                    if d < 10.0:
+                        ex = _expi(3, d)
+                    if teff <= 4250.0 and d > 0.005 and d < 0.02:
+                        ex = 0.0
+                    term2 = 0.5 * (d + ex - 0.5) / d
+                diagj = term1 + term2
+                dbdt_tc = bnu_a[j] * freq * hkt_a[j] / np.maximum(temp_a[j] * stim_a[j], 1e-300)
+                if numnu == 1:
+                    dbdt_tc = flux * 16.0 / np.maximum(temp_a[j], 1e-300)
+                partial_rdiagj[j] += (
+                    abtot_a[j]
+                    * (diagj - 1.0)
+                    / np.maximum(1.0 - alpha_a[j] * diagj, 1e-300)
+                    * (1.0 - alpha_a[j])
+                    * dbdt_tc
+                    * rcowt
+                )
+
+    return (
+        partial_raden,
+        partial_h,
+        partial_accrad,
+        partial_pradk0,
+        partial_abross,
+        partial_rjmins,
+        partial_rdabh,
+        partial_rdiagj,
+        partial_flxrad,
+    )
+
+
 def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     """Run one or more atlas_py iterations and write output `.atm`."""
 
@@ -499,6 +689,10 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     convergence_min_iterations = max(1, int(cfg.convergence_min_iterations))
     convergence_consecutive_required = max(1, int(cfg.convergence_consecutive))
     convergence_consecutive_count = 0
+    n_workers = max(
+        1,
+        cfg.n_workers if cfg.n_workers is not None else (multiprocessing.cpu_count() or 1),
+    )
     completed_iterations = 0
 
     gravity_cgs = _gravity_from_atm_metadata(atm)
@@ -930,136 +1124,210 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             stateq_init(stateq_acc, temp)
         logger.info("Timing: pre-loop setup (ROSS/RADIAP/TCORR init) in %.3fs", time.perf_counter() - _t_stage)
         _t_stage = time.perf_counter()
-        for inu in range(freq_all.size):
-            freq = float(freq_all[inu])
-            rcowt = float(rco[inu])
-            ehvkt = np.exp(-freq * hkt)
-            stim = np.maximum(1.0 - ehvkt, 1e-300)
-            freq15 = freq / 1.0e15
-            bnu = 1.47439e-2 * (freq15**3) * ehvkt / stim
-            acont = acont_all[:, inu]
-            sigmac = sigmac_all[:, inu]
-            scont = scont_all[:, inu]
-            alines = xlines[:, inu] * stim
-            # ALINE assembly: atlas12.for line 5260
-            # ALINE(J) = AHLINE(J) + ALINES(J) + AXLINE(J)
-            # AXLINE is zero (no separate NLTE-xline path in current driver).
-            if ahline_all is not None:
-                ahline = ahline_all[:, inu]
-                shline = shline_all[:, inu]
-                aline = ahline + alines
-            else:
-                ahline = np.zeros(n_layers, dtype=np.float64)
-                aline = alines.copy()
-            # SLINE assembly: atlas12.for lines 5261-5263
-            # SLINE(J) = BNU(J)
-            # IF(ALINE(J).GT.0.) SLINE(J)=(AHLINE*SHLINE+ALINES*BNU)/ALINE(J)
-            sline = bnu.copy()
-            mask = aline > 0.0
-            if np.any(mask) and ahline_all is not None:
-                sline[mask] = (
-                    ahline[mask] * shline[mask] + alines[mask] * bnu[mask]
-                ) / aline[mask]
-            knu_log_path = os.getenv("ATLAS_KNU_LOG")
-            if knu_log_path and inu == 2213:
-                im1 = max(inu - 1, 0)
-                ip1 = min(inu + 1, wave_nm.size - 1)
-                with Path(knu_log_path).open("a", encoding="utf-8") as fh:
-                    fh.write(
-                        f"DRI,{float(abtot:=np.maximum(acont[0] + aline[0] + sigmac[0] + sigmal[0], 1e-300)):.8e},"
-                        f"{float((sigmac[0] + sigmal[0]) / abtot):.8e},{float(acont[0]):.8e},{float(aline[0]):.8e},"
-                        f"{float(sigmac[0]):.8e},{float(sigmal[0]):.8e},{float(ahline[0] if ahline_all is not None else 0.0):.8e},"
-                        f"{float(alines[0]):.8e},{0.0:.8e}\n"
+        nfreq = int(freq_all.size)
+        _debug_active = bool(
+            os.getenv("ATLAS_KNU_LOG")
+            or os.getenv("ATLAS_RADIAP_LOG")
+        )
+        _use_parallel = (
+            n_workers > 1
+            and nfreq > 1000
+            and stateq_acc is None
+            and not _debug_active
+        )
+        if _use_parallel:
+            logger.info(
+                "Timing: frequency loop — parallel mode (%d freqs, %d workers)",
+                nfreq,
+                n_workers,
+            )
+            chunk_size = max(1, nfreq // n_workers)
+            chunks = [
+                (s, min(s + chunk_size, nfreq))
+                for s in range(0, nfreq, chunk_size)
+            ]
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [
+                    pool.submit(
+                        _run_freq_chunk,
+                        s,
+                        e,
+                        freq_all,
+                        rco,
+                        hkt,
+                        temp,
+                        rhox,
+                        n_layers,
+                        acont_all,
+                        sigmac_all,
+                        scont_all,
+                        xlines,
+                        sigmal,
+                        ahline_all,
+                        shline_all,
+                        flux,
+                        teff,
+                        wave_nm,
                     )
-                    fh.write(
-                        f"DRN,{int(im1):d},{float(wave_nm[im1]):.8e},{float(xlines[0, im1]):.8e},"
-                        f"{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
-                        f"{int(ip1):d},{float(wave_nm[ip1]):.8e},{float(xlines[0, ip1]):.8e},"
-                        f"{float(stim[0]):.8e}\n"
-                    )
-            if knu_log_path and 2212 <= inu <= 2214:
-                with Path(knu_log_path).open("a", encoding="utf-8") as fh:
-                    fh.write(
-                        f"DRW,{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
-                        f"{float(stim[0]):.8e},{float(alines[0]):.8e},{float(aline[0]):.8e}\n"
-                    )
-            jres = josh_depth_profiles(
-                ifscat=1,
-                ifsurf=0,
-                acont=acont,
-                scont=scont,
-                aline=aline,
-                sline=sline,
-                sigmac=sigmac,
-                sigmal=sigmal,
-                rhox=rhox,
-                bnu=bnu,
-                freq_hz=freq,
-                wave_nm=float(wave_nm[inu]),
-            )
-            # Fortran safety clamp (atlas12.for lines 355-376): if any HNU(J)<0
-            # after JOSH, clamp HNU, JNU, SNU to at least 1e-99 to prevent
-            # RADIAP from accumulating negative radiative accelerations.
-            if np.any(jres.hnu < 0.0):
-                jres.hnu[:] = np.maximum(jres.hnu, 1e-99)
-                jres.jnu[:] = np.maximum(jres.jnu, 1e-99)
-                jres.snu[:] = np.maximum(jres.snu, 1e-99)
-            radiap_accumulate(
-                radst,
-                mode=2,
-                rcowt=rcowt,
-                abtot=jres.abtot,
-                hnu=jres.hnu,
-                jnu=jres.jnu,
-                knu_surface=jres.knu_surface,
-                freq_hz=freq,
-                wave_nm=float(wave_nm[inu]),
-                flux=flux,
-                rhox=rhox,
-            )
-            tcorr_step(
-                tcst,
-                mode=2,
-                rcowt=rcowt,
-                rhox=rhox,
-                abtot=jres.abtot,
-                hnu=jres.hnu,
-                jmins=jres.jmins,
-                taunu=jres.taunu,
-                bnu=bnu,
-                freq_hz=freq,
-                hkt=hkt,
-                temperature_k=temp,
-                stim=stim,
-                alpha=jres.alpha,
-                flux=flux,
-                teff=teff,
-                numnu=int(freq_all.size),
-            )
-            abross_work, _ = ross_step(
-                abross_work,
-                mode=2,
-                rcowt=rcowt,
-                bnu=bnu,
-                freq_hz=freq,
-                hkt=hkt,
-                temperature_k=temp,
-                stim=stim,
-                abtot=jres.abtot,
-                numnu=int(freq_all.size),
-                rhox=rhox,
-            )
-            # STATEQ MODE=2: accumulate H photo-ionization rates at this frequency.
-            if stateq_acc is not None:
-                stateq_accumulate(
-                    stateq_acc,
-                    freq=freq,
+                    for s, e in chunks
+                ]
+                chunk_results = [f.result() for f in futures]
+            for (
+                p_raden,
+                p_h,
+                p_accrad,
+                p_pradk0,
+                p_abross,
+                p_rjmins,
+                p_rdabh,
+                p_rdiagj,
+                p_flxrad,
+            ) in chunk_results:
+                radst.raden += p_raden
+                radst.h += p_h
+                radst.accrad += p_accrad
+                radst.pradk0 += p_pradk0
+                abross_work += p_abross
+                tcst.rjmins += p_rjmins
+                tcst.rdabh += p_rdabh
+                tcst.rdiagj += p_rdiagj
+                tcst.flxrad += p_flxrad
+        else:
+            for inu in range(nfreq):
+                freq = float(freq_all[inu])
+                rcowt = float(rco[inu])
+                ehvkt = np.exp(-freq * hkt)
+                stim = np.maximum(1.0 - ehvkt, 1e-300)
+                freq15 = freq / 1.0e15
+                bnu = 1.47439e-2 * (freq15**3) * ehvkt / stim
+                acont = acont_all[:, inu]
+                sigmac = sigmac_all[:, inu]
+                scont = scont_all[:, inu]
+                alines = xlines[:, inu] * stim
+                # ALINE assembly: atlas12.for line 5260
+                # ALINE(J) = AHLINE(J) + ALINES(J) + AXLINE(J)
+                # AXLINE is zero (no separate NLTE-xline path in current driver).
+                if ahline_all is not None:
+                    ahline = ahline_all[:, inu]
+                    shline = shline_all[:, inu]
+                    aline = ahline + alines
+                else:
+                    ahline = np.zeros(n_layers, dtype=np.float64)
+                    aline = alines.copy()
+                # SLINE assembly: atlas12.for lines 5261-5263
+                # SLINE(J) = BNU(J)
+                # IF(ALINE(J).GT.0.) SLINE(J)=(AHLINE*SHLINE+ALINES*BNU)/ALINE(J)
+                sline = bnu.copy()
+                mask = aline > 0.0
+                if np.any(mask) and ahline_all is not None:
+                    sline[mask] = (
+                        ahline[mask] * shline[mask] + alines[mask] * bnu[mask]
+                    ) / aline[mask]
+                knu_log_path = os.getenv("ATLAS_KNU_LOG")
+                if knu_log_path and inu == 2213:
+                    im1 = max(inu - 1, 0)
+                    ip1 = min(inu + 1, wave_nm.size - 1)
+                    with Path(knu_log_path).open("a", encoding="utf-8") as fh:
+                        fh.write(
+                            f"DRI,{float(abtot:=np.maximum(acont[0] + aline[0] + sigmac[0] + sigmal[0], 1e-300)):.8e},"
+                            f"{float((sigmac[0] + sigmal[0]) / abtot):.8e},{float(acont[0]):.8e},{float(aline[0]):.8e},"
+                            f"{float(sigmac[0]):.8e},{float(sigmal[0]):.8e},{float(ahline[0] if ahline_all is not None else 0.0):.8e},"
+                            f"{float(alines[0]):.8e},{0.0:.8e}\n"
+                        )
+                        fh.write(
+                            f"DRN,{int(im1):d},{float(wave_nm[im1]):.8e},{float(xlines[0, im1]):.8e},"
+                            f"{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
+                            f"{int(ip1):d},{float(wave_nm[ip1]):.8e},{float(xlines[0, ip1]):.8e},"
+                            f"{float(stim[0]):.8e}\n"
+                        )
+                if knu_log_path and 2212 <= inu <= 2214:
+                    with Path(knu_log_path).open("a", encoding="utf-8") as fh:
+                        fh.write(
+                            f"DRW,{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
+                            f"{float(stim[0]):.8e},{float(alines[0]):.8e},{float(aline[0]):.8e}\n"
+                        )
+                jres = josh_depth_profiles(
+                    ifscat=1,
+                    ifsurf=0,
+                    acont=acont,
+                    scont=scont,
+                    aline=aline,
+                    sline=sline,
+                    sigmac=sigmac,
+                    sigmal=sigmal,
+                    rhox=rhox,
+                    bnu=bnu,
+                    freq_hz=freq,
+                    wave_nm=float(wave_nm[inu]),
+                )
+                # Fortran safety clamp (atlas12.for lines 355-376): if any HNU(J)<0
+                # after JOSH, clamp HNU, JNU, SNU to at least 1e-99 to prevent
+                # RADIAP from accumulating negative radiative accelerations.
+                if np.any(jres.hnu < 0.0):
+                    jres.hnu[:] = np.maximum(jres.hnu, 1e-99)
+                    jres.jnu[:] = np.maximum(jres.jnu, 1e-99)
+                    jres.snu[:] = np.maximum(jres.snu, 1e-99)
+                radiap_accumulate(
+                    radst,
+                    mode=2,
                     rcowt=rcowt,
+                    abtot=jres.abtot,
+                    hnu=jres.hnu,
                     jnu=jres.jnu,
+                    knu_surface=jres.knu_surface,
+                    freq_hz=freq,
+                    wave_nm=float(wave_nm[inu]),
+                    flux=flux,
+                    rhox=rhox,
+                )
+                tcorr_step(
+                    tcst,
+                    mode=2,
+                    rcowt=rcowt,
+                    rhox=rhox,
+                    abtot=jres.abtot,
+                    hnu=jres.hnu,
+                    jmins=jres.jmins,
+                    taunu=jres.taunu,
+                    bnu=bnu,
+                    freq_hz=freq,
                     hkt=hkt,
                     temperature_k=temp,
+                    stim=stim,
+                    alpha=jres.alpha,
+                    flux=flux,
+                    teff=teff,
+                    numnu=int(freq_all.size),
                 )
-        logger.info("Timing: frequency loop (%d freqs) in %.3fs", freq_all.size, time.perf_counter() - _t_stage)
+                abross_work, _ = ross_step(
+                    abross_work,
+                    mode=2,
+                    rcowt=rcowt,
+                    bnu=bnu,
+                    freq_hz=freq,
+                    hkt=hkt,
+                    temperature_k=temp,
+                    stim=stim,
+                    abtot=jres.abtot,
+                    numnu=int(freq_all.size),
+                    rhox=rhox,
+                )
+                # STATEQ MODE=2: accumulate H photo-ionization rates at this frequency.
+                if stateq_acc is not None:
+                    stateq_accumulate(
+                        stateq_acc,
+                        freq=freq,
+                        rcowt=rcowt,
+                        jnu=jres.jnu,
+                        hkt=hkt,
+                        temperature_k=temp,
+                    )
+        logger.info(
+            "Timing: frequency loop (%d freqs, %s) in %.3fs",
+            nfreq,
+            f"{n_workers} workers" if _use_parallel else "serial",
+            time.perf_counter() - _t_stage,
+        )
         _t_stage = time.perf_counter()
         abross_out, tauros_out = ross_step(
             abross_work,

@@ -96,6 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Consecutive converged iterations required before early stopping (default: 1)",
     )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        help=(
+            "ThreadPool size for the per-iteration frequency loop in atlas_py "
+            "(default: all logical CPUs). Set to 1 for a fully serial loop. "
+            "NLTE (STATEQ) forces serial execution regardless of this value."
+        ),
+    )
     return parser
 
 
@@ -129,6 +139,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         convergence_epsilon=args.convergence_epsilon,
         convergence_min_iterations=args.convergence_min_iterations,
         convergence_consecutive=args.convergence_consecutive,
+        n_workers=args.n_workers,
     )
     run_atlas(cfg)
     return 0

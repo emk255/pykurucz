@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../kurucz"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../ting_pykurucz"
+		}
+	],
+	"settings": {
+		"git.ignoreLimitWarning": true
+	}
+}

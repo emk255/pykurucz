@@ -17,6 +17,11 @@ _ISO_COLS = 265
 _ISO_ROWS = 20
 
 
+def _default_isotopes_npz_path() -> Path:
+    # atlas_py/physics -> atlas_py/data
+    return Path(__file__).resolve().parents[1] / "data" / "isotopes_atlas12.npz"
+
+
 def _default_atlas12_path() -> Path:
     # atlas_py/physics -> atlas_py -> pykurucz
     repo_root = Path(__file__).resolve().parents[2]
@@ -313,6 +318,17 @@ def _major_isotope_mass(isotope: np.ndarray) -> np.ndarray:
     return amass
 
 
+def _load_isotopes_npz(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with np.load(npz_path, allow_pickle=False) as data:
+        isotope = np.asarray(data["isotope"], dtype=np.float64)
+        amassiso_major = np.asarray(data["amassiso_major"], dtype=np.float64)
+    if isotope.shape != (10, 2, _MION):
+        raise RuntimeError(f"Invalid isotope shape in {npz_path}: {isotope.shape}")
+    if amassiso_major.shape != (_MION,):
+        raise RuntimeError(f"Invalid amassiso_major shape in {npz_path}: {amassiso_major.shape}")
+    return isotope, amassiso_major
+
+
 @lru_cache(maxsize=2)
 def load_isotopes_from_atlas12(atlas12_path: str | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Return Fortran-ordered (`ISOTOPE`, `AMASSISO(1,:)`) arrays.
@@ -324,6 +340,11 @@ def load_isotopes_from_atlas12(atlas12_path: str | None = None) -> tuple[np.ndar
     Imperative isotope assignments in `SUBROUTINE ISOTOPES` are applied
     before the final `ISOTOPE` packing loops.
     """
+
+    if atlas12_path is None:
+        npz_path = _default_isotopes_npz_path()
+        if npz_path.exists():
+            return _load_isotopes_npz(npz_path)
 
     src = Path(atlas12_path) if atlas12_path is not None else _default_atlas12_path()
     if not src.exists():

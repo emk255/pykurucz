@@ -354,6 +354,7 @@ def run_atlas_py(
     convergence_epsilon: Optional[float] = None,
     convergence_min_iterations: int = 5,
     convergence_consecutive: int = 1,
+    n_workers: Optional[int] = None,
 ) -> Path:
     """Run ``atlas_py.cli`` on *input_atm* and write iterated output to *output_atm*.
 
@@ -384,6 +385,9 @@ def run_atlas_py(
     convergence_epsilon:
         Optional early-stop threshold on max normalized changes across
         physical atmosphere columns.  ``iterations`` remains the maximum.
+    n_workers:
+        Passed to ``atlas_py.cli --n-workers`` when set (frequency-loop thread
+        pool).  When omitted, atlas_py defaults to all logical CPUs.
     """
     root = (kurucz_root or _default_kurucz_root()).resolve()
     lines_dir = root / "lines"
@@ -435,6 +439,8 @@ def run_atlas_py(
         )
     if fort12_bin is not None and fort12_bin.exists():
         cmd.extend(["--line-selection-bin", str(fort12_bin)])
+    if n_workers is not None:
+        cmd.extend(["--n-workers", str(n_workers)])
 
     with log_path.open("w", encoding="utf-8") as logf:
         logf.write(
@@ -631,7 +637,9 @@ def synthesize(
         Early-stop threshold on physical atmosphere column changes.  Defaults
         to 1e-3; set to None to force all ``atlas_iterations``.
     n_workers : int, optional
-        Worker count for synthe_py.cli (default: all logical CPUs).
+        Worker count for ``atlas_py.cli`` (frequency loop) and ``synthe_py.cli``
+        (radiative-transfer pool).  Default: all logical CPUs for both when
+        omitted.
 
     Returns
     -------
@@ -713,6 +721,7 @@ def synthesize(
             convergence_epsilon=atlas_convergence_epsilon,
             convergence_min_iterations=atlas_convergence_min_iterations,
             convergence_consecutive=atlas_convergence_consecutive,
+            n_workers=n_workers,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"ERROR in atlas_py: {exc}")
@@ -857,6 +866,15 @@ Notes:
         action="store_true",
         help="Disable convergence early stopping and run exactly --atlas-iterations.",
     )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        help=(
+            "Threads for atlas_py frequency loop and synthe_py RT pool "
+            "(default: all logical CPUs for each)."
+        ),
+    )
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: results/)")
     parser.add_argument(
@@ -913,6 +931,7 @@ Notes:
         use_molecular_lines=not args.no_molecular_lines,
         include_tio=not args.no_tio,
         include_h2o=not args.no_h2o,
+        n_workers=args.n_workers,
     )
 
 

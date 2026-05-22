@@ -24,6 +24,11 @@ _SQRT_PI_SCALE = 1.77245
 _PI = 3.14159
 
 
+def _default_hydrogen_profile_npz_path() -> Path:
+    # atlas_py/physics -> atlas_py/data
+    return Path(__file__).resolve().parents[1] / "data" / "hydrogen_profile_atlas12.npz"
+
+
 def _default_atlas12_path() -> Path:
     # atlas_py/physics -> atlas_py -> pykurucz
     repo_root = Path(__file__).resolve().parents[2]
@@ -174,8 +179,38 @@ class HydrogenProfileTables:
     pf_h2: np.ndarray  # (200,)
 
 
+def _load_hydrogen_profile_npz(npz_path: Path) -> HydrogenProfileTables:
+    with np.load(npz_path, allow_pickle=False) as data:
+        return HydrogenProfileTables(
+            propbm=np.asarray(data["propbm"], dtype=np.float64),
+            c=np.asarray(data["c"], dtype=np.float64),
+            d=np.asarray(data["d"], dtype=np.float64),
+            pp=np.asarray(data["pp"], dtype=np.float64),
+            beta=np.asarray(data["beta"], dtype=np.float64),
+            stalph=np.asarray(data["stalph"], dtype=np.float64),
+            stwtal=np.asarray(data["stwtal"], dtype=np.float64),
+            istal=np.asarray(data["istal"], dtype=np.int64),
+            lnghal=np.asarray(data["lnghal"], dtype=np.int64),
+            stcomp=np.asarray(data["stcomp"], dtype=np.float64),
+            stcpwt=np.asarray(data["stcpwt"], dtype=np.float64),
+            lncomp=np.asarray(data["lncomp"], dtype=np.int64),
+            cutoff_h2_plus=np.asarray(data["cutoff_h2_plus"], dtype=np.float64),
+            cutoff_h2=np.asarray(data["cutoff_h2"], dtype=np.float64),
+            asumlyman=np.asarray(data["asumlyman"], dtype=np.float64),
+            asum=np.asarray(data["asum"], dtype=np.float64),
+            y1wtm=np.asarray(data["y1wtm"], dtype=np.float64),
+            xknmtb=np.asarray(data["xknmtb"], dtype=np.float64),
+            pf_h2=np.asarray(data["pf_h2"], dtype=np.float64),
+        )
+
+
 @lru_cache(maxsize=2)
 def load_hydrogen_profile_tables_from_atlas12(atlas12_path: str | None = None) -> HydrogenProfileTables:
+    if atlas12_path is None:
+        npz_path = _default_hydrogen_profile_npz_path()
+        if npz_path.exists():
+            return _load_hydrogen_profile_npz(npz_path)
+
     src = Path(atlas12_path) if atlas12_path is not None else _default_atlas12_path()
     if not src.exists():
         raise FileNotFoundError(f"atlas12.for not found: {src}")

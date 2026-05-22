@@ -224,17 +224,11 @@ Both codes were run with identical inputs: same `.atm` files, same line list, sa
 
 Very cool, edge-of-grid giants can be difficult for the original Fortran validation pipeline as well; if Fortran ATLAS30 or Fortran SYNTHE cannot produce a clean reference spectrum for a case, that case is treated as an invalid reference sample rather than a Python pass/fail. Use such edge cases cautiously until a trusted external atmosphere/reference is available.
 
+Recent matched Fortran30 end-to-end checks include a 4000 K dwarf that passed with maximum normalized-flux error `0.00883` across 300–1800 nm; `atlas_py` stopped at 21/30 iterations with the default `1e-3` physical-column convergence rule. A solar-like 5770 K case also passed with early stopping at 18/30 iterations. Ultra-cool edge cases whose Fortran30 reference pipeline fails are not included in these pass counts.
+
 ### Runtime
 
-Runtime depends strongly on stellar type, wavelength range, line-list density, worker count, and whether atmosphere convergence triggers early. In matched 300–1800 nm, R=300,000 validation on the same machine, a 4000 K dwarf with a valid Fortran30 reference took about 3230 s for the full Fortran+Python comparison run: the Python branch (`atlas_py` + `synthe_py`) took about 1095 s, while the Fortran branch took about 2136 s, so Python was roughly 2x faster for that case. Solar-like runs benefit more from convergence early stopping; for one 5770 K validation case, Python ATLAS stopped at 18/30 iterations and took about 233 s for the atmosphere stage.
-
-| Model | $T_{\text{eff}}$ | $\log g$ | Type | Median Δ | 95th pctl | 99th pctl |
-|-------|-------|-------|------|----------|-----------|-----------|
-| `t02500g-1.0` | 2500 K | −1.0 | Cool giant | 0.0006% | 0.023% | 0.065% |
-| `t04000g5.00` | 4000 K | 5.0 | K dwarf | 0.00004% | 0.002% | 0.006% |
-| `t08250g4.00` | 8250 K | 4.0 | A star | 0.0008% | 0.023% | 0.056% |
-| `t10250g5.00` | 10250 K | 5.0 | Late B | 0.0008% | 0.020% | 0.047% |
-| `t44000g4.50` | 44000 K | 4.5 | O star | 0.002% | 0.109% | 0.224% |
+Runtime depends strongly on stellar type, wavelength range, line-list density, worker count, and whether atmosphere convergence triggers early. In one matched 300–1800 nm, R=300,000 validation on the same machine, the 4000 K dwarf run took about 3230 s for the full Fortran+Python comparison: the Python branch (`atlas_py` + `synthe_py`) took about 1095 s, while the Fortran branch took about 2136 s, so Python was roughly 2x faster for that case. Solar-like runs benefit more from convergence early stopping; for one 5770 K validation case, Python ATLAS stopped at 18/30 iterations and took about 233 s for the atmosphere stage.
 
 
 ## How the pipeline works
@@ -311,17 +305,17 @@ Each `.spec` file has three whitespace-delimited columns: `wavelength(nm)  F_lam
 
 Small physics tables and code are in the repository. Large binary data (line lists, molecule tables) are distributed via a public Google Drive folder — run `python scripts/download_data.py` once to populate `data/`.
 
-### Line list (`data/lines/` — from `python scripts/download_data.py`)
+### Line lists and runtime data
 
-All files below live under `data/lines/` after running `python scripts/download_data.py`:
+The main SYNTHE atomic line list lives at `lines/gfallvac.latest` and is used directly by the examples above. Additional large runtime binaries live under `data/lines/` after running `python scripts/download_data.py`:
 
 | File | Description |
 |------|-------------|
-| `gfallvac.latest` | Kurucz GFALL atomic line list — ~1.3M transitions with wavelength, $\log gf$, excitation energies, damping constants |
-| `gfpred29dec2014.bin` | Kurucz GFALL predicted-line binary used by `atlas_py` for line selection (~3.9 GB) |
-| `continua.dat` | Bound-free absorption edge wavelengths and cross-sections for computing continuous opacity |
-| `molecules.dat` | Dissociation energies and equilibrium constants for ~300 molecular species |
-| `he1tables.dat` | Tabulated helium line broadening profiles |
+| `lines/gfallvac.latest` | Kurucz GFALL atomic line list — ~1.3M transitions with wavelength, $\log gf$, excitation energies, damping constants |
+| `data/lines/gfpred29dec2014.bin` | Kurucz GFALL predicted-line binary used by `atlas_py` for line selection (~3.9 GB) |
+| `data/lines/continua.dat` | Bound-free absorption edge wavelengths and cross-sections for computing continuous opacity |
+| `data/lines/molecules.dat` | Dissociation energies and equilibrium constants for ~300 molecular species |
+| `data/lines/he1tables.dat` | Tabulated helium line broadening profiles |
 
 ### Molecule tables (`data/molecules/` — from `python scripts/download_data.py`)
 
@@ -357,6 +351,13 @@ Bundled `.atm` samples and matching `fortran_specs/` references may be distribut
 ## Reproducing the validation
 
 ```bash
+# Matched Fortran30 vs Python end-to-end validation from stellar parameters.
+# The Fortran branch always runs the requested 30 ATLAS iterations; Python may
+# stop early when the physical atmosphere columns converge below 1e-3.
+python run_e2e_pipeline.py --teff 4000 --logg 5.0 --mh 0.0 \
+    --mode both --atlas-iterations 30 --atlas-convergence-epsilon 1e-3 \
+    --force-rerun
+
 # Example: loop over your own .atm files (same stem for model.spec vs reference.spec)
 for atm in path/to/atmospheres/*.atm; do
     python synthesize_from_atm.py "$atm"
@@ -369,9 +370,6 @@ for atm in path/to/atmospheres/*.atm; do
         "path/to/fortran_specs/${stem}.spec" \
         --range 300 1800 --top 5
 done
-
-# Optional: JOSS figures (if joss/ is present)
-# python joss/generate_joss_figures.py
 ```
 
 
@@ -386,7 +384,9 @@ pykurucz/
 │
 ├── atlas_py/                       # Python ATLAS12 atmosphere engine
 │   ├── cli.py                      # Command-line interface
-│   ├── atmosphere.py               # Atmospheric structure and iteration
+│   ├── config.py                   # Atmosphere iteration configuration
+│   ├── engine/                     # Main driver and iteration loop
+│   ├── io/                         # ATLAS input/output readers and writers
 │   ├── physics/                    # Opacity sources, equation of state, convection
 │   └── tools/                      # Utilities (validator, comparator)
 │
@@ -409,12 +409,10 @@ pykurucz/
 │   ├── molecules/                  # Molecular line lists (TiO, H₂O binaries)
 │   └── README.md                   # Describes the layout and how to obtain the files
 │
-└── joss/                           # JOSS paper and figures
-    ├── paper.md
-    ├── paper.bib
-    ├── paper.pdf                   # Auto-built draft PDF
-    ├── generate_joss_figures.py
-    └── compare_*.png               # Validation figures
+├── lines/                          # Main SYNTHE atomic line list (gfallvac.latest)
+├── docs/                           # Additional project notes
+├── paper.md                        # JOSS manuscript draft
+└── paper.bib                       # Bibliography
 ```
 
 

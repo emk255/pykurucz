@@ -1619,105 +1619,93 @@ def compute_kapp_continuum(
         for _n in range(4, 28):
             he1_transn[_n, :] = xkarsas_grid(freq, 4.0 - 3.0 / (_n * _n), 1, 0)
 
-        for j in range(nfreq):
-            f = freq[j]
-            stim_j = stim[:, j]
-            ehvkt_j = ehvkt[:, j]
+        # Vectorized HE1OP: eliminate per-frequency Python loop
+        freq3_he1 = freq ** 3
+        cfree_he1 = 3.6919e8 / freq3_he1       # (nfreq,)
+        c_const_he1 = 2.815e29 / freq3_he1      # (nfreq,)
 
-            freq3 = f ** 3
-            cfree = 3.6919e8 / freq3
-            c_const = 2.815e29 / freq3
+        # Build trans_grid[10, nfreq] — cross-section for each level across all freqs
+        # imin[j] = first level n (1-based) where _he1_hefreq[n-1] <= freq[j], else 0
+        # Level n is active at freq j if imin[j] >= 1 and imin[j] <= n+1
+        # Equivalently: freq[j] >= _he1_hefreq[n]  (since hefreq is sorted descending)
+        trans_grid = np.zeros((10, nfreq), dtype=np.float64)
 
-            # Find IMIN: first level with ionization freq <= current freq
-            # (atlas12.for lines 6045-6049)
-            imin = 0
-            for _n in range(10):
-                if _he1_hefreq[_n] <= f:
-                    imin = _n + 1  # Fortran 1-based
-                    break
+        # Vectorize the per-frequency cross-section functions
+        # Level 0: _crosshe — active where freq >= _he1_hefreq[0]
+        m0 = freq >= _he1_hefreq[0]
+        if np.any(m0):
+            trans_grid[0, m0] = np.array([_crosshe(f) for f in freq[m0]])
+        # Level 1: _he12s3s
+        m1 = freq >= _he1_hefreq[1]
+        if np.any(m1):
+            trans_grid[1, m1] = np.array([_he12s3s(f) for f in freq[m1]])
+        # Level 2: _he12s1s
+        m2 = freq >= _he1_hefreq[2]
+        if np.any(m2):
+            trans_grid[2, m2] = np.array([_he12s1s(f) for f in freq[m2]])
+        # Level 3: _he12p3p
+        m3 = freq >= _he1_hefreq[3]
+        if np.any(m3):
+            trans_grid[3, m3] = np.array([_he12p3p(f) for f in freq[m3]])
+        # Level 4: _he12p1p
+        m4 = freq >= _he1_hefreq[4]
+        if np.any(m4):
+            trans_grid[4, m4] = np.array([_he12p1p(f) for f in freq[m4]])
+        # Levels 5-9: from precomputed xkarsas_grid
+        for _n in range(5, 10):
+            mn = freq >= _he1_hefreq[_n]
+            if np.any(mn):
+                trans_grid[_n, mn] = he1_xk_trans[_n][mn]
 
-            # Cross-sections TRANS[0..9] via fall-through (atlas12.for 6050-6065)
-            trans = np.zeros(10, dtype=np.float64)
-            if imin >= 1:
-                if imin <= 1:
-                    trans[0] = _crosshe(f)
-                if imin <= 2:
-                    trans[1] = _he12s3s(f)
-                if imin <= 3:
-                    trans[2] = _he12s1s(f)
-                if imin <= 4:
-                    trans[3] = _he12p3p(f)
-                if imin <= 5:
-                    trans[4] = _he12p1p(f)
-                if imin <= 6:
-                    trans[5] = he1_xk_trans[5][j]
-                if imin <= 7:
-                    trans[6] = he1_xk_trans[6][j]
-                if imin <= 8:
-                    trans[7] = he1_xk_trans[7][j]
-                if imin <= 9:
-                    trans[8] = he1_xk_trans[8][j]
-                if imin <= 10:
-                    trans[9] = he1_xk_trans[9][j]
+        # Autoionization: He II n=2 (atlas12.for lines 6067-6084)
+        # Nested thresholds — each adds to a specific level
+        _auto_n2 = [(171135.000, 4), (169087.0, 3), (166277.546, 2), (159856.069, 1)]
+        elim2_he1 = 527490.06
+        for level_cm, trans_idx in _auto_n2:
+            freqhe = (elim2_he1 - level_cm) * C_LIGHT_CM
+            mask = freq >= freqhe
+            if np.any(mask):
+                trans_grid[trans_idx, mask] += he1_auto_grids[freqhe][mask]
 
-                # He II n=2 autoionization (atlas12.for lines 6067-6084)
-                elim2 = 527490.06
-                freqhe = (elim2 - 171135.000) * C_LIGHT_CM
-                if f >= freqhe:
-                    trans[4] += he1_auto_grids[freqhe][j]
-                    freqhe = (elim2 - 169087.0) * C_LIGHT_CM
-                    if f >= freqhe:
-                        trans[3] += he1_auto_grids[freqhe][j]
-                        freqhe = (elim2 - 166277.546) * C_LIGHT_CM
-                        if f >= freqhe:
-                            trans[2] += he1_auto_grids[freqhe][j]
-                            freqhe = (elim2 - 159856.069) * C_LIGHT_CM
-                            if f >= freqhe:
-                                trans[1] += he1_auto_grids[freqhe][j]
+        # Autoionization: He II n=3 (atlas12.for lines 6086-6106)
+        _auto_n3 = [(186209.471, 9), (186101.0, 8), (185564.0, 7), (184864.0, 6), (183236.0, 5)]
+        elim3_he1 = 588451.59
+        for level_cm, trans_idx in _auto_n3:
+            freqhe = (elim3_he1 - level_cm) * C_LIGHT_CM
+            mask = freq >= freqhe
+            if np.any(mask):
+                trans_grid[trans_idx, mask] += he1_auto_grids[freqhe][mask]
 
-                # He II n=3 autoionization (atlas12.for lines 6086-6106)
-                elim3 = 588451.59
-                freqhe = (elim3 - 186209.471) * C_LIGHT_CM
-                if f >= freqhe:
-                    trans[9] += he1_auto_grids[freqhe][j]
-                    freqhe = (elim3 - 186101.0) * C_LIGHT_CM
-                    if f >= freqhe:
-                        trans[8] += he1_auto_grids[freqhe][j]
-                        freqhe = (elim3 - 185564.0) * C_LIGHT_CM
-                        if f >= freqhe:
-                            trans[7] += he1_auto_grids[freqhe][j]
-                            freqhe = (elim3 - 184864.0) * C_LIGHT_CM
-                            if f >= freqhe:
-                                trans[6] += he1_auto_grids[freqhe][j]
-                                freqhe = (elim3 - 183236.0) * C_LIGHT_CM
-                                if f >= freqhe:
-                                    trans[5] += he1_auto_grids[freqhe][j]
+        # Build active mask for each level: level n is active where freq >= _he1_hefreq[n]
+        # The Fortran logic finds imin (first active level) and then includes all levels >= imin.
+        # This is equivalent to: for each level n, include it if freq >= _he1_hefreq[n].
+        # Apply mask: zero out trans_grid where level is not active
+        # (Already done above — each trans_grid[n] is only filled where freq >= hefreq[n])
 
-            # High-n levels N=4..27 (atlas12.for lines 6107-6110)
-            transn = np.zeros(28, dtype=np.float64)
-            if f >= 1.25408e16:
-                for _n in range(4, 28):
-                    transn[_n] = he1_transn[_n, j]
+        # he1_bolt (n_layers, 10) @ trans_grid (10, nfreq) → (n_layers, nfreq)
+        bound_contribution = he1_bolt @ trans_grid
 
-            # Per-layer computation (atlas12.for lines 6111-6123)
-            if f < 2.055e14:
-                ex = he1_exlim / ehvkt_j
-            else:
-                ex = he1_boltex.copy()
-            he1_val = (ex - he1_exlim) * c_const
+        # High-n levels N=4..27: active where freq >= 1.25408e16
+        high_n_mask = freq >= 1.25408e16
+        if np.any(high_n_mask):
+            # he1_boltn (n_layers, 28) @ he1_transn (28, nfreq) → (n_layers, nfreq)
+            # Only high-n rows 4..27 are nonzero
+            bound_contribution[:, high_n_mask] += (he1_boltn @ he1_transn)[:, high_n_mask]
 
-            if imin >= 1:
-                for _n in range(imin - 1, 10):
-                    he1_val = he1_val + trans[_n] * he1_bolt[:, _n]
+        # ex selection
+        ex_he1 = np.empty((n_layers, nfreq), dtype=np.float64)
+        low_he1 = freq < 2.055e14
+        if np.any(low_he1):
+            ex_he1[:, low_he1] = he1_exlim[:, np.newaxis] / ehvkt[:, low_he1]
+        if np.any(~low_he1):
+            ex_he1[:, ~low_he1] = he1_boltex[:, np.newaxis]
 
-            if f >= 1.25408e16:
-                for _n in range(4, 28):
-                    he1_val = he1_val + transn[_n] * he1_boltn[:, _n]
+        he1_val_all = (ex_he1 - he1_exlim[:, np.newaxis]) * c_const_he1[np.newaxis, :]
+        he1_val_all += bound_contribution
+        he1_val_all += he1_coulff * cfree_he1[np.newaxis, :] * he1_freet[:, np.newaxis]
 
-            # Free-free: COULFF(J,1)*FREET(J)*CFREE (atlas12.for line 6123)
-            coulff_arr = he1_coulff[:, j]
-            ahe1[:, j] = (he1_val + coulff_arr * he1_freet * cfree) * stim_j
-            she1[:, j] = bnu_all[:, j]
+        ahe1[:, :] = he1_val_all * stim
+        she1[:, :] = bnu_all
 
     # HE2OP: Helium II opacity (atlas12.for lines 6331-6375)
     # Uses XKARSAS (Karzas & Latter 1960) cross-sections, matching atlas12 exactly.
@@ -1751,28 +1739,28 @@ def compute_kapp_continuum(
             [xkarsas_grid(freq, 4.0, n, n) for n in range(1, 10)]
         )
 
-        for j in range(nfreq):
-            f = freq[j]
+        # Vectorized HE2OP: eliminate per-frequency Python loop
+        freq3_all = freq ** 3                                   # (nfreq,)
+        cfree_all = 3.6919e8 / freq3_all * 4.0                 # (nfreq,)
+        c_const_all = 2.815e29 * 4.0 / freq3_all               # (nfreq,)
 
-            cont = he2_cont[:, j]
+        # ex selection: low-freq branch vs high-freq branch
+        low_mask = freq < 1.31522e14                            # (nfreq,)
+        ex_all = np.empty((n_layers, nfreq), dtype=np.float64)
+        if np.any(low_mask):
+            ex_all[:, low_mask] = exlim[:, np.newaxis] / ehvkt[:, low_mask]
+        if np.any(~low_mask):
+            ex_all[:, ~low_mask] = boltex[:, np.newaxis]
 
-            freq3 = f ** 3
-            cfree = 3.6919e8 / freq3 * 4.0
-            c_const = 2.815e29 * 4.0 / freq3
+        # he2_val = (ex - exlim) * c_const + sum_n(cont[n] * bolt[:, n])
+        he2_val = (ex_all - exlim[:, np.newaxis]) * c_const_all[np.newaxis, :]
 
-            if f < 1.31522e14:
-                ex = exlim / ehvkt[:, j]
-            else:
-                ex = boltex
-            he2_val = (ex - exlim) * c_const
+        # bolt (n_layers, 9) @ he2_cont (9, nfreq) → (n_layers, nfreq)
+        he2_val += bolt @ he2_cont
 
-            for n in range(9):
-                he2_val = he2_val + cont[n] * bolt[:, n]
-
-            coulff_arr = he2_coulff[:, j]
-
-            ahe2[:, j] = (he2_val + coulff_arr * cfree * freet) * stim[:, j]
-            she2[:, j] = bnu_all[:, j]
+        # Add free-free: coulff * cfree * freet
+        ahe2[:, :] = (he2_val + he2_coulff * cfree_all[np.newaxis, :] * freet[:, np.newaxis]) * stim
+        she2[:, :] = bnu_all
 
     # HEMIOP: He- opacity (atlas7v.for line 7296-7318)
     # Fortran evidence:
@@ -2032,106 +2020,88 @@ def compute_kapp_continuum(
         # hckt is shape (n_layers,) — from atmosphere
         bolt = _c1_glev[:, None] * np.exp(-_c1_elev[:, None] * hckt[None, :])
 
-        for j in range(nfreq):
-            f = freq[j]
-            wno = waveno[j]
-            stim_j = stim[:, j]
-
-            # Fortran: IF(FREQ.GT.3.28805D15)RETURN  (Lyman limit guard)
-            if f > 3.28805e15:
-                continue
-
+        # Vectorized C1OP: eliminate per-frequency Python loop
+        lyman_mask = freq <= 3.28805e15  # (nfreq,)
+        if np.any(lyman_mask):
             z = 1.0
-            freq3 = 2.815e29 / f / f / f * z**4
+            _c1_elim1 = 90862.70
+            _c1_elim2 = 90820.42
+            _c1_elim2b = _c1_elim2 + 63.42
+            _c1_elim3 = _c1_elim2 + 43003.3
+            _c1_elim_ff = _c1_elim2
 
-            # Compute cross-sections x[0..24]
-            x = np.zeros(25)
+            # x_grid[25, nfreq] — cross-section per level per frequency
+            x_grid = np.zeros((25, nfreq), dtype=np.float64)
 
-            # --- Group 1: C II 2P average limit (levels 1-14) ---
-            elim1 = 90862.70
-            # Levels 1-6: 2s2 2p3d states, XKARSAS(FREQ, ZEFF2, 3, 2)
-            for i in range(6):
-                if wno < elim1 - _c1_elev[i]:
-                    break
-                zeff2 = 9.0 / _RYD * (elim1 - _c1_elev[i])
-                x[i] = xkarsas(f, zeff2, 3, 2)
-            # Levels 7-12: 2s2 2p3p states, XKARSAS(FREQ, ZEFF2, 3, 1)
-            for i in range(6, 12):
-                if wno < elim1 - _c1_elev[i]:
-                    break
-                zeff2 = 9.0 / _RYD * (elim1 - _c1_elev[i])
-                x[i] = xkarsas(f, zeff2, 3, 1)
-            # Levels 13-14: 2s2 2p3s states, XKARSAS(FREQ, ZEFF2, 3, 0)
-            for i in range(12, 14):
-                if wno < elim1 - _c1_elev[i]:
-                    break
-                zeff2 = 9.0 / _RYD * (elim1 - _c1_elev[i])
-                x[i] = xkarsas(f, zeff2, 3, 0)
+            # Group 1: levels 0-5 (n=3, l=2), 6-11 (n=3, l=1), 12-13 (n=3, l=0)
+            for i in range(14):
+                thresh = _c1_elim1 - _c1_elev[i]
+                mask = lyman_mask & (waveno >= thresh)
+                if not np.any(mask):
+                    continue
+                zeff2 = 9.0 / _RYD * thresh
+                if i < 6:
+                    x_grid[i, mask] = xkarsas_grid(freq[mask], zeff2, 3, 2)
+                elif i < 12:
+                    x_grid[i, mask] = xkarsas_grid(freq[mask], zeff2, 3, 1)
+                else:
+                    x_grid[i, mask] = xkarsas_grid(freq[mask], zeff2, 3, 0)
 
-            # --- Group 2: C II 2P1/2 limit (levels 15-19), Luo & Pradhan ---
-            elim2 = 90820.42
-            # Level 15 (1S): Luo & Pradhan + Burke & Taylor resonance
-            if wno >= elim2 - _c1_elev[14]:
-                xs0 = 10.0 ** (-16.80 - (wno - elim2 + _c1_elev[14]) / 3.0 / _RYD)
-                eps = (wno - 97700.0) * 2.0 / 2743.0
-                xs1 = (68e-18 * eps + 118e-18) / (eps**2 + 1.0)
-                x[14] = (xs0 + xs1) * 1.0 / 3.0
-            # Level 16 (1D): Luo & Pradhan + two Burke & Taylor resonances
-            if wno >= elim2 - _c1_elev[15]:
-                xd0 = 10.0 ** (-16.80 - (wno - elim2 + _c1_elev[15]) / 3.0 / _RYD)
-                eps1 = (wno - 93917.0) * 2.0 / 9230.0
-                xd1 = (22e-18 * eps1 + 26e-18) / (eps1**2 + 1.0)
-                eps2 = (wno - 111130.0) * 2.0 / 2743.0
-                xd2 = (-10.5e-18 * eps2 + 46e-18) / (eps2**2 + 1.0)
-                x[15] = (xd0 + xd1 + xd2) * 1.0 / 3.0
-            # Levels 17-19 (3P2, 3P1, 3P0): Luo & Pradhan
-            for i in range(16, 19):
-                if wno >= elim2 - _c1_elev[i]:
-                    x[i] = 10.0 ** (-16.80 - (wno - elim2 + _c1_elev[i]) / 3.0 / _RYD) * 1.0 / 3.0
+            # Group 2: Luo & Pradhan levels 14-18, C II 2P1/2 limit (1/3 weight)
+            for elim_g2, weight in [(_c1_elim2, 1.0 / 3.0), (_c1_elim2b, 2.0 / 3.0)]:
+                # Level 14 (1S)
+                mask14 = lyman_mask & (waveno >= elim_g2 - _c1_elev[14])
+                if np.any(mask14):
+                    wno_m = waveno[mask14]
+                    xs0 = 10.0 ** (-16.80 - (wno_m - elim_g2 + _c1_elev[14]) / 3.0 / _RYD)
+                    eps = (wno_m - 97700.0) * 2.0 / 2743.0
+                    xs1 = (68e-18 * eps + 118e-18) / (eps**2 + 1.0)
+                    x_grid[14, mask14] += (xs0 + xs1) * weight
+                # Level 15 (1D)
+                mask15 = lyman_mask & (waveno >= elim_g2 - _c1_elev[15])
+                if np.any(mask15):
+                    wno_m = waveno[mask15]
+                    xd0 = 10.0 ** (-16.80 - (wno_m - elim_g2 + _c1_elev[15]) / 3.0 / _RYD)
+                    eps1 = (wno_m - 93917.0) * 2.0 / 9230.0
+                    xd1 = (22e-18 * eps1 + 26e-18) / (eps1**2 + 1.0)
+                    eps2 = (wno_m - 111130.0) * 2.0 / 2743.0
+                    xd2 = (-10.5e-18 * eps2 + 46e-18) / (eps2**2 + 1.0)
+                    x_grid[15, mask15] += (xd0 + xd1 + xd2) * weight
+                # Levels 16-18 (3P)
+                for i in range(16, 19):
+                    mask_i = lyman_mask & (waveno >= elim_g2 - _c1_elev[i])
+                    if np.any(mask_i):
+                        x_grid[i, mask_i] += (
+                            10.0 ** (-16.80 - (waveno[mask_i] - elim_g2 + _c1_elev[i]) / 3.0 / _RYD) * weight
+                        )
 
-            # --- Group 2b: C II 2P3/2 limit (levels 15-19), 2/3 weight added ---
-            elim2b = 90820.42 + 63.42
-            if wno >= elim2b - _c1_elev[14]:
-                xs0 = 10.0 ** (-16.80 - (wno - elim2b + _c1_elev[14]) / 3.0 / _RYD)
-                eps = (wno - 97700.0) * 2.0 / 2743.0
-                xs1 = (68e-18 * eps + 118e-18) / (eps**2 + 1.0)
-                x[14] += (xs0 + xs1) * 2.0 / 3.0
-            if wno >= elim2b - _c1_elev[15]:
-                xd0 = 10.0 ** (-16.80 - (wno - elim2b + _c1_elev[15]) / 3.0 / _RYD)
-                eps1 = (wno - 93917.0) * 2.0 / 9230.0
-                xd1 = (22e-18 * eps1 + 26e-18) / (eps1**2 + 1.0)
-                eps2 = (wno - 111130.0) * 2.0 / 2743.0
-                xd2 = (-10.5e-18 * eps2 + 46e-18) / (eps2**2 + 1.0)
-                x[15] += (xd0 + xd1 + xd2) * 2.0 / 3.0
-            for i in range(16, 19):
-                if wno >= elim2b - _c1_elev[i]:
-                    x[i] += 10.0 ** (-16.80 - (wno - elim2b + _c1_elev[i]) / 3.0 / _RYD) * 2.0 / 3.0
-
-            # --- Group 3: C II 4P1/2 limit (levels 20-25) ---
-            elim3 = 90820.42 + 43003.3
+            # Group 3: levels 19-24 (n=2, l=1, degen=3)
             degen = 3.0
             for i in range(19, 25):
-                if wno < elim3 - _c1_elev[i]:
-                    break
-                zeff2 = 4.0 / _RYD * (elim3 - _c1_elev[i])
-                x[i] = xkarsas(f, zeff2, 2, 1) * degen
+                thresh = _c1_elim3 - _c1_elev[i]
+                mask = lyman_mask & (waveno >= thresh)
+                if not np.any(mask):
+                    continue
+                zeff2 = 4.0 / _RYD * thresh
+                x_grid[i, mask] = xkarsas_grid(freq[mask], zeff2, 2, 1) * degen
 
-            # --- Kramers-Gaunt n>=4 free-free approximation ---
-            elim_ff = 90820.42
+            # Kramers-Gaunt n>=4 free-free
             gfactor = 6.0
             ryd_z2_over_16 = _RYD * z**2 / 16.0
-            kramers_exp_arg_min = max(elim_ff - ryd_z2_over_16, elim_ff - wno)
-            # h_kramers[k] = freq3*gfactor*2/2/(RYD*Z^2*HCKT(k)) * (exp(-...) - exp(-elim*HCKT(k)))
-            h_kramers = (freq3 * gfactor / (_RYD * z**2 * hckt)
-                         * (np.exp(-kramers_exp_arg_min * hckt)
-                            - np.exp(-elim_ff * hckt)))
+            freq3_all = 2.815e29 * z**4 / (freq ** 3)  # (nfreq,)
+            kramers_exp_arg_min = np.maximum(_c1_elim_ff - ryd_z2_over_16, _c1_elim_ff - waveno)  # (nfreq,)
+            # h_kramers: (n_layers, nfreq)
+            h_kramers_all = (
+                freq3_all[np.newaxis, :] * gfactor / (_RYD * z**2 * hckt[:, np.newaxis])
+                * (np.exp(-kramers_exp_arg_min[np.newaxis, :] * hckt[:, np.newaxis])
+                   - np.exp(-_c1_elim_ff * hckt)[:, np.newaxis])
+            )
 
-            # Sum: H = kramers + sum(x[i] * bolt[i, :])
-            h = h_kramers + np.dot(x, bolt)
+            # Sum: H = kramers + bolt.T @ x_grid  → bolt is (25, n_layers), x_grid is (25, nfreq)
+            h_all = h_kramers_all + bolt.T @ x_grid  # (n_layers, nfreq)
 
-            # Final: AC1(J) = H * XNFP(J,21) * STIM(J) / RHO(J)
-            ac1[:, j] = h * xnfpc * stim_j / rho
-            sc1[:, j] = bnu_all[:, j]
+            ac1[:, lyman_mask] = h_all[:, lyman_mask] * (xnfpc * stim[:, lyman_mask].T / rho).T
+            sc1[:, lyman_mask] = bnu_all[:, lyman_mask]
 
     # MG1OP: Magnesium I opacity — atlas12.for lines 6768-6896.
     # Fortran: XNFP(J,78), 1-based → Python index 77.
@@ -2150,74 +2120,78 @@ def compute_kapp_continuum(
 
         bolt_mg = _mg1_glev[:, None] * np.exp(-_mg1_elev[:, None] * hckt[None, :])
 
-        for j in range(nfreq):
-            f = freq[j]
-            wno = waveno[j]
-            stim_j = stim[:, j]
-
-            if f > 3.28805e15:
-                continue
-
+        # Vectorized MG1OP: eliminate per-frequency Python loop
+        lyman_mask_mg = freq <= 3.28805e15
+        if np.any(lyman_mask_mg):
             z = 1.0
-            freq3 = 2.815e29 / f / f / f * z**4
-
-            x = np.zeros(15)
             elim = 61671.02
+            x_mg = np.zeros((15, nfreq), dtype=np.float64)
 
-            # Levels 1-2: 3s4f states, XKARSAS(FREQ, ZEFF2, 4, 3)
+            # Levels 0-1: xkarsas (4, 3)
             for i in range(2):
-                if wno < elim - _mg1_elev[i]:
-                    break
-                zeff2 = 16.0 / _RYD_MG * (elim - _mg1_elev[i])
-                x[i] = xkarsas(f, zeff2, 4, 3)
-            # Levels 3-4: 3s4d states, XKARSAS(FREQ, ZEFF2, 4, 2)
+                thresh = elim - _mg1_elev[i]
+                mask = lyman_mask_mg & (waveno >= thresh)
+                if np.any(mask):
+                    x_mg[i, mask] = xkarsas_grid(freq[mask], 16.0 / _RYD_MG * thresh, 4, 3)
+            # Levels 2-3: xkarsas (4, 2)
             for i in range(2, 4):
-                if wno < elim - _mg1_elev[i]:
-                    break
-                zeff2 = 16.0 / _RYD_MG * (elim - _mg1_elev[i])
-                x[i] = xkarsas(f, zeff2, 4, 2)
-            # Level 5: 3s4p 1P, XKARSAS(FREQ, ZEFF2, 4, 1)
-            if wno >= elim - _mg1_elev[4]:
-                zeff2 = 16.0 / _RYD_MG * (elim - _mg1_elev[4])
-                x[4] = xkarsas(f, zeff2, 4, 1)
-            # Level 6: 3s3d 3D — analytical
-            if wno >= elim - _mg1_elev[5]:
-                x[5] = 25e-18 * (13713.986 / wno) ** 2.7
-            # Level 7: 3s4p 3P — analytical
-            if wno >= elim - _mg1_elev[6]:
-                x[6] = 33.8e-18 * (13823.223 / wno) ** 2.8
-            # Level 8: 3s3d 1D — analytical
-            if wno >= elim - _mg1_elev[7]:
-                x[7] = 45e-18 * (15267.955 / wno) ** 2.7
-            # Level 9: 3s4s 1S — analytical
-            if wno >= elim - _mg1_elev[8]:
-                x[8] = 0.43e-18 * (18167.687 / wno) ** 2.6
-            # Level 10: 3s4s 3S — analytical
-            if wno >= elim - _mg1_elev[9]:
-                x[9] = 2.1e-18 * (20473.617 / wno) ** 2.6
-            # Level 11: 3s3p 1P — analytical (two-term)
-            if wno >= elim - _mg1_elev[10]:
-                x[10] = 16e-18 * (26619.756 / wno) ** 2.1 - 7.8e-18 * (26619.756 / wno) ** 9.5
-            # Levels 12-14: 3s3p 3P (three J sub-levels) — analytical with MAX
+                thresh = elim - _mg1_elev[i]
+                mask = lyman_mask_mg & (waveno >= thresh)
+                if np.any(mask):
+                    x_mg[i, mask] = xkarsas_grid(freq[mask], 16.0 / _RYD_MG * thresh, 4, 2)
+            # Level 4: xkarsas (4, 1)
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[4])
+            if np.any(mask):
+                x_mg[4, mask] = xkarsas_grid(freq[mask], 16.0 / _RYD_MG * (elim - _mg1_elev[4]), 4, 1)
+            # Level 5: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[5])
+            if np.any(mask):
+                x_mg[5, mask] = 25e-18 * (13713.986 / waveno[mask]) ** 2.7
+            # Level 6: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[6])
+            if np.any(mask):
+                x_mg[6, mask] = 33.8e-18 * (13823.223 / waveno[mask]) ** 2.8
+            # Level 7: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[7])
+            if np.any(mask):
+                x_mg[7, mask] = 45e-18 * (15267.955 / waveno[mask]) ** 2.7
+            # Level 8: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[8])
+            if np.any(mask):
+                x_mg[8, mask] = 0.43e-18 * (18167.687 / waveno[mask]) ** 2.6
+            # Level 9: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[9])
+            if np.any(mask):
+                x_mg[9, mask] = 2.1e-18 * (20473.617 / waveno[mask]) ** 2.6
+            # Level 10: analytical (two-term)
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[10])
+            if np.any(mask):
+                x_mg[10, mask] = 16e-18 * (26619.756 / waveno[mask]) ** 2.1 - 7.8e-18 * (26619.756 / waveno[mask]) ** 9.5
+            # Levels 11-13: analytical with max
             for i in range(11, 14):
-                if wno >= elim - _mg1_elev[i]:
-                    xval = 20e-18 * (39759.842 / wno) ** 2.7
-                    x[i] = max(xval, 40e-18 * (39759.842 / wno) ** 14)
-            # Level 15: 3s2 1S — analytical
-            if wno >= elim - _mg1_elev[14]:
-                x[14] = 1.1e-18 * ((elim - _mg1_elev[14]) / wno) ** 10
+                mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[i])
+                if np.any(mask):
+                    xval = 20e-18 * (39759.842 / waveno[mask]) ** 2.7
+                    x_mg[i, mask] = np.maximum(xval, 40e-18 * (39759.842 / waveno[mask]) ** 14)
+            # Level 14: analytical
+            mask = lyman_mask_mg & (waveno >= elim - _mg1_elev[14])
+            if np.any(mask):
+                x_mg[14, mask] = 1.1e-18 * ((elim - _mg1_elev[14]) / waveno[mask]) ** 10
 
             # Kramers-Gaunt n>=5 free-free
             gfactor = 2.0
             ryd_z2_over_25 = _RYD_MG * z**2 / 25.0
-            kff_arg = max(elim - ryd_z2_over_25, elim - wno)
-            h_kramers = (freq3 * gfactor / (_RYD_MG * z**2 * hckt)
-                         * (np.exp(-kff_arg * hckt) - np.exp(-elim * hckt)))
+            freq3_mg = 2.815e29 * z**4 / (freq ** 3)
+            kff_arg_mg = np.maximum(elim - ryd_z2_over_25, elim - waveno)
+            h_kramers_mg = (
+                freq3_mg[np.newaxis, :] * gfactor / (_RYD_MG * z**2 * hckt[:, np.newaxis])
+                * (np.exp(-kff_arg_mg[np.newaxis, :] * hckt[:, np.newaxis])
+                   - np.exp(-elim * hckt)[:, np.newaxis])
+            )
 
-            h = h_kramers + np.dot(x, bolt_mg)
-
-            amg1[:, j] = h * xnfpmg * stim_j / rho
-            smg1[:, j] = bnu_all[:, j]
+            h_mg = h_kramers_mg + bolt_mg.T @ x_mg  # (n_layers, nfreq)
+            amg1[:, lyman_mask_mg] = h_mg[:, lyman_mask_mg] * (xnfpmg * stim[:, lyman_mask_mg].T / rho).T
+            smg1[:, lyman_mask_mg] = bnu_all[:, lyman_mask_mg]
 
     # FE1OP: Iron I opacity (atlas7v.for line 6623-6665) - simpler structure
     # Fortran: FE1OP uses XNFP(J,351) — POPSALL slot 351, 1-based → index 350.
@@ -2492,106 +2466,77 @@ def compute_kapp_continuum(
 
         bolt_si = _si1_glev[:, None] * np.exp(-_si1_elev[:, None] * hckt[None, :])
 
-        for j in range(nfreq):
-            f = freq[j]
-            wno = waveno[j]
-            stim_j = stim[:, j]
-
-            if f > 3.28805e15:
-                continue
-
+        # Vectorized SI1OP: eliminate per-frequency Python loop
+        lyman_mask_si = freq <= 3.28805e15
+        if np.any(lyman_mask_si):
             z = 1.0
-            freq3 = 2.815e29 / f / f / f * z**4
+            x_si = np.zeros((33, nfreq), dtype=np.float64)
 
-            x = np.zeros(33)
-
-            # --- Group 1: Si II 2P avg limit (levels 1-22) — XKARSAS ---
-            elim1 = 65939.18
+            # Group 1: levels 0-21 — XKARSAS
+            elim1_si = 65939.18
             for i in range(22):
-                if wno < elim1 - _si1_elev[i]:
-                    break
-                zeff2 = _si1_zeff_fac[i] / _RYD_SI * (elim1 - _si1_elev[i])
+                thresh = elim1_si - _si1_elev[i]
+                mask = lyman_mask_si & (waveno >= thresh)
+                if not np.any(mask):
+                    continue
+                zeff2 = _si1_zeff_fac[i] / _RYD_SI * thresh
                 n_qn, l_qn = _si1_nl[i]
-                x[i] = xkarsas(f, zeff2, n_qn, l_qn)
+                x_si[i, mask] = xkarsas_grid(freq[mask], zeff2, n_qn, l_qn)
 
-            # --- Group 2: Si II 2P1/2 limit (levels 23-27) — Nahar & Pradhan ---
-            elim2 = 65747.55
-            # Level 23 (1S): Nahar & Pradhan + resonance
-            if wno >= elim2 - _si1_elev[22]:
-                eps = (wno - 70000.0) * 2.0 / 6500.0
-                reson1 = (97e-18 * eps + 94e-18) / (eps**2 + 1.0)
-                x[22] = (37e-18 * (50353.180 / wno) ** 2.40 + reson1) / 3.0
-            # Level 24 (1D): Nahar & Pradhan + resonance
-            if wno >= elim2 - _si1_elev[23]:
-                eps = (wno - 78600.0) * 2.0 / 13000.0
-                reson1 = (-10e-18 * eps + 77e-18) / (eps**2 + 1.0)
-                x[23] = (24.5e-18 * (59448.700 / wno) ** 1.85 + reson1) / 3.0
-            # Level 25 (3P2): Nahar & Pradhan (two-part power law)
-            if wno >= elim2 - _si1_elev[24]:
-                if wno <= 74000.0:
-                    x[24] = 72e-18 * (65524.393 / wno) ** 1.90 / 3.0
-                else:
-                    x[24] = 93e-18 * (65524.393 / wno) ** 4.00 / 3.0
-            # Level 26 (3P1)
-            if wno >= elim2 - _si1_elev[25]:
-                if wno <= 74000.0:
-                    x[25] = 72e-18 * (65524.393 / wno) ** 1.90 * 2.0 / 3.0
-                else:
-                    x[25] = 93e-18 * (65524.393 / wno) ** 4.00 * 2.0 / 3.0
-            # Level 27 (3P0)
-            if wno >= elim2 - _si1_elev[26]:
-                if wno <= 74000.0:
-                    x[26] = 72e-18 * (65524.393 / wno) ** 1.90 / 3.0
-                else:
-                    x[26] = 93e-18 * (65524.393 / wno) ** 4.00 / 3.0
+            # Group 2 + 2b: Nahar & Pradhan levels 22-26
+            for elim_g, weight in [(65747.55, 1.0 / 3.0), (65747.55 + 287.45, 2.0 / 3.0)]:
+                # Level 22 (1S)
+                m22 = lyman_mask_si & (waveno >= elim_g - _si1_elev[22])
+                if np.any(m22):
+                    wm = waveno[m22]
+                    eps = (wm - 70000.0) * 2.0 / 6500.0
+                    reson1 = (97e-18 * eps + 94e-18) / (eps**2 + 1.0)
+                    x_si[22, m22] += (37e-18 * (50353.180 / wm) ** 2.40 + reson1) * weight
+                # Level 23 (1D)
+                m23 = lyman_mask_si & (waveno >= elim_g - _si1_elev[23])
+                if np.any(m23):
+                    wm = waveno[m23]
+                    eps = (wm - 78600.0) * 2.0 / 13000.0
+                    reson1 = (-10e-18 * eps + 77e-18) / (eps**2 + 1.0)
+                    x_si[23, m23] += (24.5e-18 * (59448.700 / wm) ** 1.85 + reson1) * weight
+                # Levels 24-26 (3P): two-part power law
+                for i, w_mult in [(24, 1.0), (25, 2.0), (26, 1.0)]:
+                    mi = lyman_mask_si & (waveno >= elim_g - _si1_elev[i])
+                    if np.any(mi):
+                        wm = waveno[mi]
+                        ratio = 65524.393 / wm
+                        x_si[i, mi] += np.where(
+                            wm <= 74000.0,
+                            72e-18 * ratio ** 1.90,
+                            93e-18 * ratio ** 4.00,
+                        ) * w_mult * weight
 
-            # --- Group 2b: Si II 2P3/2 limit (levels 23-27), 2/3 weight ---
-            elim2b = 65747.55 + 287.45
-            if wno >= elim2b - _si1_elev[22]:
-                eps = (wno - 70000.0) * 2.0 / 6500.0
-                reson1 = (97e-18 * eps + 94e-18) / (eps**2 + 1.0)
-                x[22] += (37e-18 * (50353.180 / wno) ** 2.40 + reson1) * 2.0 / 3.0
-            if wno >= elim2b - _si1_elev[23]:
-                eps = (wno - 78600.0) * 2.0 / 13000.0
-                reson1 = (-10e-18 * eps + 77e-18) / (eps**2 + 1.0)
-                x[23] += (24.5e-18 * (59448.700 / wno) ** 1.85 + reson1) * 2.0 / 3.0
-            if wno >= elim2b - _si1_elev[24]:
-                if wno <= 74000.0:
-                    x[24] += 72e-18 * (65524.393 / wno) ** 1.90 * 2.0 / 3.0
-                else:
-                    x[24] += 93e-18 * (65524.393 / wno) ** 4.00 * 2.0 / 3.0
-            if wno >= elim2b - _si1_elev[25]:
-                if wno <= 74000.0:
-                    x[25] += 72e-18 * (65524.393 / wno) ** 1.90 * 2.0 / 3.0
-                else:
-                    x[25] += 93e-18 * (65524.393 / wno) ** 4.00 * 2.0 / 3.0
-            if wno >= elim2b - _si1_elev[26]:
-                if wno <= 74000.0:
-                    x[26] += 72e-18 * (65524.393 / wno) ** 1.90 * 2.0 / 3.0
-                else:
-                    x[26] += 93e-18 * (65524.393 / wno) ** 4.00 * 2.0 / 3.0
-
-            # --- Group 3: Si II 4P1/2 limit (levels 28-33) — XKARSAS ---
-            elim3 = 65747.5 + 42824.35
+            # Group 3: levels 27-32 — XKARSAS (3, 1)
+            elim3_si = 65747.5 + 42824.35
             degen_si = 3.0
             for i in range(27, 33):
-                if wno < elim3 - _si1_elev[i]:
-                    break
-                zeff2 = 9.0 / _RYD_SI * (elim3 - _si1_elev[i])
-                x[i] = xkarsas(f, zeff2, 3, 1) * degen_si
+                thresh = elim3_si - _si1_elev[i]
+                mask = lyman_mask_si & (waveno >= thresh)
+                if not np.any(mask):
+                    continue
+                zeff2 = 9.0 / _RYD_SI * thresh
+                x_si[i, mask] = xkarsas_grid(freq[mask], zeff2, 3, 1) * degen_si
 
             # Kramers-Gaunt n>=5 free-free
-            elim_ff = 65747.55
-            gfactor = 6.0
+            elim_ff_si = 65747.55
+            gfactor_si = 6.0
             ryd_z2_25 = _RYD_SI * z**2 / 25.0
-            kff_arg = max(elim_ff - ryd_z2_25, elim_ff - wno)
-            h_kramers = (freq3 * gfactor / (_RYD_SI * z**2 * hckt)
-                         * (np.exp(-kff_arg * hckt) - np.exp(-elim_ff * hckt)))
+            freq3_si = 2.815e29 * z**4 / (freq ** 3)
+            kff_arg_si = np.maximum(elim_ff_si - ryd_z2_25, elim_ff_si - waveno)
+            h_kramers_si = (
+                freq3_si[np.newaxis, :] * gfactor_si / (_RYD_SI * z**2 * hckt[:, np.newaxis])
+                * (np.exp(-kff_arg_si[np.newaxis, :] * hckt[:, np.newaxis])
+                   - np.exp(-elim_ff_si * hckt)[:, np.newaxis])
+            )
 
-            h = h_kramers + np.dot(x, bolt_si)
-
-            asi1[:, j] = h * xnfpsi * stim_j / rho
-            ssi1[:, j] = bnu_all[:, j]
+            h_si = h_kramers_si + bolt_si.T @ x_si
+            asi1[:, lyman_mask_si] = h_si[:, lyman_mask_si] * (xnfpsi * stim[:, lyman_mask_si].T / rho).T
+            ssi1[:, lyman_mask_si] = bnu_all[:, lyman_mask_si]
 
     # LUKEOP: Lukewarm star opacity (atlas7v.for line 8952-8977)
     # Computes: N1OP, O1OP, MG2OP, SI2OP, CA2OP

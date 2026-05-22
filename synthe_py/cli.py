@@ -135,8 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Parallel workers for synthesis (metal line accumulation, RT when parallel). "
-            "Default: all logical CPUs for maximum throughput; use 1 for sequential debugging."
+            "ThreadPool size for the radiative-transfer loop over wavelengths (solve_lte_spectrum). "
+            "Metal-wing accumulation uses separate Numba/OpenMP parallelism and does not use this "
+            "count unless NUMBA_NUM_THREADS is set accordingly. Default RT pool: all CPUs for large "
+            "grids; use 1 for sequential RT. If multi-worker RT is slower than 1, try "
+            "OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 (BLAS oversubscription across pool threads)."
         ),
     )
     parser.add_argument(

@@ -141,7 +141,7 @@ class AtmosphereEmulator:
         
         Returns:
             numpy.ndarray: 80x9 atmosphere data array with columns:
-                          RHOX, T, P, XNE, ABROSS, ACCRAD, VTURB, 0, 0
+                          RHOX, T, P, XNE, ABROSS, ACCRAD, VTURB, FLXCNV, VCONV
         """
         # Get predictions from model using provided TAU grid
         pred = self.predict(teff, logg, feh, afe, tau_grid=tau_grid)
@@ -155,8 +155,8 @@ class AtmosphereEmulator:
         data[:, 4] = pred['ABROSS']     # Column 5: Rosseland mean opacity
         data[:, 5] = pred['ACCRAD']     # Column 6: Radiative acceleration
         data[:, 6] = vturb * 1e5        # Column 7: Vturb (km/s -> cm/s)
-        data[:, 7] = 0.0                # Column 8: Convective velocity (set to 0)
-        data[:, 8] = 0.0                # Column 9: Convective flux ratio (set to 0)
+        data[:, 7] = 0.0                # Column 8: Convective flux (set to 0)
+        data[:, 8] = 0.0                # Column 9: Convective velocity (set to 0)
         
         return data
 

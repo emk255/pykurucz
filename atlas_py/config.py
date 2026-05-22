@@ -51,4 +51,5 @@ class AtlasConfig:
     convergence_epsilon: Optional[float] = None
     convergence_min_iterations: int = 5
     convergence_consecutive: int = 1
+    n_workers: Optional[int] = None
 
