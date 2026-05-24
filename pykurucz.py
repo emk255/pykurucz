@@ -18,8 +18,7 @@ Fortran ATLAS12 (MOLECULES ON) — skipping it would silently diverge from
 Fortran parity and is therefore not offered as an option.
 
 This module also exposes the building blocks for the same flow as
-public helpers so that other tools (e.g. run_e2e_pipeline.py) can reuse them
-without duplicating the subprocess plumbing:
+public helpers so other scripts can reuse them without duplicating subprocess plumbing:
 
     emulator_warmstart_atm(...)  -> Path    # stellar params → warm-start .atm
     run_atlas_py(...)            -> Path    # warm-start .atm → iterated .atm
@@ -255,9 +254,7 @@ def write_atm_file(path: Path, teff: float, logg: float,
 # ── Shared pipeline helpers ─────────────────────────────────────────────
 #
 # The three public helpers below are the canonical Python-pipeline building
-# blocks.  ``synthesize()`` chains them, and run_e2e_pipeline.py imports them
-# directly so that both user-facing and validation runs go through the exact
-# same code paths.
+# blocks.  ``synthesize()`` chains them for the user-facing CLI.
 
 _REPO_ROOT = Path(__file__).resolve().parent
 
@@ -272,7 +269,7 @@ def _default_atlas_cache_dir() -> Path:
     return _REPO_ROOT / "results" / "atlas_fort12_cache"
 
 
-# Prod optimization defaults (parity_e2e / broad regression).  Applied via
+# Prod optimization defaults.  Applied via setdefault in child processes so an
 # setdefault in child processes so an explicit shell override still wins.
 _PROD_ENV_DEFAULTS: dict[str, str] = {
     "ATLAS_LINOP1_CACHE_LINE_SCALARS": "1",
@@ -667,7 +664,7 @@ def synthesize(
         synthe_py.cli (default: all logical CPUs for both).
     atlas_fort12_cache : bool
         When True (default), reuse a disk cache of Python SELECTLINES output
-        under ``results/atlas_fort12_cache/`` (same as ``tools/parity_e2e.py``).
+        under ``results/atlas_fort12_cache/``.
     atlas_cache_dir : Path, optional
         Override directory for the fort.12 cache.  Ignored when
         ``atlas_fort12_cache`` is False.
