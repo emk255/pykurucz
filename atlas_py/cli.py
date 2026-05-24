@@ -96,6 +96,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Consecutive converged iterations required before early stopping (default: 1)",
     )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        help=(
+            "ThreadPool size for the per-iteration frequency loop in atlas_py "
+            "(default: all logical CPUs). Set to 1 for a fully serial loop. "
+            "NLTE (STATEQ) forces serial execution regardless of this value."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Directory for fort.12 SELECTLINES disk cache (speeds repeated runs).",
+    )
     return parser
 
 
@@ -129,6 +145,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         convergence_epsilon=args.convergence_epsilon,
         convergence_min_iterations=args.convergence_min_iterations,
         convergence_consecutive=args.convergence_consecutive,
+        n_workers=args.n_workers,
+        cache_dir=args.cache_dir,
     )
     # Fix 10: catch ZeroDivisionError / FloatingPointError that escape josh
     # Python fallback so the slurm task exits cleanly rather than killing the whole array.

@@ -267,6 +267,31 @@ def _default_kurucz_root() -> Path:
     return _REPO_ROOT / "data"
 
 
+def _default_atlas_cache_dir() -> Path:
+    """Disk cache for Python SELECTLINES (``fort.12``); shared with parity harness."""
+    return _REPO_ROOT / "results" / "atlas_fort12_cache"
+
+
+# Prod optimization defaults (parity_e2e / broad regression).  Applied via
+# setdefault in child processes so an explicit shell override still wins.
+_PROD_ENV_DEFAULTS: dict[str, str] = {
+    "ATLAS_LINOP1_CACHE_LINE_SCALARS": "1",
+    "ATLAS_LINOP1_PREFILTER": "1",
+    "ATLAS_LINOP1_TIGHT_PREFILTER": "1",
+    "ATLAS_LINOP1_SERIAL": "0",
+    "ATLAS_LINOP1_BACKEND": "cpu",
+    "PY_USE_NUMBA_TRANSP": "1",
+    "PY_NUMBA_HELIUM": "1",
+    "PY_OPT_STEP1_WING_HOIST": "1",
+    "PY_HYD_JIT": "1",
+}
+
+
+def _apply_prod_env_defaults(env: dict[str, str]) -> None:
+    for key, value in _PROD_ENV_DEFAULTS.items():
+        env.setdefault(key, value)
+
+
 def _run_streaming(
     cmd: list[str],
     *,
@@ -280,6 +305,7 @@ def _run_streaming(
     """
     env = {**os.environ}
     env.setdefault("PYTHONUNBUFFERED", "1")
+    _apply_prod_env_defaults(env)
     proc = subprocess.Popen(
         cmd,
         text=True,
@@ -354,6 +380,8 @@ def run_atlas_py(
     convergence_epsilon: Optional[float] = None,
     convergence_min_iterations: int = 5,
     convergence_consecutive: int = 1,
+    n_workers: Optional[int] = None,
+    cache_dir: Optional[Path] = None,
 ) -> Path:
     """Run ``atlas_py.cli`` on *input_atm* and write iterated output to *output_atm*.
 
@@ -433,6 +461,10 @@ def run_atlas_py(
         )
     if fort12_bin is not None and fort12_bin.exists():
         cmd.extend(["--line-selection-bin", str(fort12_bin)])
+    if cache_dir is not None:
+        cmd.extend(["--cache-dir", str(cache_dir)])
+    if n_workers is not None:
+        cmd.extend(["--n-workers", str(n_workers)])
 
     with log_path.open("w", encoding="utf-8") as logf:
         logf.write(
@@ -585,6 +617,8 @@ def synthesize(
     atlas_convergence_min_iterations: int = 5,
     atlas_convergence_consecutive: int = 1,
     n_workers: Optional[int] = None,
+    atlas_fort12_cache: bool = True,
+    atlas_cache_dir: Optional[Path] = None,
     warmstart_atm_override: Optional[str] = None,
 ) -> Path:
     """Generate a synthetic spectrum from stellar parameters.
@@ -630,7 +664,14 @@ def synthesize(
         Early-stop threshold on physical atmosphere column changes.  Defaults
         to 1e-3; set to None to force all ``atlas_iterations``.
     n_workers : int, optional
-        Worker count for synthe_py.cli (default: all logical CPUs).
+        Worker count for both atlas_py.cli (frequency-loop thread pool) and
+        synthe_py.cli (default: all logical CPUs for both).
+    atlas_fort12_cache : bool
+        When True (default), reuse a disk cache of Python SELECTLINES output
+        under ``results/atlas_fort12_cache/`` (same as ``tools/parity_e2e.py``).
+    atlas_cache_dir : Path, optional
+        Override directory for the fort.12 cache.  Ignored when
+        ``atlas_fort12_cache`` is False.
 
     Returns
     -------
@@ -736,8 +777,15 @@ def synthesize(
             sys.exit(1)
     print(f"      Warm-start: {warmstart_atm}")
 
+    cache_dir = None
+    if atlas_fort12_cache:
+        cache_dir = atlas_cache_dir or _default_atlas_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
     # ── Stage 2: atlas_py iteration ─────────────────────────────────────
     print(f"[2/3] Running atlas_py ({atlas_iterations} iteration(s), MOLECULES ON)...")
+    if cache_dir is not None:
+        print(f"      fort.12 cache: {cache_dir}")
     try:
         run_atlas_py(
             input_atm=warmstart_atm,
@@ -747,6 +795,8 @@ def synthesize(
             convergence_epsilon=atlas_convergence_epsilon,
             convergence_min_iterations=atlas_convergence_min_iterations,
             convergence_consecutive=atlas_convergence_consecutive,
+            n_workers=n_workers,
+            cache_dir=cache_dir,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"ERROR in atlas_py: {exc}")
@@ -894,6 +944,29 @@ Notes:
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: results/)")
     parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        help=(
+            "Parallel worker count for atlas_py (frequency loop) and "
+            "synthe_py (RT pool). Default: all logical CPUs."
+        ),
+    )
+    parser.add_argument(
+        "--atlas-cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for fort.12 SELECTLINES disk cache "
+            f"(default: {_default_atlas_cache_dir()})."
+        ),
+    )
+    parser.add_argument(
+        "--no-atlas-cache",
+        action="store_true",
+        help="Disable fort.12 disk cache (rebuild SELECTLINES every run).",
+    )
+    parser.add_argument(
         "--warmstart-atm", type=str, default=None,
         help="Path to a pre-staged warm-start .atm file. When set, skip "
              "the kurucz-a1 emulator and use this file's layer structure "
@@ -933,6 +1006,8 @@ Notes:
     )
     if atlas_convergence_epsilon is not None and atlas_convergence_epsilon <= 0.0:
         parser.error("--atlas-convergence-epsilon must be positive")
+    if args.n_workers is not None and args.n_workers < 1:
+        parser.error("--n-workers must be >= 1")
 
     individual = None
     if args.abund:
@@ -956,6 +1031,13 @@ Notes:
         use_molecular_lines=not args.no_molecular_lines,
         include_tio=not args.no_tio,
         include_h2o=not args.no_h2o,
+        n_workers=args.n_workers,
+        atlas_fort12_cache=not args.no_atlas_cache,
+        atlas_cache_dir=(
+            Path(args.atlas_cache_dir).expanduser().resolve()
+            if args.atlas_cache_dir is not None
+            else None
+        ),
         warmstart_atm_override=args.warmstart_atm,
     )
 

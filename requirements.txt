@@ -13,5 +13,7 @@ python-dateutil==2.9.0.post0
 scipy==1.17.0
 six==1.17.0
 
-# Optional: needed only for the ATLAS12 emulator (pykurucz.py end-to-end mode)
-# torch
+gdown>=5.1
+
+# Optional: Apple Silicon GPU acceleration for LINOP1 (Phase 2 pilot)
+# mlx>=0.20; sys_platform == 'darwin' and platform_machine == 'arm64'

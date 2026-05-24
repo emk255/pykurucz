@@ -219,9 +219,13 @@ def _compute_asynth_wings_kernel(
     If N10DOP = 0 (which happens when DOPPLE*RESOLU < 0.1), NO wings are computed.
     This is critical for high-resolution spectra where Doppler widths are << grid spacing.
 
-    Parallel strategy: keep outer loop over lines sequential, but parallelize the
-    inner loop over depths (prange). Each worker writes to a distinct asynth row
-    (depth_idx), avoiding write races on shared wavelength bins.
+    Parallel strategy (May 2026): DEPTH-OUTER / LINE-INNER loop inversion.
+    Outer prange over depths (ONE dispatch of ~80 tasks), inner sequential loop
+    over all lines per depth.  Each prange worker owns asynth[depth_idx, :],
+    so no write races.  Eliminates ~60k prange dispatches of the old approach
+    and gives much better cache locality (each thread works on ~10 depth rows
+    = ~2.3 MB, fits in L2).  Lines within each depth are processed in original
+    order, preserving exact accumulation parity.
     """
     n_lines = transp.shape[0]
     n_depths = transp.shape[1]
@@ -238,29 +242,23 @@ def _compute_asynth_wings_kernel(
         if ratio > 1.0:
             resolu = 1.0 / (ratio - 1.0)
 
-    for line_idx in range(n_lines):  # Sequential loop to avoid race conditions
-        line_wavelength = line_wavelengths[line_idx]
-        center_idx = line_indices[line_idx]
-        line_type = line_types[line_idx]
+    # Precompute depth-independent line masks to avoid redundant checks
+    # inside the depth prange.  Only type-0 lines within reachable range
+    # are processed.
+    line_active = np.empty(n_lines, dtype=np.bool_)
+    for li in range(n_lines):
+        ci = line_indices[li]
+        line_active[li] = (
+            line_types[li] == 0
+            and ci >= -max_profile_steps
+            and ci <= n_wavelengths - 1 + max_profile_steps
+        )
 
-        # CRITICAL FIX: Skip fort.19 special lines (line_type != 0).
-        # Hydrogen (type -1/-2) → _compute_hydrogen_line_opacity (HPROF4 profile)
-        # Autoionizing (type 1) → _add_fort19_asynth (Lorentz profile)
-        # Helium (type -3/-6) → helium wings path
-        # Processing them here with Voigt/table profiles DOUBLE-COUNTS them
-        # with the wrong profile shape.
-        if line_type != 0:
-            continue
+    for depth_idx in prange(n_depths):  # ONE prange dispatch for all depths
+        for line_idx in range(n_lines):  # Sequential over lines — preserves accumulation order
+            if not line_active[line_idx]:
+                continue
 
-        # Allow wing contributions from lines whose centers fall just outside the grid.
-        # This is required to match full-range Fortran runs when we synthesize a subrange.
-        if (
-            center_idx < -max_profile_steps
-            or center_idx > n_wavelengths - 1 + max_profile_steps
-        ):
-            continue
-
-        for depth_idx in prange(n_depths):
             if not valid_mask[line_idx, depth_idx]:
                 continue
 
@@ -268,149 +266,14 @@ def _compute_asynth_wings_kernel(
             if transp_val <= 0.0:
                 continue
 
+            line_wavelength = line_wavelengths[line_idx]
+            center_idx = line_indices[line_idx]
             kappa0 = kappa0_values[line_idx, depth_idx]
             adamp = adamp_values[line_idx, depth_idx]
             doppler_width = doppler_widths[line_idx, depth_idx]
             stim_factor = stim_factors[line_idx, depth_idx]
 
-            if line_type == 1:
-                # Autoionizing line (Fortran synthe.for label 700)
-                gamma_rad = gamma_rad_values[line_idx]
-                ashore = gamma_stark_values[line_idx]
-                bshore = gamma_vdw_values[line_idx]
-                if gamma_rad <= 0.0 or bshore <= 0.0:
-                    continue
-
-                # Use per-position cutoff (Fortran checks after add)
-                maxstep = max_profile_steps
-                offset = 1
-                red_active = True
-                blue_active = True
-                freq_line = C_LIGHT_NM / line_wavelength
-
-                while offset <= maxstep and (red_active or blue_active):
-                    # Red wing
-                    if red_active:
-                        idx = center_idx + offset
-                        if idx < 0:
-                            # Center below grid; wait for offset to bring idx in-range.
-                            pass
-                        elif idx >= n_wavelengths:
-                            red_active = False
-                        else:
-                            freq = C_LIGHT_NM / wavelength_grid[idx]
-                            epsil = 2.0 * (freq - freq_line) / gamma_rad
-                            profile_val = (
-                                kappa0
-                                * (ashore * epsil + bshore)
-                                / (epsil * epsil + 1.0)
-                                / bshore
-                            )
-                            value_red = profile_val * stim_factor
-                            asynth[depth_idx, idx] += value_red
-                            if use_cutoff:
-                                kapmin_at_idx = continuum_absorption[0, idx] * cutoff
-                                if value_red < kapmin_at_idx:
-                                    red_active = False
-
-                    # Blue wing
-                    if blue_active:
-                        idx = center_idx - offset
-                        if idx < 0:
-                            blue_active = False
-                        elif idx >= n_wavelengths:
-                            # Center is above grid; wait for offset to bring idx in-range.
-                            pass
-                        else:
-                            freq = C_LIGHT_NM / wavelength_grid[idx]
-                            epsil = 2.0 * (freq - freq_line) / gamma_rad
-                            profile_val = (
-                                kappa0
-                                * (ashore * epsil + bshore)
-                                / (epsil * epsil + 1.0)
-                                / bshore
-                            )
-                            value_blue = profile_val * stim_factor
-                            asynth[depth_idx, idx] += value_blue
-                            if use_cutoff:
-                                kapmin_at_idx = continuum_absorption[0, idx] * cutoff
-                                if value_blue < kapmin_at_idx:
-                                    blue_active = False
-
-                    offset += 1
-
-                continue
-
             if doppler_width <= 0.0:
-                continue
-
-            # AUTOIONIZING LINES (TYPE=1): Lorentzian wings with ASHORE/BSHORE
-            # Fortran synthe.for label 700:
-            #   KAPPA = KAPPA0*(ASHORE*EPSIL+BSHORE)/(EPSIL**2+1)/BSHORE
-            #   EPSIL = 2*(FREQ-FRELIN)/GAMMAR
-            if line_type == 1:
-                gamma_rad = gamma_rad_values[line_idx]
-                bshore = gamma_vdw_values[line_idx]
-                ashore = gamma_stark_values[line_idx]
-                if gamma_rad <= 0.0 or bshore <= 0.0:
-                    continue
-
-                maxstep = center_idx
-                if n_wavelengths - center_idx - 1 > maxstep:
-                    maxstep = n_wavelengths - center_idx - 1
-
-                offset = 1
-                red_active = True
-                blue_active = True
-                while offset <= maxstep and (red_active or blue_active):
-                    # Red wing: add then cutoff check
-                    if red_active:
-                        idx = center_idx + offset
-                        if idx < 0:
-                            # Center below grid; wait for offset to bring idx in-range.
-                            pass
-                        elif idx >= n_wavelengths:
-                            red_active = False
-                        else:
-                            freq = C_LIGHT_NM / wavelength_grid[idx]
-                            frelin = C_LIGHT_NM / line_wavelength
-                            epsil = 2.0 * (freq - frelin) / gamma_rad
-                            profile_val = (
-                                kappa0
-                                * (ashore * epsil + bshore)
-                                / (epsil * epsil + 1.0)
-                                / bshore
-                            )
-                            profile_val *= stim_factor
-                            asynth[depth_idx, idx] += profile_val
-                            if use_cutoff:
-                                kapmin_at_idx = continuum_absorption[0, idx] * cutoff
-                                if profile_val < kapmin_at_idx:
-                                    red_active = False
-
-                    # Blue wing: add then cutoff check
-                    if blue_active:
-                        idx = center_idx - offset
-                        if idx < 0:
-                            blue_active = False
-                        else:
-                            freq = C_LIGHT_NM / wavelength_grid[idx]
-                            frelin = C_LIGHT_NM / line_wavelength
-                            epsil = 2.0 * (freq - frelin) / gamma_rad
-                            profile_val = (
-                                kappa0
-                                * (ashore * epsil + bshore)
-                                / (epsil * epsil + 1.0)
-                                / bshore
-                            )
-                            profile_val *= stim_factor
-                            asynth[depth_idx, idx] += profile_val
-                            if use_cutoff:
-                                kapmin_at_idx = continuum_absorption[0, idx] * cutoff
-                                if profile_val < kapmin_at_idx:
-                                    blue_active = False
-
-                    offset += 1
                 continue
 
             # CRITICAL FIX: Compute N10DOP to match Fortran behavior exactly
@@ -434,40 +297,19 @@ def _compute_asynth_wings_kernel(
                                 wtail = wtail_val
 
             # Wing contributions (center contributions are added separately)
-            # All lines are now in-grid (we skip out-of-grid lines above to match Fortran)
             red_active = True
             blue_active = True
             offset = 1
 
-            # CRITICAL FIX (Dec 2025): Use DYNAMIC continuum at EACH WING POSITION
-            # Fortran synthe.for line 767: IF(KAPPA.LT.CONTINUUM(IBUFF)*CUTOFF)GO TO 212
-            # The IBUFF changes with each wing iteration, so cutoff threshold varies!
-            # Previous code incorrectly used kapmin_center (continuum at line center) everywhere.
-
             # For MAXSTEP estimation, use depth-specific KAPMIN at line center.
             kapmin_ref = kapmin_ref_values[line_idx, depth_idx] if use_cutoff else 0.0
 
-            # CRITICAL FIX (Dec 2025): Match Fortran XLINOP behavior EXACTLY
-            #
-            # Fortran XLINOP (synthe.for lines 757-786) for gfallvac lines:
-            # 1. Use FULL VOIGT at every wing step (not 1/x^2 approximation)
-            # 2. Per-step cutoff check: IF(KAPPA.LT.CONTINUUM(IBUFF)*CUTOFF)
-            # 3. Red wing: Check BEFORE adding (line 767-768)
-            # 4. Blue wing: Add FIRST, then check (lines 784-785)
-            #
-            # Key differences from previous Python code:
-            # - KAPMIN check uses continuum at LINE CENTER, not wing position
-            # - Near-wing KAPMIN check exits BOTH wings, not just one
-            # - If near-wing exits early, far-wing is SKIPPED entirely
-
             # Pre-compute PROFILE array (matching Fortran's PROFILE(NSTEP))
-            # This stores kappa0 * voigt (no stim_factor - that's applied later)
             dvoigt = 1.0 / (dopple * resolu) if dopple > 0 else 1.0
 
             # Phase 1: Near-wing profile with KAPMIN check at line center
             nstep_cutoff = n10dop  # Max near-wing step before cutoff
             profile_at_n10dop = 0.0
-            # Fortran XLINOP uses H0TAB/H1TAB for ADAMP < 0.2
             vsteps = 200.0
             tabstep = vsteps * dvoigt
             tabi = 0.5  # 0-based indexing (Fortran uses 1.5 for 1-based arrays)
@@ -501,23 +343,6 @@ def _compute_asynth_wings_kernel(
 
             # Phase 2: Far-wing setup
             #
-            # CRITICAL FIX (Dec 2025): Match Fortran XLINOP behavior exactly.
-            # Fortran XLINOP does NOT pre-limit maxstep based on near-wing cutoff!
-            # Instead, it uses MAXBLUE = NBUFF-1 (line center index - 1), allowing
-            # wings to extend all the way to the grid start if the per-step cutoff
-            # doesn't terminate them earlier.
-            #
-            # The per-step cutoff checks in the wing loop (lines 309-310, 343-344)
-            # will naturally terminate wings when profile value falls below kapmin.
-            # This allows wings to extend further than the old nstep_cutoff limit
-            # when XLINOP's full Voigt profile has higher far-wing values.
-            #
-            # Previous code (WRONG):
-            #   if nstep_cutoff == -1:
-            #       maxstep = max_profile_steps
-            #   else:
-            #       maxstep = nstep_cutoff  # <-- This was too restrictive!
-            #
             # If near-wing cutoff triggers, Fortran skips far wings entirely.
             if nstep_cutoff != -1:
                 maxstep = nstep_cutoff
@@ -528,16 +353,6 @@ def _compute_asynth_wings_kernel(
                 #   X = PROFILE(N10DOP) * FLOAT(N10DOP)**2
                 #   MAXSTEP = SQRT(X / KAPMIN) + 1.
                 #   MAXSTEP = MIN(MAXSTEP, MAXPROF)
-                #
-                # Fortran's implicit REAL→INTEGER conversion for MAXSTEP:
-                #   KAPMIN=NaN → X/NaN=NaN → SQRT(NaN)=NaN → INT(NaN)=0 → far wing skipped
-                #   KAPMIN=0   → X/0=Inf  → SQRT(Inf)=Inf → INT(Inf)=MAXINT → capped to MAXPROF
-                #   KAPMIN>0   → normal computation, capped to MAXPROF
-                #
-                # Numba's int(NaN)=0 matches gfortran's INT(NaN)=0, so we let NaN
-                # propagate naturally for the NaN case.  For kapmin=0 we must avoid
-                # ZeroDivisionError (Numba raises it unlike Fortran), so handle it
-                # explicitly.
                 use_far_wing = True
                 if n10dop > 0 and profile_at_n10dop > 0.0:
                     x_far = profile_at_n10dop * float(n10dop) ** 2
@@ -583,13 +398,11 @@ def _compute_asynth_wings_kernel(
                         profile_val = kappa0 * voigt_val
                 profile_val = profile_val * stim_factor
 
-                # Early exit when profile has underflowed to zero — equivalent to
-                # Fortran's far-wing loop adding zero to BUFFER for remaining steps.
+                # Early exit when profile has underflowed to zero
                 if profile_val == 0.0:
                     break
 
                 # Process red wing
-                # Fortran XLINOP (lines 767-768): Check BEFORE adding, exit if below cutoff
                 if red_active:
                     idx = center_idx + offset
                     if idx < 0:
@@ -607,19 +420,15 @@ def _compute_asynth_wings_kernel(
                                 taper = (wave - wcon) / max(wtail - wcon, 1e-10)
                                 value_red = value_red * taper
 
-                            # Fortran uses KAPMIN at line center to set MAXSTEP,
-                            # no per-position cutoff in the wing loop.
                             asynth[depth_idx, idx] += value_red
 
                 # Process blue wing
-                # Fortran XLINOP (lines 784-785): Add FIRST, then check for exit
                 if blue_active:
                     idx = center_idx - offset
                     if idx < 0:
                         blue_active = False
                     elif idx >= n_wavelengths:
-                        # Center is above grid; wait for offset to bring idx in-range.
-                        pass
+                        pass  # Center is above grid; wait for offset to bring idx in-range.
                     else:
                         wave = wavelength_grid[idx]
                         skip_blue = wcon > 0.0 and wave < wcon
@@ -631,11 +440,7 @@ def _compute_asynth_wings_kernel(
                                 taper = (wave - wcon) / max(wtail - wcon, 1e-10)
                                 value_blue = value_blue * taper
 
-                            # XLINOP behavior (line 784-785): Add FIRST, then check
                             asynth[depth_idx, idx] += value_blue
-
-                            # Fortran uses KAPMIN at line center to set MAXSTEP,
-                            # no per-position cutoff in the wing loop.
 
                 offset += 1
 

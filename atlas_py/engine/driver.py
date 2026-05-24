@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,11 @@ from ..physics.isotopes import load_isotopes_from_atlas12
 from ..physics.josh import josh_depth_profiles
 from ..physics.kapcont import kapcont_baseline, kapcont_table
 from ..physics.hydrogen_wings import compute_hydrogen_wings
+from ..physics.fort12_cache import (
+    fort12_cache_key,
+    load_or_prepare_fort12_cache,
+    resolve_fort12_cache_path,
+)
 from ..physics.line_opacity import linop1, xlinop
 from ..physics.line_selection import read_nlteline_records, read_selected_lines
 from ..physics.selectlines import selectlines as run_selectlines
@@ -30,8 +37,7 @@ from ..physics.kapp import KappAtmosphereAdapter
 from ..physics.atlas_tables import load_atlas_tables
 from ..physics.nmolec import (
     clear_nmolec_context, get_nmolec_snapshot, set_nmolec_context,
-    compute_nmolec_edens, set_nmolec_ifedns, save_nmolec_xnsave,
-    restore_nmolec_xnsave,
+    set_nmolec_ifedns, save_nmolec_xnsave, restore_nmolec_xnsave,
 )
 from ..physics.popsall import popsall
 from ..physics.populations import pops
@@ -41,6 +47,12 @@ from ..physics.runtime import AtlasRuntimeState
 from ..physics.tcorr import init_tcorr, rosstab_ingest, tcorr_step
 from ..physics.josh_math import _map1 as _josh_map1
 from ..physics.turb import turb as compute_turb, vturbstandard
+from .convec_fd_worker import (
+    build_worker_mol_static,
+    convec_fd_parallel_enabled,
+    init_worker as convec_fd_init_worker,
+    run_convec_fd_parallel,
+)
 from .hydrostatic import integrate_hydrostatic_pressure
 
 
@@ -270,16 +282,7 @@ def _convec_fd_samples(
         )
         # Fortran CONVEC FD (atlas12.for 4882+) calls POPS(0,1,...) only.
         # - IFMOL=0: POPS->NELECT already computes EDENS with atomic ionization terms.
-        #   Do not overwrite it with a simplified expression.
-        # - IFMOL=1: POPS routes through NMOLEC; recompute molecular EDENS terms
-        #   through the NMOLEC-equivalent helper.
-        if ifmol:
-            state.edens[:] = compute_nmolec_edens(
-                temperature_k=atm.temperature,
-                tk_erg=atm.tk,
-                gas_pressure=state.p,
-                state=state,
-            )
+        # - IFMOL=1: POPS->NMOLEC with IFEDNS=1 fills EDENS at label 160 inline.
 
     def _log_fd(label: str) -> None:
         if not convec_log_path:
@@ -469,6 +472,194 @@ def _apply_deck_to_atm_abundances(atm: AtlasAtmosphere, deck: AtlasDeck) -> None
             atm.abundances[iz] = base + offset
 
 
+def _run_freq_chunk(
+    inu_start: int,
+    inu_end: int,
+    freq_all: np.ndarray,
+    rco: np.ndarray,
+    hkt: np.ndarray,
+    temp: np.ndarray,
+    rhox: np.ndarray,
+    n_layers: int,
+    acont_all: np.ndarray,
+    sigmac_all: np.ndarray,
+    scont_all: np.ndarray,
+    xlines: np.ndarray,
+    sigmal: np.ndarray,
+    ahline_all: Optional[np.ndarray],
+    shline_all: Optional[np.ndarray],
+    flux: float,
+    teff: float,
+    wave_nm: np.ndarray,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Process frequencies ``[inu_start, inu_end)`` and return partial accumulators.
+
+    Matches the per-frequency body of ``run_atlas`` (JOSH + RADIAP mode 2 +
+    TCORR mode 2 + ROSS mode 2 contributions).  ``ATLAS_KNU_LOG`` /
+    ``ATLAS_RADIAP_LOG`` debug paths are skipped — use ``--n-workers 1`` when
+    those diagnostics are needed.
+    """
+    from ..physics.tcorr import _NUMBA_AVAILABLE as _TC_NUMBA
+
+    if _TC_NUMBA:
+        from ..physics.tcorr import _tcorr_mode2_nb
+    else:
+        from ..physics.josh_math import _deriv
+        from ..physics.tcorr import _expi
+
+    partial_raden = np.zeros(n_layers, dtype=np.float64)
+    partial_h = np.zeros(n_layers, dtype=np.float64)
+    partial_accrad = np.zeros(n_layers, dtype=np.float64)
+    partial_pradk0 = 0.0
+    partial_abross = np.zeros(n_layers, dtype=np.float64)
+    partial_rjmins = np.zeros(n_layers, dtype=np.float64)
+    partial_rdabh = np.zeros(n_layers, dtype=np.float64)
+    partial_rdiagj = np.zeros(n_layers, dtype=np.float64)
+    partial_flxrad = np.zeros(n_layers, dtype=np.float64)
+
+    for inu in range(inu_start, inu_end):
+        freq = float(freq_all[inu])
+        rcowt = float(rco[inu])
+        ehvkt = np.exp(-freq * hkt)
+        stim = np.maximum(1.0 - ehvkt, 1e-300)
+        freq15 = freq / 1.0e15
+        bnu = 1.47439e-2 * (freq15**3) * ehvkt / stim
+        acont = acont_all[:, inu]
+        sigmac = sigmac_all[:, inu]
+        scont = scont_all[:, inu]
+        alines = xlines[:, inu] * stim
+        if ahline_all is not None:
+            ahline = ahline_all[:, inu]
+            shline = shline_all[:, inu]
+            aline = ahline + alines
+        else:
+            ahline = np.zeros(n_layers, dtype=np.float64)
+            aline = alines.copy()
+        sline = bnu.copy()
+        mask = aline > 0.0
+        if np.any(mask) and ahline_all is not None:
+            sline[mask] = (
+                ahline[mask] * shline[mask] + alines[mask] * bnu[mask]
+            ) / aline[mask]
+        jres = josh_depth_profiles(
+            ifscat=1,
+            ifsurf=0,
+            acont=acont,
+            scont=scont,
+            aline=aline,
+            sline=sline,
+            sigmac=sigmac,
+            sigmal=sigmal,
+            rhox=rhox,
+            bnu=bnu,
+            freq_hz=freq,
+            wave_nm=float(wave_nm[inu]),
+        )
+        if np.any(jres.hnu < 0.0):
+            jres.hnu[:] = np.maximum(jres.hnu, 1e-99)
+            jres.jnu[:] = np.maximum(jres.jnu, 1e-99)
+            jres.snu[:] = np.maximum(jres.snu, 1e-99)
+        partial_raden += jres.jnu * rcowt
+        partial_h += jres.hnu * rcowt
+        partial_accrad += jres.abtot * jres.hnu * rcowt
+        partial_pradk0 += jres.knu_surface * rcowt
+        dbdt = bnu * freq * hkt / np.maximum(temp * stim, 1e-300)
+        partial_abross += dbdt / np.maximum(jres.abtot, 1e-300) * rcowt
+        if _TC_NUMBA:
+            _tcorr_mode2_nb(
+                partial_rjmins,
+                partial_rdabh,
+                partial_rdiagj,
+                partial_flxrad,
+                rcowt,
+                rhox,
+                jres.abtot,
+                jres.hnu,
+                jres.jmins,
+                jres.taunu,
+                bnu,
+                freq,
+                hkt,
+                temp,
+                stim,
+                jres.alpha,
+                flux,
+                teff,
+                int(freq_all.size),
+            )
+        else:
+            rhox_a = np.asarray(rhox, dtype=np.float64)
+            abtot_a = np.asarray(jres.abtot, dtype=np.float64)
+            hnu_a = np.asarray(jres.hnu, dtype=np.float64)
+            jmins_a = np.asarray(jres.jmins, dtype=np.float64)
+            taunu_a = np.asarray(jres.taunu, dtype=np.float64)
+            bnu_a = np.asarray(bnu, dtype=np.float64)
+            hkt_a = np.asarray(hkt, dtype=np.float64)
+            temp_a = np.asarray(temp, dtype=np.float64)
+            stim_a = np.asarray(stim, dtype=np.float64)
+            alpha_a = np.asarray(jres.alpha, dtype=np.float64)
+            dabtot = _deriv(rhox_a, abtot_a)
+            partial_rdabh += dabtot / np.maximum(abtot_a, 1e-300) * hnu_a * rcowt
+            partial_rjmins += abtot_a * jmins_a * rcowt
+            partial_flxrad += hnu_a * rcowt
+            term2 = 0.0
+            numnu = int(freq_all.size)
+            for j in range(n_layers):
+                term1 = term2
+                d = 1e-10
+                if j != n_layers - 1:
+                    d = taunu_a[j + 1] - taunu_a[j]
+                d = max(1e-10, float(d))
+                if d <= 0.01:
+                    term2 = (
+                        (0.922784335098467 - np.log(d)) * d / 4.0
+                        + d * d / 12.0
+                        - d**3 / 96.0
+                        + d**4 / 720.0
+                    )
+                else:
+                    ex = 0.0
+                    if d < 10.0:
+                        ex = _expi(3, d)
+                    if teff <= 4250.0 and d > 0.005 and d < 0.02:
+                        ex = 0.0
+                    term2 = 0.5 * (d + ex - 0.5) / d
+                diagj = term1 + term2
+                dbdt_tc = bnu_a[j] * freq * hkt_a[j] / np.maximum(temp_a[j] * stim_a[j], 1e-300)
+                if numnu == 1:
+                    dbdt_tc = flux * 16.0 / np.maximum(temp_a[j], 1e-300)
+                partial_rdiagj[j] += (
+                    abtot_a[j]
+                    * (diagj - 1.0)
+                    / np.maximum(1.0 - alpha_a[j] * diagj, 1e-300)
+                    * (1.0 - alpha_a[j])
+                    * dbdt_tc
+                    * rcowt
+                )
+
+    return (
+        partial_raden,
+        partial_h,
+        partial_accrad,
+        partial_pradk0,
+        partial_abross,
+        partial_rjmins,
+        partial_rdabh,
+        partial_rdiagj,
+        partial_flxrad,
+    )
+
+
 def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     """Run one or more atlas_py iterations and write output `.atm`."""
 
@@ -499,11 +690,10 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     convergence_min_iterations = max(1, int(cfg.convergence_min_iterations))
     convergence_consecutive_required = max(1, int(cfg.convergence_consecutive))
     convergence_consecutive_count = 0
-    # Fix 14: tracks consecutive iterations where convergence metrics are
-    # all non-finite (an unambiguous NaN-explosion).  After 3 such
-    # iterations we bail with RuntimeError to avoid grinding through
-    # all 30 iterations only to fail at write time (Fix 13).
-    convergence_nan_streak = 0
+    n_workers = max(
+        1,
+        cfg.n_workers if cfg.n_workers is not None else (multiprocessing.cpu_count() or 1),
+    )
     completed_iterations = 0
 
     gravity_cgs = _gravity_from_atm_metadata(atm)
@@ -633,6 +823,27 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     selected_line_records = None
     nlteline_records = None
     fort12_path = cfg.inputs.line_selection_path
+    fort12_cache_key_val: str | None = None
+    if ifop[14] == 1 and fort12_path is None and cfg.cache_dir is not None:
+        fort12_cache_key_val = fort12_cache_key(
+            teff=teff_init,
+            fort11_path=cfg.inputs.fort11_path,
+            fort111_path=cfg.inputs.fort111_path,
+            fort21_path=cfg.inputs.fort21_path,
+            fort31_path=cfg.inputs.fort31_path,
+            fort41_path=cfg.inputs.fort41_path,
+            fort51_path=cfg.inputs.fort51_path,
+            fort61_path=cfg.inputs.fort61_path,
+        )
+        cached_fort12 = resolve_fort12_cache_path(cfg.cache_dir, fort12_cache_key_val)
+        if cached_fort12.exists():
+            fort12_path = cached_fort12
+            selected_line_records = read_selected_lines(fort12_path)
+            logger.info(
+                "Timing: SELECTLINES cache hit (%s, %d lines)",
+                cached_fort12.name,
+                selected_line_records.size,
+            )
     if ifop[14] == 1:
         if fort12_path is None:
             import tempfile
@@ -641,10 +852,26 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             )
             fort12_path = Path(_tmp.name)
             _tmp.close()
-        elif fort12_path.exists():
+        elif selected_line_records is None and fort12_path.exists():
             selected_line_records = read_selected_lines(fort12_path)
     if ifop[16] == 1:
         nlteline_records = read_nlteline_records(cfg.inputs.nlteline_path)
+
+    convec_fd_pool = None
+    if convec_fd_parallel_enabled(teff_init):
+        _mp_ctx = multiprocessing.get_context("spawn")
+        _mol_static = build_worker_mol_static(ifmol=ifmol)
+        convec_fd_pool = _mp_ctx.Pool(
+            4,
+            initializer=convec_fd_init_worker,
+            initargs=(_mol_static,),
+        )
+        logger.info(
+            "CONVEC FD parallel enabled (Teff=%.0f K, 4 spawn workers)",
+            teff_init,
+        )
+
+    _linop1_xlines_buf: np.ndarray | None = None
 
     for iter_idx in range(numits):
         iter_no = iter_idx + 1
@@ -790,8 +1017,28 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                 )
                 selected_line_records = read_selected_lines(fort12_path)
                 logger.info("Timing: SELECTLINES/read fort.12 in %.3fs", time.perf_counter() - _t_sub)
+                if fort12_cache_key_val is not None and cfg.cache_dir is not None:
+                    fort12_path = load_or_prepare_fort12_cache(
+                        cache_dir=cfg.cache_dir,
+                        cache_key=fort12_cache_key_val,
+                        generated_path=fort12_path,
+                    )
+                    if fort12_path != cfg.inputs.line_selection_path:
+                        selected_line_records = read_selected_lines(fort12_path)
+                        logger.info(
+                            "Timing: SELECTLINES stored in cache (%s)",
+                            fort12_path.name,
+                        )
             records = selected_line_records
             _t_sub = time.perf_counter()
+            if _linop1_xlines_buf is None or _linop1_xlines_buf.shape != (
+                atm.layers,
+                int(wave_nm.size),
+            ):
+                _linop1_xlines_buf = np.zeros(
+                    (atm.layers, int(wave_nm.size)),
+                    dtype=np.float32,
+                )
             line_state = linop1(
                 records=records,
                 wave_set_nm=np.asarray(wave_nm, dtype=np.float64),
@@ -805,6 +1052,7 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                 dopple=np.asarray(state.dopple, dtype=np.float64),
                 nulo=1,
                 nuhi=int(wave_nm.size),
+                xlines_buf=_linop1_xlines_buf,
             )
             logger.info("Timing: LINOP1 kernel in %.3fs", time.perf_counter() - _t_sub)
             xlines = line_state.xlines
@@ -935,137 +1183,213 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             stateq_init(stateq_acc, temp)
         logger.info("Timing: pre-loop setup (ROSS/RADIAP/TCORR init) in %.3fs", time.perf_counter() - _t_stage)
         _t_stage = time.perf_counter()
-        for inu in range(freq_all.size):
-            freq = float(freq_all[inu])
-            rcowt = float(rco[inu])
-            ehvkt = np.exp(-freq * hkt)
-            stim = np.maximum(1.0 - ehvkt, 1e-300)
-            freq15 = freq / 1.0e15
-            bnu = 1.47439e-2 * (freq15**3) * ehvkt / stim
-            acont = acont_all[:, inu]
-            sigmac = sigmac_all[:, inu]
-            scont = scont_all[:, inu]
-            alines = xlines[:, inu] * stim
-            # ALINE assembly: atlas12.for line 5260
-            # ALINE(J) = AHLINE(J) + ALINES(J) + AXLINE(J)
-            # AXLINE is zero (no separate NLTE-xline path in current driver).
-            if ahline_all is not None:
-                ahline = ahline_all[:, inu]
-                shline = shline_all[:, inu]
-                aline = ahline + alines
-            else:
-                ahline = np.zeros(n_layers, dtype=np.float64)
-                aline = alines.copy()
-            # SLINE assembly: atlas12.for lines 5261-5263
-            # SLINE(J) = BNU(J)
-            # IF(ALINE(J).GT.0.) SLINE(J)=(AHLINE*SHLINE+ALINES*BNU)/ALINE(J)
-            sline = bnu.copy()
-            mask = aline > 0.0
-            if np.any(mask) and ahline_all is not None:
-                sline[mask] = (
-                    ahline[mask] * shline[mask] + alines[mask] * bnu[mask]
-                ) / aline[mask]
-            knu_log_path = os.getenv("ATLAS_KNU_LOG")
-            if knu_log_path and inu == 2213:
-                im1 = max(inu - 1, 0)
-                ip1 = min(inu + 1, wave_nm.size - 1)
-                with Path(knu_log_path).open("a", encoding="utf-8") as fh:
-                    fh.write(
-                        f"DRI,{float(abtot:=np.maximum(acont[0] + aline[0] + sigmac[0] + sigmal[0], 1e-300)):.8e},"
-                        f"{float((sigmac[0] + sigmal[0]) / abtot):.8e},{float(acont[0]):.8e},{float(aline[0]):.8e},"
-                        f"{float(sigmac[0]):.8e},{float(sigmal[0]):.8e},{float(ahline[0] if ahline_all is not None else 0.0):.8e},"
-                        f"{float(alines[0]):.8e},{0.0:.8e}\n"
+        nfreq = int(freq_all.size)
+        _debug_active = bool(
+            os.getenv("ATLAS_KNU_LOG")
+            or os.getenv("ATLAS_RADIAP_LOG")
+        )
+        _use_parallel = (
+            n_workers > 1
+            and nfreq > 1000
+            and stateq_acc is None
+            and not _debug_active
+        )
+        if _use_parallel:
+            logger.info(
+                "Timing: frequency loop — parallel mode (%d freqs, %d workers)",
+                nfreq,
+                n_workers,
+            )
+            chunk_size = max(1, nfreq // n_workers)
+            chunks = [
+                (s, min(s + chunk_size, nfreq))
+                for s in range(0, nfreq, chunk_size)
+            ]
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [
+                    pool.submit(
+                        _run_freq_chunk,
+                        s,
+                        e,
+                        freq_all,
+                        rco,
+                        hkt,
+                        temp,
+                        rhox,
+                        n_layers,
+                        acont_all,
+                        sigmac_all,
+                        scont_all,
+                        xlines,
+                        sigmal,
+                        ahline_all,
+                        shline_all,
+                        flux,
+                        teff,
+                        wave_nm,
                     )
-                    fh.write(
-                        f"DRN,{int(im1):d},{float(wave_nm[im1]):.8e},{float(xlines[0, im1]):.8e},"
-                        f"{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
-                        f"{int(ip1):d},{float(wave_nm[ip1]):.8e},{float(xlines[0, ip1]):.8e},"
-                        f"{float(stim[0]):.8e}\n"
-                    )
-            if knu_log_path and 2212 <= inu <= 2214:
-                with Path(knu_log_path).open("a", encoding="utf-8") as fh:
-                    fh.write(
-                        f"DRW,{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
-                        f"{float(stim[0]):.8e},{float(alines[0]):.8e},{float(aline[0]):.8e}\n"
-                    )
-            jres = josh_depth_profiles(
-                ifscat=1,
-                ifsurf=0,
-                acont=acont,
-                scont=scont,
-                aline=aline,
-                sline=sline,
-                sigmac=sigmac,
-                sigmal=sigmal,
-                rhox=rhox,
-                bnu=bnu,
-                freq_hz=freq,
-                wave_nm=float(wave_nm[inu]),
-            )
-            # Fortran safety clamp (atlas12.for lines 355-376): if any HNU(J)<0
-            # after JOSH, clamp HNU, JNU, SNU to at least 1e-99 to prevent
-            # RADIAP from accumulating negative radiative accelerations.
-            if np.any(jres.hnu < 0.0):
-                jres.hnu[:] = np.maximum(jres.hnu, 1e-99)
-                jres.jnu[:] = np.maximum(jres.jnu, 1e-99)
-                jres.snu[:] = np.maximum(jres.snu, 1e-99)
-            radiap_accumulate(
-                radst,
-                mode=2,
-                rcowt=rcowt,
-                abtot=jres.abtot,
-                hnu=jres.hnu,
-                jnu=jres.jnu,
-                knu_surface=jres.knu_surface,
-                freq_hz=freq,
-                wave_nm=float(wave_nm[inu]),
-                flux=flux,
-                rhox=rhox,
-            )
-            tcorr_step(
-                tcst,
-                mode=2,
-                rcowt=rcowt,
-                rhox=rhox,
-                abtot=jres.abtot,
-                hnu=jres.hnu,
-                jmins=jres.jmins,
-                taunu=jres.taunu,
-                bnu=bnu,
-                freq_hz=freq,
-                hkt=hkt,
-                temperature_k=temp,
-                stim=stim,
-                alpha=jres.alpha,
-                flux=flux,
-                teff=teff,
-                numnu=int(freq_all.size),
-            )
-            abross_work, _ = ross_step(
-                abross_work,
-                mode=2,
-                rcowt=rcowt,
-                bnu=bnu,
-                freq_hz=freq,
-                hkt=hkt,
-                temperature_k=temp,
-                stim=stim,
-                abtot=jres.abtot,
-                numnu=int(freq_all.size),
-                rhox=rhox,
-            )
-            # STATEQ MODE=2: accumulate H photo-ionization rates at this frequency.
-            if stateq_acc is not None:
-                stateq_accumulate(
-                    stateq_acc,
-                    freq=freq,
+                    for s, e in chunks
+                ]
+                chunk_results = [f.result() for f in futures]
+            for (
+                p_raden,
+                p_h,
+                p_accrad,
+                p_pradk0,
+                p_abross,
+                p_rjmins,
+                p_rdabh,
+                p_rdiagj,
+                p_flxrad,
+            ) in chunk_results:
+                radst.raden += p_raden
+                radst.h += p_h
+                radst.accrad += p_accrad
+                radst.pradk0 += p_pradk0
+                abross_work += p_abross
+                tcst.rjmins += p_rjmins
+                tcst.rdabh += p_rdabh
+                tcst.rdiagj += p_rdiagj
+                tcst.flxrad += p_flxrad
+        else:
+            for inu in range(nfreq):
+                freq = float(freq_all[inu])
+                rcowt = float(rco[inu])
+                ehvkt = np.exp(-freq * hkt)
+                stim = np.maximum(1.0 - ehvkt, 1e-300)
+                freq15 = freq / 1.0e15
+                bnu = 1.47439e-2 * (freq15**3) * ehvkt / stim
+                acont = acont_all[:, inu]
+                sigmac = sigmac_all[:, inu]
+                scont = scont_all[:, inu]
+                alines = xlines[:, inu] * stim
+                # ALINE assembly: atlas12.for line 5260
+                # ALINE(J) = AHLINE(J) + ALINES(J) + AXLINE(J)
+                # AXLINE is zero (no separate NLTE-xline path in current driver).
+                if ahline_all is not None:
+                    ahline = ahline_all[:, inu]
+                    shline = shline_all[:, inu]
+                    aline = ahline + alines
+                else:
+                    ahline = np.zeros(n_layers, dtype=np.float64)
+                    aline = alines.copy()
+                # SLINE assembly: atlas12.for lines 5261-5263
+                # SLINE(J) = BNU(J)
+                # IF(ALINE(J).GT.0.) SLINE(J)=(AHLINE*SHLINE+ALINES*BNU)/ALINE(J)
+                sline = bnu.copy()
+                mask = aline > 0.0
+                if np.any(mask) and ahline_all is not None:
+                    sline[mask] = (
+                        ahline[mask] * shline[mask] + alines[mask] * bnu[mask]
+                    ) / aline[mask]
+                knu_log_path = os.getenv("ATLAS_KNU_LOG")
+                if knu_log_path and inu == 2213:
+                    im1 = max(inu - 1, 0)
+                    ip1 = min(inu + 1, wave_nm.size - 1)
+                    with Path(knu_log_path).open("a", encoding="utf-8") as fh:
+                        fh.write(
+                            f"DRI,{float(abtot:=np.maximum(acont[0] + aline[0] + sigmac[0] + sigmal[0], 1e-300)):.8e},"
+                            f"{float((sigmac[0] + sigmal[0]) / abtot):.8e},{float(acont[0]):.8e},{float(aline[0]):.8e},"
+                            f"{float(sigmac[0]):.8e},{float(sigmal[0]):.8e},{float(ahline[0] if ahline_all is not None else 0.0):.8e},"
+                            f"{float(alines[0]):.8e},{0.0:.8e}\n"
+                        )
+                        fh.write(
+                            f"DRN,{int(im1):d},{float(wave_nm[im1]):.8e},{float(xlines[0, im1]):.8e},"
+                            f"{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
+                            f"{int(ip1):d},{float(wave_nm[ip1]):.8e},{float(xlines[0, ip1]):.8e},"
+                            f"{float(stim[0]):.8e}\n"
+                        )
+                if knu_log_path and 2212 <= inu <= 2214:
+                    with Path(knu_log_path).open("a", encoding="utf-8") as fh:
+                        fh.write(
+                            f"DRW,{int(inu):d},{float(wave_nm[inu]):.8e},{float(xlines[0, inu]):.8e},"
+                            f"{float(stim[0]):.8e},{float(alines[0]):.8e},{float(aline[0]):.8e}\n"
+                        )
+                jres = josh_depth_profiles(
+                    ifscat=1,
+                    ifsurf=0,
+                    acont=acont,
+                    scont=scont,
+                    aline=aline,
+                    sline=sline,
+                    sigmac=sigmac,
+                    sigmal=sigmal,
+                    rhox=rhox,
+                    bnu=bnu,
+                    freq_hz=freq,
+                    wave_nm=float(wave_nm[inu]),
+                )
+                # Fortran safety clamp (atlas12.for lines 355-376): if any HNU(J)<0
+                # after JOSH, clamp HNU, JNU, SNU to at least 1e-99 to prevent
+                # RADIAP from accumulating negative radiative accelerations.
+                if np.any(jres.hnu < 0.0):
+                    jres.hnu[:] = np.maximum(jres.hnu, 1e-99)
+                    jres.jnu[:] = np.maximum(jres.jnu, 1e-99)
+                    jres.snu[:] = np.maximum(jres.snu, 1e-99)
+                radiap_accumulate(
+                    radst,
+                    mode=2,
                     rcowt=rcowt,
+                    abtot=jres.abtot,
+                    hnu=jres.hnu,
                     jnu=jres.jnu,
+                    knu_surface=jres.knu_surface,
+                    freq_hz=freq,
+                    wave_nm=float(wave_nm[inu]),
+                    flux=flux,
+                    rhox=rhox,
+                )
+                tcorr_step(
+                    tcst,
+                    mode=2,
+                    rcowt=rcowt,
+                    rhox=rhox,
+                    abtot=jres.abtot,
+                    hnu=jres.hnu,
+                    jmins=jres.jmins,
+                    taunu=jres.taunu,
+                    bnu=bnu,
+                    freq_hz=freq,
                     hkt=hkt,
                     temperature_k=temp,
+                    stim=stim,
+                    alpha=jres.alpha,
+                    flux=flux,
+                    teff=teff,
+                    numnu=int(freq_all.size),
                 )
-        logger.info("Timing: frequency loop (%d freqs) in %.3fs", freq_all.size, time.perf_counter() - _t_stage)
+                abross_work, _ = ross_step(
+                    abross_work,
+                    mode=2,
+                    rcowt=rcowt,
+                    bnu=bnu,
+                    freq_hz=freq,
+                    hkt=hkt,
+                    temperature_k=temp,
+                    stim=stim,
+                    abtot=jres.abtot,
+                    numnu=int(freq_all.size),
+                    rhox=rhox,
+                )
+                # STATEQ MODE=2: accumulate H photo-ionization rates at this frequency.
+                if stateq_acc is not None:
+                    stateq_accumulate(
+                        stateq_acc,
+                        freq=freq,
+                        rcowt=rcowt,
+                        jnu=jres.jnu,
+                        hkt=hkt,
+                        temperature_k=temp,
+                    )
+        logger.info(
+            "Timing: frequency loop (%d freqs, %s) in %.3fs",
+            nfreq,
+            f"{n_workers} workers" if _use_parallel else "serial",
+            time.perf_counter() - _t_stage,
+        )
         _t_stage = time.perf_counter()
+        _t_post_iter = time.perf_counter()
+        _t_post = time.perf_counter()
         abross_out, tauros_out = ross_step(
             abross_work,
             mode=3,
@@ -1099,22 +1423,43 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
         rosstab_ingest(tcst, temp, state.p, abross_out)
         # CALL HIGH: compute geometric height from RHOX / RHO (atlas12.for line 388).
         state.height = high_from_rhox(rhox=rhox, rho=state.rho)
+        logger.info(
+            "Timing: post-loop ROSS/RADIAP finalize in %.3fs",
+            time.perf_counter() - _t_post,
+        )
         pturb0 = float(pturb[0]) if pturb.size > 0 else 0.0
         pzero = pcon + float(pradk0_prev) + pturb0
         ptotal = gravity_cgs * rhox + pzero
+        _t_post = time.perf_counter()
         if ifconv == 1:
-            ed1, ed2, ed3, ed4, r1, r2, r3, r4 = _convec_fd_samples(
-                atm=atm,
-                state=state,
-                pradk=radst.pradk,
-                tauros=tauros_out,
-                ifmol=ifmol,
-                itemp_seed=itemp * 10,
-                itemp_cache=itemp_cache,
-            )
+            if convec_fd_pool is not None:
+                ed1, ed2, ed3, ed4, r1, r2, r3, r4 = run_convec_fd_parallel(
+                    temp0=atm.temperature.copy(),
+                    state=state,
+                    pradk=radst.pradk,
+                    tauros=tauros_out,
+                    ifmol=ifmol,
+                    itemp_seed=itemp * 10,
+                    pool=convec_fd_pool,
+                )
+            else:
+                ed1, ed2, ed3, ed4, r1, r2, r3, r4 = _convec_fd_samples(
+                    atm=atm,
+                    state=state,
+                    pradk=radst.pradk,
+                    tauros=tauros_out,
+                    ifmol=ifmol,
+                    itemp_seed=itemp * 10,
+                    itemp_cache=itemp_cache,
+                )
         else:
             ed1 = ed2 = ed3 = ed4 = None
             r1 = r2 = r3 = r4 = None
+        logger.info(
+            "Timing: post-loop CONVEC FD samples in %.3fs",
+            time.perf_counter() - _t_post,
+        )
+        _t_post = time.perf_counter()
         convec_log_path = os.getenv("ATLAS_CONVEC_LOG")
         cv = convec(
             tcst=tcst,
@@ -1143,6 +1488,11 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             rho4=r4,
             convec_log_path=convec_log_path,
         )
+        logger.info(
+            "Timing: post-loop CONVEC kernel in %.3fs",
+            time.perf_counter() - _t_post,
+        )
+        _t_post = time.perf_counter()
         flxcnv_out = cv.flxcnv.copy()
         vconv_out = cv.vconv.copy()
         grdadb_out = cv.grdadb.copy()
@@ -1185,6 +1535,11 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             steplg=0.125,
             tau1lg=-6.875,
         )
+        logger.info(
+            "Timing: post-loop TCORR mode=3 in %.3fs",
+            time.perf_counter() - _t_post,
+        )
+        _t_post = time.perf_counter()
         pradk0_prev = float(radst.pradk0)
         physical_convergence_max = float("inf")
         if tcres is not None:
@@ -1227,6 +1582,10 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                     pass
                 # atlas12.for line 991: TAUROS(J) = TAUSTD(J)
                 tauros_out = taustd.copy()
+            logger.info(
+                "Timing: post-loop MAP1 remap in %.3fs",
+                time.perf_counter() - _t_post,
+            )
             if abross_out is not None:
                 atm.abross[:] = abross_out
             if accrad_out is not None:
@@ -1238,6 +1597,16 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             dtflux_out = tcres.dtflux.copy()
             dtlamb_out = tcres.dtlamb.copy()
             t1_out = tcres.t1.copy()
+        else:
+            logger.info(
+                "Timing: post-loop MAP1 remap in %.3fs",
+                time.perf_counter() - _t_post,
+            )
+        logger.info(
+            "Timing: post-loop total in %.3fs",
+            time.perf_counter() - _t_post_iter,
+        )
+        if tcres is not None:
             layer_idx = min(79, n_layers - 1)
             rel_dt = np.abs(
                 (atm.temperature - temp_before_iter)
@@ -1289,44 +1658,14 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
                 )
                 for name, value in convergence_after.items()
             }
-            # Fix 8c (2026-05-03): an iteration that produces NO finite
-            # convergence metrics is the opposite of converged — it means
-            # the atmosphere has gone NaN.  Returning 0.0 here causes the
-            # `physical_max < epsilon` check below to spuriously trigger
-            # an "early convergence" stop on a fully broken atmosphere.
-            # Use +inf instead so the convergence check definitively
-            # fails and the iteration loop continues (giving the
-            # self-healing TCORR / PFSAHA guards a chance to recover).
-            _physical_finite = [
+            physical_convergence_max = max(
                 convergence_metrics[name]
                 for name in ("RHOX", "T", "P", "XNE", "ABROSS", "VTURB")
                 if np.isfinite(convergence_metrics[name])
-            ]
-            physical_convergence_max = (
-                max(_physical_finite) if _physical_finite else float("inf")
             )
-            _all_finite = [
-                value for value in convergence_metrics.values()
-                if np.isfinite(value)
-            ]
-            convergence_max = max(_all_finite) if _all_finite else float("inf")
-            # Fix 14: detect a sustained all-NaN convergence-metric state.
-            # A single bad iteration can self-heal (TCORR / PFSAHA / Fix 12
-            # all give the next iteration a chance to recover).  Three in
-            # a row is unambiguously a divergent atmosphere — bail rather
-            # than burn the remaining ~25 iterations on NaN.
-            if not _all_finite:
-                convergence_nan_streak += 1
-                if convergence_nan_streak >= 3:
-                    raise RuntimeError(
-                        f"ATLAS atmosphere went all-NaN at iteration {iter_no}/"
-                        f"{numits} for {convergence_nan_streak} consecutive "
-                        f"iterations; convergence_metrics are non-finite. "
-                        f"Aborting (Fix 14) instead of grinding through to "
-                        f"iteration {numits}."
-                    )
-            else:
-                convergence_nan_streak = 0
+            convergence_max = max(
+                value for value in convergence_metrics.values() if np.isfinite(value)
+            )
             logger.info(
                 "Convergence iteration %d/%d: physical_max=%.3e max_col=%.3e %s",
                 iter_no,
@@ -1393,20 +1732,6 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
         abundances=atm.abundances.copy(),
     )
     logger.info("Timing: post-loop (ROSS/CONVEC/TCORR/output) in %.3fs", time.perf_counter() - _t_stage)
-    # Fix 13: refuse to write a degenerate atmosphere.  ATLAS sometimes runs
-    # all numits iterations after T(tau) has gone NaN (Issue 8c).  Without
-    # this guard, the silent NaN .atm reaches SYNTHE which then refuses it
-    # with the misleading 'XNE not found' error, after wasting another 30+
-    # min on linelist conversion.  Better to fail fast in ATLAS itself.
-    nan_T = ~np.isfinite(out.temperature)
-    nan_X = ~np.isfinite(out.electron_density)
-    if nan_T.any() or nan_X.any():
-        raise RuntimeError(
-            f"ATLAS atmosphere degenerate at iteration {completed_iterations}: "
-            f"NaN/inf in {int(nan_T.sum())}/{out.temperature.size} T layers, "
-            f"{int(nan_X.sum())}/{out.electron_density.size} XNE layers; "
-            f"refusing to write {cfg.outputs.output_atm_path}"
-        )
     write_atm(out, cfg.outputs.output_atm_path)
     if cfg.outputs.debug_state_path is not None:
         _write_debug_state_npz(
@@ -1433,6 +1758,9 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
             grdadb_out=grdadb_out,
             hscale_out=hscale_out,
         )
+    if convec_fd_pool is not None:
+        convec_fd_pool.close()
+        convec_fd_pool.join()
     logger.info("Timing: total atlas_py run in %.3fs", time.perf_counter() - _t_total)
     return out
 

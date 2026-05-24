@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import logging
+import multiprocessing
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -59,6 +63,8 @@ def _subset_xline_records(records: XLineRecords, mask: np.ndarray) -> XLineRecor
 _RATIOLG = np.log(1.0 + 1.0 / 2_000_000.0)
 _CGF_SCALE = 0.026538 / 1.77245 / 2.99792458e17
 _GAMMA_SCALE = 1.0 / 12.5664 / 2.99792458e17
+_LINOP1_CHUNK_MIN_RECORDS = 500_000
+_LINOP1_CHUNK_TARGET = 250_000
 
 _LO_TABLES = _load_lo_tables()
 _TABVI = _LO_TABLES["_TABVI"]
@@ -195,13 +201,7 @@ def _build_h_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _fastex(x: float, extab: np.ndarray, extabf: np.ndarray) -> float:
-    # Guard NaN/inf: a non-finite x can arrive here when an upstream
-    # divergence (TCORR overshoot, hydrostatic floor) leaves stray
-    # non-finite values in the column.  Returning 0 is the safe choice
-    # (no contribution from this layer/line for this iteration); the
-    # convergence monitor in driver.py will catch a genuinely runaway
-    # column on the next pass.
-    if not np.isfinite(x) or x < 0.0 or x >= 1001.0:
+    if x < 0.0 or x >= 1001.0:
         return 0.0
     i = int(x)
     j = int((x - float(i)) * 1000.0 + 1.5)
@@ -347,7 +347,151 @@ def _accumulate_wings(
             break
 
 
+_logger = logging.getLogger(__name__)
+_FASTEX_MONOTONIC_CHECKED = False
 
+
+@dataclass
+class _Linop1ScalarCache:
+    """Per-record scalars invariant across ATLAS iterations (same fort.12)."""
+
+    wlvac_arr: np.ndarray
+    wlvac4_arr: np.ndarray
+    cgf_arr: np.ndarray
+    elo_log_arr: np.ndarray
+    gammar_arr: np.ndarray
+    gammas_arr: np.ndarray
+    gammaw_arr: np.ndarray
+    line_valid: np.ndarray
+
+
+_linop1_scalar_cache_store: dict[int, _Linop1ScalarCache] = {}
+
+
+def _available_ram_bytes() -> int:
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return int(pages * page_size)
+    except (ValueError, AttributeError, OSError):
+        return 16_000_000_000
+
+
+def _linop1_cache_line_scalars_enabled(n_records: int) -> bool:
+    env = os.environ.get("ATLAS_LINOP1_CACHE_LINE_SCALARS", "1")
+    if env == "0":
+        return False
+    bytes_needed = n_records * (8 + 4 * 6 + 1)
+    if bytes_needed > _available_ram_bytes() * 0.5:
+        _logger.warning(
+            "LINOP1 scalar cache disabled: need %.1f GB, >50%% of RAM",
+            bytes_needed / 1e9,
+        )
+        return False
+    return True
+
+
+def _get_linop1_scalar_cache(
+    records: SelectedLineRecords,
+    tablog: np.ndarray,
+) -> _Linop1ScalarCache | None:
+    n_records = int(records.size)
+    if not _linop1_cache_line_scalars_enabled(n_records):
+        return None
+    key = id(records.iwl)
+    cached = _linop1_scalar_cache_store.get(key)
+    if cached is not None:
+        return cached
+
+    _t0 = time.perf_counter()
+    iwl_arr = np.asarray(records.iwl, dtype=np.float64)
+    igflog_arr = np.asarray(records.igflog, dtype=np.int16)
+    ielo_arr = np.asarray(records.ielo, dtype=np.int16)
+    igr_arr = np.asarray(records.igr, dtype=np.int16)
+    igs_arr = np.asarray(records.igs, dtype=np.int16)
+    igw_arr = np.asarray(records.igw, dtype=np.int16)
+
+    wlvac_arr = np.exp(iwl_arr * _RATIOLG)
+    wlvac4_arr = wlvac_arr.astype(np.float32, copy=False)
+    tl = int(tablog.shape[0])
+
+    line_valid = (
+        (igflog_arr >= 1)
+        & (ielo_arr >= 1)
+        & (igr_arr >= 1)
+        & (igs_arr >= 1)
+        & (igw_arr >= 1)
+        & (igflog_arr <= tl)
+        & (ielo_arr <= tl)
+        & (igr_arr <= tl)
+        & (igs_arr <= tl)
+        & (igw_arr <= tl)
+    ).astype(np.uint8)
+
+    cgf_scale = np.float32(_CGF_SCALE)
+    gamma_scale = np.float32(_GAMMA_SCALE)
+    igflog_idx = np.clip(igflog_arr.astype(np.int64) - 1, 0, tl - 1)
+    cgf_arr = (cgf_scale * wlvac4_arr * tablog[igflog_idx]).astype(np.float32, copy=False)
+    cgf_arr[~line_valid.astype(bool)] = np.float32(0.0)
+
+    elo_idx = np.clip(ielo_arr.astype(np.int64) - 1, 0, tl - 1)
+    elo_log_arr = tablog[elo_idx].astype(np.float32, copy=False)
+
+    igr_idx = np.clip(igr_arr.astype(np.int64) - 1, 0, tl - 1)
+    igs_idx = np.clip(igs_arr.astype(np.int64) - 1, 0, tl - 1)
+    igw_idx = np.clip(igw_arr.astype(np.int64) - 1, 0, tl - 1)
+    gammar_arr = (tablog[igr_idx] * wlvac4_arr * gamma_scale).astype(np.float32, copy=False)
+    gammas_arr = (tablog[igs_idx] * wlvac4_arr * gamma_scale).astype(np.float32, copy=False)
+    gammaw_arr = (tablog[igw_idx] * wlvac4_arr * gamma_scale).astype(np.float32, copy=False)
+
+    cached = _Linop1ScalarCache(
+        wlvac_arr=wlvac_arr,
+        wlvac4_arr=wlvac4_arr,
+        cgf_arr=cgf_arr,
+        elo_log_arr=elo_log_arr,
+        gammar_arr=gammar_arr,
+        gammas_arr=gammas_arr,
+        gammaw_arr=gammaw_arr,
+        line_valid=line_valid,
+    )
+    _linop1_scalar_cache_store[key] = cached
+    _logger.info(
+        "LINOP1 scalar cache built: %d records, %.1f MB, %.3fs",
+        n_records,
+        (n_records * 33) / 1e6,
+        time.perf_counter() - _t0,
+    )
+    return cached
+
+
+def _assert_fastex_monotonic() -> None:
+    global _FASTEX_MONOTONIC_CHECKED
+    if _FASTEX_MONOTONIC_CHECKED:
+        return
+    extab, extabf = _build_exptab()
+    xs = np.linspace(0.0, 1000.0, 10001, dtype=np.float64)
+    vals = np.empty(xs.shape[0], dtype=np.float64)
+    for k, x in enumerate(xs):
+        vals[k] = _fastex(float(x), extab, extabf)
+    if not np.all(np.diff(vals) <= 1e-15):
+        raise RuntimeError("_fastex is not monotonically decreasing on [0, 1000]")
+    _FASTEX_MONOTONIC_CHECKED = True
+
+
+def _dummy_f32() -> np.ndarray:
+    return np.zeros(1, dtype=np.float32)
+
+
+def _dummy_f64() -> np.ndarray:
+    return np.zeros(1, dtype=np.float64)
+
+
+def _dummy_u8() -> np.ndarray:
+    return np.zeros(1, dtype=np.uint8)
+
+
+def _dummy_i64() -> np.ndarray:
+    return np.zeros(5, dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -356,16 +500,12 @@ def _accumulate_wings(
 # ---------------------------------------------------------------------------
 
 if _NUMBA_AVAILABLE:
-    _njit = numba.njit(cache=True)
-    _njit_parallel = numba.njit(cache=True, parallel=True)
+    _njit = numba.njit(cache=True, nogil=True)
+    _njit_parallel = numba.njit(cache=True, parallel=True, nogil=True)
 
     @_njit
     def _fastex_nb(x, extab, extabf):
-        # Guard NaN/inf: numba's int(NaN) raises ValueError inside the JIT,
-        # so explicitly bail out for non-finite x.  Returning 0 corresponds
-        # to "no opacity contribution from this layer this iteration",
-        # which lets the iteration recover.
-        if not (x == x) or x < 0.0 or x >= 1001.0:
+        if x < 0.0 or x >= 1001.0:
             return 0.0
         i = int(x)
         j = int((x - float(i)) * 1000.0 + 1.5)
@@ -472,6 +612,39 @@ if _NUMBA_AVAILABLE:
                 break
 
     @_njit
+    def _accwings_record_nb(
+        wing_j0,
+        wing_nu0,
+        wing_wlvac,
+        wing_center,
+        wing_adamp,
+        wing_dopwave,
+        wing_tabcont,
+        wing_count,
+        j0,
+        nu0,
+        wlvac,
+        center,
+        adamp,
+        dopwave,
+        tabcont_ref,
+    ):
+        if dopwave <= 0.0:
+            return
+        idx = int(wing_count[0])
+        if idx >= wing_j0.shape[0]:
+            wing_count[0] = idx + 1
+            return
+        wing_j0[idx] = j0
+        wing_nu0[idx] = nu0
+        wing_wlvac[idx] = wlvac
+        wing_center[idx] = center
+        wing_adamp[idx] = adamp
+        wing_dopwave[idx] = dopwave
+        wing_tabcont[idx] = tabcont_ref
+        wing_count[0] = idx + 1
+
+    @_njit
     def _accwings_cutoff_nb(
         xlines, j0, nu0, wlvac, center, adamp, dopwave, tabcont_ref,
         waveset, h0tab, h1tab, h2tab, wing_steps, blue_cutoff,
@@ -535,6 +708,30 @@ if _NUMBA_AVAILABLE:
                 break
 
     @_njit
+    def _linop1_prefilter_skip_nb(
+        cgf,
+        nelion,
+        nucont0,
+        tab_col_min,
+        max_xnfdop_arr,
+        elo_val,
+        min_hckt,
+        extab,
+        extabf,
+        use_tight,
+    ):
+        """Exact-safe reject for LINOP1 line records.
+
+        When ``use_tight == 0``: peak pre-fastex center < min tab at nucont0.
+        When ``use_tight == 1``: also multiply by fastex(elo * min_hckt), which
+        is an upper bound on fastex(elo * hckt[j]) for all j (fastex decreases).
+        """
+        peak = cgf * max_xnfdop_arr[nelion - 1]
+        if use_tight != 0:
+            peak = peak * _fastex_nb(elo_val * min_hckt, extab, extabf)
+        return peak < tab_col_min[nucont0]
+
+    @_njit
     def _linop1_kernel_nb(
         n_records,
         iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
@@ -545,16 +742,325 @@ if _NUMBA_AVAILABLE:
         nrhox, numnu, nuhi_eff, nulo,
         start, stop,
         ratiolg, cgf_scale, gamma_scale,
+        tab_col_min,
+        max_xnfdop_arr,
+        use_prefilter,
+        use_cached,
+        wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
+        gammar_arr, gammas_arr, gammaw_arr, line_valid,
+        min_hckt, use_tight_prefilter,
+        do_profile, profile_stats,
+        xlines_out, reuse_buffer,
     ):
-        xlines = np.zeros((nrhox, numnu), dtype=np.float32)
-        ifj = np.zeros(nrhox + 2, dtype=np.int32)
+        return _linop1_kernel_nb_chunk(
+            0,
+            n_records,
+            max(0, nulo - 1),
+            0,
+            0,
+            n_records,
+            iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
+            waveset, iwavetab, tab,
+            hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
+            extab, extabf, tablog,
+            h0tab, h1tab, h2tab,
+            nrhox, numnu, nuhi_eff, nulo,
+            start, stop,
+            ratiolg, cgf_scale, gamma_scale,
+            tab_col_min,
+            max_xnfdop_arr,
+            use_prefilter,
+            use_cached,
+            wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
+            gammar_arr, gammas_arr, gammaw_arr, line_valid,
+            min_hckt, use_tight_prefilter,
+            do_profile, profile_stats,
+            xlines_out, reuse_buffer,
+        )
 
+    @_njit
+    def _linop1_scan_boundaries_nb(
+        n_records,
+        iwl_arr,
+        iwavetab,
+        waveset,
+        nulo,
+        start,
+        stop,
+        ratiolg,
+        chunk_starts,
+        use_cached,
+        wlvac_arr,
+    ):
+        """Record (nu0, nucont0, iwlold) at each chunk start index."""
+        n_chunks = chunk_starts.shape[0]
+        nu0_st = np.zeros(n_chunks, dtype=np.int64)
+        nucont0_st = np.zeros(n_chunks, dtype=np.int64)
+        iwlold_st = np.zeros(n_chunks, dtype=np.int64)
+        numnu = waveset.shape[0]
         nucont0 = 0
         nu0 = max(0, nulo - 1)
         iwlold = 0
-        lineused = 0
-
+        chunk_idx = 0
+        if n_chunks > 0:
+            nu0_st[0] = nu0
+            nucont0_st[0] = nucont0
+            iwlold_st[0] = iwlold
         for iline in range(n_records):
+            if chunk_idx + 1 < n_chunks and iline == int(chunk_starts[chunk_idx + 1]):
+                chunk_idx += 1
+                nu0_st[chunk_idx] = nu0
+                nucont0_st[chunk_idx] = nucont0
+                iwlold_st[chunk_idx] = iwlold
+            iwl = int(iwl_arr[iline])
+            if iwl < iwlold:
+                nucont0 = 0
+                nu0 = max(0, nulo - 1)
+            while nucont0 < iwavetab.shape[0] and iwl >= int(iwavetab[nucont0]):
+                nucont0 += 1
+            if nucont0 >= iwavetab.shape[0]:
+                iwlold = iwl
+                continue
+            if use_cached != 0:
+                wlvac = wlvac_arr[iline]
+            else:
+                wlvac = np.exp(float(iwl) * ratiolg)
+            if wlvac < start or wlvac > stop:
+                iwlold = iwl
+                continue
+            while nu0 < numnu and wlvac >= waveset[nu0]:
+                nu0 += 1
+            iwlold = iwl
+        return nu0_st, nucont0_st, iwlold_st
+
+    @_njit
+    def _linop1_kernel_nb_chunk(
+        iline_start,
+        iline_end,
+        init_nu0,
+        init_nucont0,
+        init_iwlold,
+        n_records,
+        iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
+        waveset, iwavetab, tab,
+        hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
+        extab, extabf, tablog,
+        h0tab, h1tab, h2tab,
+        nrhox, numnu, nuhi_eff, nulo,
+        start, stop,
+        ratiolg, cgf_scale, gamma_scale,
+        tab_col_min,
+        max_xnfdop_arr,
+        use_prefilter,
+        use_cached,
+        wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
+        gammar_arr, gammas_arr, gammaw_arr, line_valid,
+        min_hckt, use_tight_prefilter,
+        do_profile, profile_stats,
+        xlines_out, reuse_buffer,
+    ):
+        if reuse_buffer != 0:
+            xlines = xlines_out
+            xlines.fill(np.float32(0.0))
+        else:
+            xlines = np.zeros((nrhox, numnu), dtype=np.float32)
+        ifj = np.zeros(nrhox + 2, dtype=np.int32)
+        nucont0 = int(init_nucont0)
+        nu0 = int(init_nu0)
+        iwlold = int(init_iwlold)
+        lineused = 0
+        iline_start = max(0, int(iline_start))
+        iline_end = min(int(iline_end), int(n_records))
+
+        for iline in range(iline_start, iline_end):
+            if do_profile != 0:
+                profile_stats[0] += 1
+            iwl = int(iwl_arr[iline])
+            if iwl < iwlold:
+                nucont0 = 0
+                nu0 = max(0, nulo - 1)
+
+            while nucont0 < iwavetab.shape[0] and iwl >= int(iwavetab[nucont0]):
+                nucont0 += 1
+            if nucont0 >= tab.shape[1]:
+                iwlold = iwl
+                continue
+
+            nelion = abs(int(ielion_arr[iline])) // 10
+            if nelion < 1 or nelion > xnfdop_arr.shape[1]:
+                iwlold = iwl
+                continue
+
+            if use_cached != 0:
+                wlvac = wlvac_arr[iline]
+                wlvac4 = wlvac4_arr[iline]
+            else:
+                wlvac = np.exp(float(iwl) * ratiolg)
+                wlvac4 = np.float32(wlvac)
+
+            if wlvac < start or wlvac > stop:
+                iwlold = iwl
+                continue
+
+            while nu0 < numnu and wlvac >= waveset[nu0]:
+                nu0 += 1
+            if nu0 >= numnu:
+                iwlold = iwl
+                continue
+
+            if use_cached != 0:
+                if line_valid[iline] == 0:
+                    iwlold = iwl
+                    continue
+                cgf = cgf_arr[iline]
+                elo_val = elo_log_arr[iline]
+            else:
+                igflog = int(igflog_arr[iline])
+                ielo = int(ielo_arr[iline])
+                igr_v = int(igr_arr[iline])
+                igs_v = int(igs_arr[iline])
+                igw_v = int(igw_arr[iline])
+                if igflog < 1 or ielo < 1 or igr_v < 1 or igs_v < 1 or igw_v < 1:
+                    iwlold = iwl
+                    continue
+                tl = tablog.shape[0]
+                if igflog > tl or ielo > tl or igr_v > tl or igs_v > tl or igw_v > tl:
+                    iwlold = iwl
+                    continue
+                cgf = cgf_scale * wlvac4 * tablog[igflog - 1]
+                elo_val = tablog[ielo - 1]
+
+            if use_prefilter:
+                if _linop1_prefilter_skip_nb(
+                    cgf, nelion, nucont0, tab_col_min, max_xnfdop_arr,
+                    elo_val, min_hckt, extab, extabf, use_tight_prefilter,
+                ):
+                    if do_profile != 0:
+                        profile_stats[1] += 1
+                    iwlold = iwl
+                    continue
+
+            ifline = 0
+            adamp_seed = 0.0
+            gammar = np.float32(0.0)
+            gammas = np.float32(0.0)
+            gammaw = np.float32(0.0)
+
+            for j1 in range(8, nrhox + 1, 8):
+                if do_profile != 0:
+                    profile_stats[2] += 1
+                ifj[j1 + 1] = 0
+                j0 = j1 - 1
+                center = cgf * xnfdop_arr[j0, nelion - 1]
+                if center < tab[j0, nucont0]:
+                    continue
+                center = center * _fastex_nb(elo_val * hckt_arr[j0], extab, extabf)
+                if center < tab[j0, nucont0]:
+                    continue
+                ifj[j1 + 1] = 1
+                ifline = 1
+                if adamp_seed == 0.0:
+                    if use_cached != 0:
+                        gammar = gammar_arr[iline]
+                        gammas = gammas_arr[iline]
+                        gammaw = gammaw_arr[iline]
+                    else:
+                        gammar = tablog[int(igr_arr[iline]) - 1] * wlvac4 * gamma_scale
+                        gammas = tablog[int(igs_arr[iline]) - 1] * wlvac4 * gamma_scale
+                        gammaw = tablog[int(igw_arr[iline]) - 1] * wlvac4 * gamma_scale
+                    adamp_seed = 1.0
+                dop = dopple_arr[j0, nelion - 1]
+                if dop <= 0.0:
+                    continue
+                adamp = (gammar + gammas * xne_arr[j0] + gammaw * txnxn[j0]) / dop
+                dopwave = dop * wlvac4
+                if do_profile != 0:
+                    profile_stats[4] += 1
+                _accwings_nb(
+                    xlines, j0, nu0, wlvac, center, adamp, dopwave,
+                    tab[j0, nucont0], waveset, h0tab, h1tab, h2tab,
+                )
+
+            for k1 in range(8, nrhox + 1, 8):
+                if ifj[k1 - 7] + ifj[k1 + 1] == 0:
+                    continue
+                for j1 in range(k1 - 7, k1):
+                    if do_profile != 0:
+                        profile_stats[3] += 1
+                    j0 = j1 - 1
+                    center = cgf * xnfdop_arr[j0, nelion - 1]
+                    if center < tab[j0, nucont0]:
+                        continue
+                    center = center * _fastex_nb(elo_val * hckt_arr[j0], extab, extabf)
+                    if center < tab[j0, nucont0]:
+                        continue
+                    dop = dopple_arr[j0, nelion - 1]
+                    if dop <= 0.0:
+                        continue
+                    if adamp_seed == 0.0:
+                        if use_cached != 0:
+                            gammar = gammar_arr[iline]
+                            gammas = gammas_arr[iline]
+                            gammaw = gammaw_arr[iline]
+                        else:
+                            gammar = tablog[int(igr_arr[iline]) - 1] * wlvac4 * gamma_scale
+                            gammas = tablog[int(igs_arr[iline]) - 1] * wlvac4 * gamma_scale
+                            gammaw = tablog[int(igw_arr[iline]) - 1] * wlvac4 * gamma_scale
+                        adamp_seed = 1.0
+                    adamp = (gammar + gammas * xne_arr[j0] + gammaw * txnxn[j0]) / dop
+                    dopwave = dop * wlvac4
+                    if do_profile != 0:
+                        profile_stats[4] += 1
+                    _accwings_nb(
+                        xlines, j0, nu0, wlvac, center, adamp, dopwave,
+                        tab[j0, nucont0], waveset, h0tab, h1tab, h2tab,
+                    )
+
+            if ifline == 1:
+                lineused += 1
+            iwlold = iwl
+
+        return xlines, lineused
+
+    @_njit
+    def _linop1_kernel_nb_chunk_record(
+        iline_start,
+        iline_end,
+        init_nu0,
+        init_nucont0,
+        init_iwlold,
+        n_records,
+        iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
+        waveset, iwavetab, tab,
+        hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
+        extab, extabf, tablog,
+        h0tab, h1tab, h2tab,
+        nrhox, numnu, nuhi_eff, nulo,
+        start, stop,
+        ratiolg, cgf_scale, gamma_scale,
+        tab_col_min,
+        max_xnfdop_arr,
+        use_prefilter,
+        min_hckt,
+        use_tight_prefilter,
+        wing_j0,
+        wing_nu0,
+        wing_wlvac,
+        wing_center,
+        wing_adamp,
+        wing_dopwave,
+        wing_tabcont,
+        wing_count,
+    ):
+        ifj = np.zeros(nrhox + 2, dtype=np.int32)
+        nucont0 = int(init_nucont0)
+        nu0 = int(init_nu0)
+        iwlold = int(init_iwlold)
+        lineused = 0
+        iline_start = max(0, int(iline_start))
+        iline_end = min(int(iline_end), int(n_records))
+
+        for iline in range(iline_start, iline_end):
             iwl = int(iwl_arr[iline])
             if iwl < iwlold:
                 nucont0 = 0
@@ -598,6 +1104,13 @@ if _NUMBA_AVAILABLE:
 
             cgf = cgf_scale * wlvac4 * tablog[igflog - 1]
             elo_val = tablog[ielo - 1]
+            if use_prefilter:
+                if _linop1_prefilter_skip_nb(
+                    cgf, nelion, nucont0, tab_col_min, max_xnfdop_arr,
+                    elo_val, min_hckt, extab, extabf, use_tight_prefilter,
+                ):
+                    iwlold = iwl
+                    continue
             ifline = 0
             adamp_seed = 0.0
             gammar = 0.0
@@ -625,9 +1138,10 @@ if _NUMBA_AVAILABLE:
                     continue
                 adamp = (gammar + gammas * xne_arr[j0] + gammaw * txnxn[j0]) / dop
                 dopwave = dop * wlvac4
-                _accwings_nb(
-                    xlines, j0, nu0, wlvac, center, adamp, dopwave,
-                    tab[j0, nucont0], waveset, h0tab, h1tab, h2tab,
+                _accwings_record_nb(
+                    wing_j0, wing_nu0, wing_wlvac, wing_center, wing_adamp,
+                    wing_dopwave, wing_tabcont, wing_count,
+                    j0, nu0, wlvac, center, adamp, dopwave, tab[j0, nucont0],
                 )
 
             for k1 in range(8, nrhox + 1, 8):
@@ -646,16 +1160,17 @@ if _NUMBA_AVAILABLE:
                         continue
                     adamp = (gammar + gammas * xne_arr[j0] + gammaw * txnxn[j0]) / dop
                     dopwave = dop * wlvac4
-                    _accwings_nb(
-                        xlines, j0, nu0, wlvac, center, adamp, dopwave,
-                        tab[j0, nucont0], waveset, h0tab, h1tab, h2tab,
+                    _accwings_record_nb(
+                        wing_j0, wing_nu0, wing_wlvac, wing_center, wing_adamp,
+                        wing_dopwave, wing_tabcont, wing_count,
+                        j0, nu0, wlvac, center, adamp, dopwave, tab[j0, nucont0],
                     )
 
             if ifline == 1:
                 lineused += 1
             iwlold = iwl
 
-        return xlines, lineused
+        return lineused
 
     @_njit
     def _xlinop_type0_kernel_nb(
@@ -1187,6 +1702,8 @@ def linop1(
     dopple: np.ndarray,
     nulo: int = 1,
     nuhi: int | None = None,
+    xlines_buf: np.ndarray | None = None,
+    chunk_bufs: list[np.ndarray] | None = None,
 ) -> LineOpacityState:
     """Fortran-faithful LINOP1 accumulation from preselected `fort.12` records.
 
@@ -1198,29 +1715,13 @@ def linop1(
     iwavetab = np.asarray(i_wavetab, dtype=np.int64)
     # Fortran LINOP1 uses IMPLICIT REAL*4: TABCONT, XNFDOP, DOPPLE, HCKT4,
     # XNE4 are all REAL*4.  Keep WAVESET as float64 (Fortran REAL*8).
-    # Fix 8d (2026-05-03): clip non-finite or extreme values that overflow
-    # the float32 cast.  Real stellar XNE never exceeds ~1e20 cm^-3, so a
-    # ceiling of 1e30 is far above any physical value while comfortably
-    # below the float32 max (~3.4e38).  Without this clip, a single
-    # diverging atmosphere iteration produces inf/NaN in the cast and
-    # propagates through the entire LINOP/RT chain, poisoning the
-    # next iteration's atmosphere and producing the silent-NaN
-    # convergence failure documented in PYKURUCZ_FIXES.md Fix 8a.
-    def _safe_f32(arr, ceiling: float = 1e30):
-        a = np.asarray(arr, dtype=np.float64)
-        a = np.where(np.isfinite(a), a, 0.0)
-        a = np.clip(a, -ceiling, ceiling)
-        return a.astype(np.float32)
-
-    tab = _safe_f32(tabcont)
+    tab = np.asarray(tabcont, dtype=np.float32)
     t = np.asarray(temperature_k, dtype=np.float64)
-    t = np.where(np.isfinite(t) & (t > 0.0), t, 1.0)
-    hckt_arr = _safe_f32(hckt, ceiling=1e10)
-    xne_arr = _safe_f32(xne, ceiling=1e30)
+    hckt_arr = np.asarray(hckt, dtype=np.float32)
+    xne_arr = np.asarray(xne, dtype=np.float32)
     xnf_arr = np.asarray(xnf, dtype=np.float64)
-    xnf_arr = np.where(np.isfinite(xnf_arr), xnf_arr, 0.0)
-    xnfdop_arr = _safe_f32(xnfdop)
-    dopple_arr = _safe_f32(dopple, ceiling=1e10)
+    xnfdop_arr = np.asarray(xnfdop, dtype=np.float32)
+    dopple_arr = np.asarray(dopple, dtype=np.float32)
 
     nrhox = int(t.size)
     numnu = int(waveset.size)
@@ -1238,33 +1739,392 @@ def linop1(
     h2tab = np.asarray(h2tab, dtype=np.float32)
 
     # Fortran: TXNXN is REAL*4 (line 9950), computed from REAL*8 then truncated
-    # Fix 8d: same clip pattern as above to keep cast finite.
-    _txnxn_full = (
-        xnf_arr[:, 0] + 0.42 * xnf_arr[:, 2] + 0.85 * xnf_arr[:, 840]
-    ) * (np.maximum(t, 1.0) / 10000.0) ** 0.3
-    txnxn = _safe_f32(_txnxn_full)
+    txnxn = np.asarray(
+        (xnf_arr[:, 0] + 0.42 * xnf_arr[:, 2] + 0.85 * xnf_arr[:, 840]) * (t / 10000.0) ** 0.3,
+        dtype=np.float32,
+    )
     start = float(waveset[max(0, int(nulo) - 1)] - 1.0)
     stop = float(waveset[min(nuhi_eff, numnu) - 1] + 1.0)
 
     force_py_linop1 = os.environ.get("ATLAS_TRACE_FORCE_PY_LINOP1", "0") == "1"
+    force_serial_linop1 = os.environ.get("ATLAS_LINOP1_SERIAL", "0") == "1"
+    linop1_backend = os.environ.get("ATLAS_LINOP1_BACKEND", "cpu").strip().lower()
     if _NUMBA_AVAILABLE and not force_py_linop1:
-        xlines, lineused = _linop1_kernel_nb(
-            records.size,
-            np.asarray(records.iwl, dtype=np.int32),
-            np.asarray(records.ielion, dtype=np.int16),
-            np.asarray(records.ielo, dtype=np.int16),
-            np.asarray(records.igflog, dtype=np.int16),
-            np.asarray(records.igr, dtype=np.int16),
-            np.asarray(records.igs, dtype=np.int16),
-            np.asarray(records.igw, dtype=np.int16),
-            waveset, iwavetab, tab,
-            hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
-            extab, extabf, tablog,
-            h0tab, h1tab, h2tab,
-            nrhox, numnu, nuhi_eff, nulo,
-            start, stop,
-            float(_RATIOLG), np.float32(_CGF_SCALE), np.float32(_GAMMA_SCALE),
+        n_records = int(records.size)
+        iwl_arr = np.asarray(records.iwl, dtype=np.int32)
+        ielion_arr = np.asarray(records.ielion, dtype=np.int16)
+        ielo_arr = np.asarray(records.ielo, dtype=np.int16)
+        igflog_arr = np.asarray(records.igflog, dtype=np.int16)
+        igr_arr = np.asarray(records.igr, dtype=np.int16)
+        igs_arr = np.asarray(records.igs, dtype=np.int16)
+        igw_arr = np.asarray(records.igw, dtype=np.int16)
+        ratiolg = float(_RATIOLG)
+        cgf_scale = np.float32(_CGF_SCALE)
+        gamma_scale = np.float32(_GAMMA_SCALE)
+
+        use_linop1_prefilter = os.environ.get("ATLAS_LINOP1_PREFILTER", "1") != "0"
+        prefilter_flag = 1 if use_linop1_prefilter else 0
+        if use_linop1_prefilter:
+            tab_col_min = np.min(tab, axis=0).astype(np.float32, copy=False)
+            max_xnfdop_arr = np.max(xnfdop_arr, axis=0).astype(np.float32, copy=False)
+        else:
+            tab_col_min = np.zeros(1, dtype=np.float32)
+            max_xnfdop_arr = np.zeros(1, dtype=np.float32)
+
+        _assert_fastex_monotonic()
+        use_tight_prefilter = int(
+            os.environ.get("ATLAS_LINOP1_TIGHT_PREFILTER", "1") != "0"
         )
+        min_hckt = np.float32(np.min(hckt_arr))
+        do_profile = int(os.environ.get("ATLAS_LINOP1_PROFILE", "0") == "1")
+        profile_stats = np.zeros(5, dtype=np.int64)
+
+        scalar_cache = _get_linop1_scalar_cache(records, tablog)
+        use_cached = 1 if scalar_cache is not None else 0
+        if scalar_cache is not None:
+            wlvac_arr = scalar_cache.wlvac_arr
+            wlvac4_arr = scalar_cache.wlvac4_arr
+            cgf_arr = scalar_cache.cgf_arr
+            elo_log_arr = scalar_cache.elo_log_arr
+            gammar_arr = scalar_cache.gammar_arr
+            gammas_arr = scalar_cache.gammas_arr
+            gammaw_arr = scalar_cache.gammaw_arr
+            line_valid = scalar_cache.line_valid
+        else:
+            wlvac_arr = _dummy_f64()
+            wlvac4_arr = _dummy_f32()
+            cgf_arr = _dummy_f32()
+            elo_log_arr = _dummy_f32()
+            gammar_arr = _dummy_f32()
+            gammas_arr = _dummy_f32()
+            gammaw_arr = _dummy_f32()
+            line_valid = _dummy_u8()
+
+        if linop1_backend == "mlx":
+            from .line_opacity_gpu import (
+                apply_wings_mlx,
+                finalize_xlines,
+                mlx_available,
+            )
+
+            if not mlx_available():
+                raise RuntimeError(
+                    "ATLAS_LINOP1_BACKEND=mlx requires mlx; install with: pip install mlx"
+                )
+
+            mlx_chunk_target = int(
+                os.environ.get("ATLAS_LINOP1_MLX_CHUNK_TARGET", str(_LINOP1_CHUNK_TARGET))
+            )
+            mlx_record_workers = max(
+                1,
+                int(os.environ.get(
+                    "ATLAS_LINOP1_MLX_RECORD_WORKERS",
+                    str(min(8, multiprocessing.cpu_count() or 4)),
+                )),
+            )
+
+            mlx_chunk_starts = np.arange(0, n_records, mlx_chunk_target, dtype=np.int64)
+            n_mlx_chunks = int(mlx_chunk_starts.shape[0])
+            mlx_chunk_ends = np.empty(n_mlx_chunks, dtype=np.int64)
+            for c in range(n_mlx_chunks):
+                mlx_chunk_ends[c] = (
+                    mlx_chunk_starts[c + 1] if c + 1 < n_mlx_chunks else n_records
+                )
+            nu0_st, nucont0_st, iwlold_st = _linop1_scan_boundaries_nb(
+                n_records,
+                iwl_arr,
+                iwavetab,
+                waveset,
+                int(nulo),
+                start,
+                stop,
+                ratiolg,
+                mlx_chunk_starts,
+                use_cached,
+                wlvac_arr,
+            )
+
+            wing_cap_default = max(2_000_000, int(mlx_chunk_target) * int(nrhox) // 4)
+
+            import mlx.core as mx_core  # noqa: WPS433
+
+            xlines_mx = mx_core.array(
+                np.zeros((nrhox, numnu), dtype=np.float32).reshape(-1)
+            )
+            lineused = 0
+
+            def _record_chunk(c: int):
+                cap = wing_cap_default
+                while True:
+                    wj0 = np.empty(cap, dtype=np.int32)
+                    wnu0 = np.empty(cap, dtype=np.int32)
+                    wwl = np.empty(cap, dtype=np.float32)
+                    wcen = np.empty(cap, dtype=np.float32)
+                    wad = np.empty(cap, dtype=np.float32)
+                    wdw = np.empty(cap, dtype=np.float32)
+                    wtc = np.empty(cap, dtype=np.float32)
+                    wcnt = np.zeros(1, dtype=np.int64)
+                    lu = _linop1_kernel_nb_chunk_record(
+                        int(mlx_chunk_starts[c]),
+                        int(mlx_chunk_ends[c]),
+                        int(nu0_st[c]),
+                        int(nucont0_st[c]),
+                        int(iwlold_st[c]),
+                        n_records,
+                        iwl_arr,
+                        ielion_arr,
+                        ielo_arr,
+                        igflog_arr,
+                        igr_arr,
+                        igs_arr,
+                        igw_arr,
+                        waveset,
+                        iwavetab,
+                        tab,
+                        hckt_arr,
+                        xne_arr,
+                        xnfdop_arr,
+                        dopple_arr,
+                        txnxn,
+                        extab,
+                        extabf,
+                        tablog,
+                        h0tab,
+                        h1tab,
+                        h2tab,
+                        nrhox,
+                        numnu,
+                        nuhi_eff,
+                        int(nulo),
+                        start,
+                        stop,
+                        ratiolg,
+                        cgf_scale,
+                        gamma_scale,
+                        tab_col_min,
+                        max_xnfdop_arr,
+                        prefilter_flag,
+                        min_hckt,
+                        use_tight_prefilter,
+                        wj0,
+                        wnu0,
+                        wwl,
+                        wcen,
+                        wad,
+                        wdw,
+                        wtc,
+                        wcnt,
+                    )
+                    n_w = int(wcnt[0])
+                    if n_w <= cap:
+                        break
+                    cap *= 2
+                return (
+                    wj0[:n_w], wnu0[:n_w], wwl[:n_w], wcen[:n_w],
+                    wad[:n_w], wdw[:n_w], wtc[:n_w], int(lu),
+                )
+
+            with ThreadPoolExecutor(max_workers=mlx_record_workers) as pool:
+                results_iter = pool.map(_record_chunk, range(n_mlx_chunks))
+                for res in results_iter:
+                    wj0, wnu0, wwl, wcen, wad, wdw, wtc, lu = res
+                    lineused += int(lu)
+                    if wj0.shape[0] == 0:
+                        continue
+                    _, xlines_mx = apply_wings_mlx(
+                        wing_j0=wj0,
+                        wing_nu0=wnu0,
+                        wing_wlvac=wwl,
+                        wing_center=wcen,
+                        wing_adamp=wad,
+                        wing_dopwave=wdw,
+                        wing_tabcont=wtc,
+                        xlines=np.zeros((nrhox, numnu), dtype=np.float32),
+                        waveset=waveset,
+                        h0tab=h0tab,
+                        h1tab=h1tab,
+                        h2tab=h2tab,
+                        xlines_mx_in=xlines_mx,
+                    )
+
+            xlines = finalize_xlines(xlines_mx, nrhox, numnu)
+            return LineOpacityState(xlines=xlines, lineused=int(lineused))
+
+        use_chunks = (
+            not force_serial_linop1
+            and n_records >= _LINOP1_CHUNK_MIN_RECORDS
+        )
+        if use_chunks:
+            n_threads = max(
+                1,
+                int(os.environ.get("NUMBA_NUM_THREADS", multiprocessing.cpu_count() or 4)),
+            )
+            n_chunks = min(
+                n_threads,
+                max(1, (n_records + _LINOP1_CHUNK_TARGET - 1) // _LINOP1_CHUNK_TARGET),
+            )
+            chunk_size = (n_records + n_chunks - 1) // n_chunks
+            chunk_starts = np.arange(0, n_records, chunk_size, dtype=np.int64)
+            n_chunks = int(chunk_starts.shape[0])
+            chunk_ends = np.empty(n_chunks, dtype=np.int64)
+            for c in range(n_chunks):
+                chunk_ends[c] = (
+                    chunk_starts[c + 1] if c + 1 < n_chunks else n_records
+                )
+            nu0_st, nucont0_st, iwlold_st = _linop1_scan_boundaries_nb(
+                n_records,
+                iwl_arr,
+                iwavetab,
+                waveset,
+                int(nulo),
+                start,
+                stop,
+                ratiolg,
+                chunk_starts,
+                use_cached,
+                wlvac_arr,
+            )
+
+            if chunk_bufs is not None and len(chunk_bufs) >= n_chunks:
+                local_chunk_bufs = chunk_bufs
+            else:
+                local_chunk_bufs = [
+                    np.zeros((nrhox, numnu), dtype=np.float32) for _ in range(n_chunks)
+                ]
+
+            def _run_chunk(c: int):
+                local_prof = np.zeros(5, dtype=np.int64)
+                prof_arr = local_prof if do_profile else profile_stats
+                prof_flag = do_profile
+                result = _linop1_kernel_nb_chunk(
+                    int(chunk_starts[c]),
+                    int(chunk_ends[c]),
+                    int(nu0_st[c]),
+                    int(nucont0_st[c]),
+                    int(iwlold_st[c]),
+                    n_records,
+                    iwl_arr,
+                    ielion_arr,
+                    ielo_arr,
+                    igflog_arr,
+                    igr_arr,
+                    igs_arr,
+                    igw_arr,
+                    waveset,
+                    iwavetab,
+                    tab,
+                    hckt_arr,
+                    xne_arr,
+                    xnfdop_arr,
+                    dopple_arr,
+                    txnxn,
+                    extab,
+                    extabf,
+                    tablog,
+                    h0tab,
+                    h1tab,
+                    h2tab,
+                    nrhox,
+                    numnu,
+                    nuhi_eff,
+                    int(nulo),
+                    start,
+                    stop,
+                    ratiolg,
+                    cgf_scale,
+                    gamma_scale,
+                    tab_col_min,
+                    max_xnfdop_arr,
+                    prefilter_flag,
+                    use_cached,
+                    wlvac_arr,
+                    wlvac4_arr,
+                    cgf_arr,
+                    elo_log_arr,
+                    gammar_arr,
+                    gammas_arr,
+                    gammaw_arr,
+                    line_valid,
+                    min_hckt,
+                    use_tight_prefilter,
+                    prof_flag,
+                    prof_arr,
+                    local_chunk_bufs[c],
+                    1,
+                )
+                return result, local_prof
+
+            with ThreadPoolExecutor(max_workers=n_chunks) as pool:
+                chunk_results = list(pool.map(_run_chunk, range(n_chunks)))
+            if do_profile:
+                profile_stats[:] = 0
+                for _res in chunk_results:
+                    profile_stats += _res[1]
+            chunk_results = [r[0] for r in chunk_results]
+            if xlines_buf is not None and xlines_buf.shape == (nrhox, numnu):
+                xlines = xlines_buf
+                xlines.fill(np.float32(0.0))
+            else:
+                xlines = np.zeros((nrhox, numnu), dtype=np.float32)
+            lineused = 0
+            for xl, lu in chunk_results:
+                xlines += xl
+                lineused += int(lu)
+        else:
+            if xlines_buf is not None and xlines_buf.shape == (nrhox, numnu):
+                xlines_out = xlines_buf
+                reuse_buffer = 1
+            else:
+                xlines_out = np.zeros((nrhox, numnu), dtype=np.float32)
+                reuse_buffer = 0
+            xlines, lineused = _linop1_kernel_nb(
+                n_records,
+                iwl_arr,
+                ielion_arr,
+                ielo_arr,
+                igflog_arr,
+                igr_arr,
+                igs_arr,
+                igw_arr,
+                waveset, iwavetab, tab,
+                hckt_arr, xne_arr, xnfdop_arr, dopple_arr, txnxn,
+                extab, extabf, tablog,
+                h0tab, h1tab, h2tab,
+                nrhox, numnu, nuhi_eff, nulo,
+                start, stop,
+                ratiolg, cgf_scale, gamma_scale,
+                tab_col_min,
+                max_xnfdop_arr,
+                prefilter_flag,
+                use_cached,
+                wlvac_arr,
+                wlvac4_arr,
+                cgf_arr,
+                elo_log_arr,
+                gammar_arr,
+                gammas_arr,
+                gammaw_arr,
+                line_valid,
+                min_hckt,
+                use_tight_prefilter,
+                do_profile,
+                profile_stats,
+                xlines_out,
+                reuse_buffer,
+            )
+
+        if do_profile:
+            _logger.info(
+                "LINOP1 profile: lines=%d prefilter_skip=%d j0_outer=%d "
+                "inner7=%d wings=%d cached=%d tight_prefilter=%d",
+                int(profile_stats[0]),
+                int(profile_stats[1]),
+                int(profile_stats[2]),
+                int(profile_stats[3]),
+                int(profile_stats[4]),
+                use_cached,
+                use_tight_prefilter,
+            )
         return LineOpacityState(xlines=xlines, lineused=int(lineused))
 
     # --- pure-Python fallback (slow, only used when numba is absent) ---
