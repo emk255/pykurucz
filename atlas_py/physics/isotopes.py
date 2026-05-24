@@ -23,13 +23,10 @@ def _default_isotopes_npz_path() -> Path:
 
 
 def _default_atlas12_path() -> Path:
-    # atlas_py/physics -> atlas_py -> pykurucz
+    # Used only when re-extracting tables from Fortran source; the normal
+    # runtime path is the pre-extracted .npz cache below.
     repo_root = Path(__file__).resolve().parents[2]
-    # Prefer self-contained data/src/; fall back to sibling kurucz/src/
-    data_path = repo_root / "data" / "src" / "atlas12.for"
-    if data_path.exists():
-        return data_path
-    return repo_root.parent / "kurucz" / "src" / "atlas12.for"
+    return repo_root / "data" / "src" / "atlas12.for"
 
 
 def _parse_fortran_scalar(token: str) -> float:

@@ -151,10 +151,9 @@ def find_default_molecules_file() -> Path | None:
     """Search common local locations for ATLAS12 molecular input file.
 
     Search order:
-    1. data/lines/ inside the pykurucz repo (self-contained layout after setup_data.sh)
+    1. data/lines/ inside the pykurucz repo (populated by scripts/download_data.py)
     2. lines/ inside the pykurucz repo
-    3. Sibling ../kurucz/lines/ (legacy layout)
-    4. CWD-relative lines/
+    3. CWD-relative lines/
     """
     repo_root = Path(__file__).resolve().parents[2]
     candidates = [
@@ -162,8 +161,6 @@ def find_default_molecules_file() -> Path | None:
         repo_root / "data" / "lines" / "molecules.dat",
         repo_root / "lines" / "molecules.new",
         repo_root / "lines" / "molecules.dat",
-        repo_root.parent / "kurucz" / "lines" / "molecules.new",
-        repo_root.parent / "kurucz" / "lines" / "molecules.dat",
         Path("lines/molecules.new"),
         Path("lines/molecules.dat"),
     ]
