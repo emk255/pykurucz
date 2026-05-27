@@ -53,4 +53,7 @@ class AtlasConfig:
     convergence_consecutive: int = 1
     n_workers: Optional[int] = None
     cache_dir: Optional[Path] = None
+    linop1_serial: Optional[bool] = None
+    convec_fd_parallel: Optional[bool] = None
+    pops_parallel: Optional[bool] = None
 

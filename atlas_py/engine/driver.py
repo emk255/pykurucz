@@ -663,8 +663,19 @@ def _run_freq_chunk(
 def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     """Run one or more atlas_py iterations and write output `.atm`."""
 
+    from .threading_policy import ThreadingPolicy, log_threading_banner
+
     _t_total = time.perf_counter()
     _t_stage = time.perf_counter()
+
+    policy = ThreadingPolicy.from_n_workers(
+        cfg.n_workers,
+        linop1_serial=cfg.linop1_serial,
+        convec_fd_parallel=cfg.convec_fd_parallel,
+        pops_parallel=cfg.pops_parallel,
+    )
+    policy.apply()
+    log_threading_banner(policy, stage="atlas_py")
 
     atm = load_atm(cfg.inputs.atmosphere_path)
     state = _runtime_from_atm(atm)
@@ -690,10 +701,7 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     convergence_min_iterations = max(1, int(cfg.convergence_min_iterations))
     convergence_consecutive_required = max(1, int(cfg.convergence_consecutive))
     convergence_consecutive_count = 0
-    n_workers = max(
-        1,
-        cfg.n_workers if cfg.n_workers is not None else (multiprocessing.cpu_count() or 1),
-    )
+    n_workers = max(1, policy.atlas_freq_pool)
     completed_iterations = 0
 
     gravity_cgs = _gravity_from_atm_metadata(atm)

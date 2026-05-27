@@ -65,6 +65,13 @@ _CGF_SCALE = 0.026538 / 1.77245 / 2.99792458e17
 _GAMMA_SCALE = 1.0 / 12.5664 / 2.99792458e17
 _LINOP1_CHUNK_MIN_RECORDS = 500_000
 _LINOP1_CHUNK_TARGET = 250_000
+# profile_stats layout: [0]=lines [1]=prefilter_skip [2]=j0_outer [3]=inner7
+# [4]=wings [5..15]=active-stride-count histogram (0..10)
+# [16..25]=per-stride outer activation [26]=outer_wings [27]=inner_wings
+# [28]=stride_dead_skip (all 10 pre-fastex checks failed)
+# [29]=tight_stride_skip (per-stride fastex elided via boltz upper bound)
+_LINOP1_PROFILE_STATS_SIZE = 30
+_LINOP1_N_STRIDE_BANDS = 10
 
 _LO_TABLES = _load_lo_tables()
 _TABVI = _LO_TABLES["_TABVI"]
@@ -549,12 +556,21 @@ if _NUMBA_AVAILABLE:
             return 0.5642 * a / (v * v)
         return (h2[i] * a + h1[i]) * a + h0[i]
 
-    @_njit
+    @numba.njit(cache=True, nogil=True, fastmath=True)
     def _accwings_nb(xlines, j0, nu0, wlvac, center, adamp, dopwave, tabcont_ref, waveset, h0tab, h1tab, h2tab):
         """_accumulate_wings without blue_cutoff (linop1 never sets it).
 
         Fortran LINOP1 uses IMPLICIT REAL*4 — all intermediates (VVOIGT, CV)
         are float32.  VVOIGT = SNGL(WAVESET-WLVAC)/DOPWAVE.
+
+        ``fastmath=True`` is set on this function specifically (not the
+        rest of the module). The wing accumulator runs ~1.3B times per
+        ATLAS iter on cool stars; it is the LINOP1 hot path. fastmath
+        lets Numba/LLVM substitute reciprocal approximations for the
+        per-step ``/dopwave`` divide and FMA-fuse the Horner Voigt
+        polynomial. The numerical drift is < 1 ULP per step (xlines
+        accumulator is float32, so sub-ULP error stays below storage
+        precision). Fortran source: atlas12.for ACCWINGS subroutine.
         """
         numnu = waveset.shape[0]
         if dopwave <= 0.0:
@@ -699,6 +715,57 @@ if _NUMBA_AVAILABLE:
         return peak < tab_col_min[nucont0]
 
     @_njit
+    def _linop1_all_stride_prefastex_dead_nb(
+        cgf,
+        nelion,
+        nucont0,
+        tab,
+        xnfdop_arr,
+        nrhox,
+    ):
+        """True when every stride-8 anchor fails the pre-Boltzmann center test.
+
+        Mirrors the first ``CENTER.LT.TABCONT(J,NUCONT)`` check at each
+        ``J=8,16,...,NRHOX`` in Fortran LINOP1 (atlas12.for ~10123). Exact-safe:
+        if all anchors fail this test, no stride can activate and IFJ stays zero.
+        """
+        nel = nelion - 1
+        for j1 in range(8, nrhox + 1, 8):
+            j0 = j1 - 1
+            if cgf * xnfdop_arr[j0, nel] >= tab[j0, nucont0]:
+                return False
+        return True
+
+    @_njit
+    def _linop1_all_stride_tight_dead_nb(
+        cgf,
+        nelion,
+        nucont0,
+        tab,
+        xnfdop_arr,
+        nrhox,
+        elo_val,
+        min_hckt,
+        extab,
+        extabf,
+    ):
+        """True when every stride anchor fails the tight post-Boltzmann upper bound.
+
+        Uses ``fastex(elo * min_hckt)`` as an upper bound on ``fastex(elo * hckt[j])``
+        at all layers (``_fastex`` decreases with ``hckt``). If
+        ``cgf * xnfdop[j0] * fastex(elo * min_hckt) < tab[j0, nucont0]`` at every
+        stride anchor, no depth can pass the post-Boltzmann center test either.
+        """
+        nel = nelion - 1
+        boltz_max = _fastex_nb(elo_val * min_hckt, extab, extabf)
+        for j1 in range(8, nrhox + 1, 8):
+            j0 = j1 - 1
+            peak = cgf * xnfdop_arr[j0, nel] * boltz_max
+            if peak >= tab[j0, nucont0]:
+                return False
+        return True
+
+    @_njit
     def _linop1_kernel_nb(
         n_records,
         iwl_arr, ielion_arr, ielo_arr, igflog_arr, igr_arr, igs_arr, igw_arr,
@@ -716,6 +783,8 @@ if _NUMBA_AVAILABLE:
         wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
         gammar_arr, gammas_arr, gammaw_arr, line_valid,
         min_hckt, use_tight_prefilter,
+        use_stride_dead_skip,
+        use_stride_tight_skip,
         do_profile, profile_stats,
         xlines_out, reuse_buffer,
     ):
@@ -741,7 +810,9 @@ if _NUMBA_AVAILABLE:
             wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
             gammar_arr, gammas_arr, gammaw_arr, line_valid,
             min_hckt, use_tight_prefilter,
-            do_profile, profile_stats,
+            use_stride_dead_skip,
+            use_stride_tight_skip,
+        do_profile, profile_stats,
             xlines_out, reuse_buffer,
         )
 
@@ -823,6 +894,8 @@ if _NUMBA_AVAILABLE:
         wlvac_arr, wlvac4_arr, cgf_arr, elo_log_arr,
         gammar_arr, gammas_arr, gammaw_arr, line_valid,
         min_hckt, use_tight_prefilter,
+        use_stride_dead_skip,
+        use_stride_tight_skip,
         do_profile, profile_stats,
         xlines_out, reuse_buffer,
     ):
@@ -907,12 +980,29 @@ if _NUMBA_AVAILABLE:
                     iwlold = iwl
                     continue
 
+            if use_stride_dead_skip != 0:
+                if _linop1_all_stride_tight_dead_nb(
+                    cgf, nelion, nucont0, tab, xnfdop_arr, nrhox,
+                    elo_val, min_hckt, extab, extabf,
+                ):
+                    if do_profile != 0:
+                        profile_stats[28] += 1
+                        profile_stats[5] += 1
+                    iwlold = iwl
+                    continue
+
             ifline = 0
             adamp_seed = 0.0
             gammar = np.float32(0.0)
             gammas = np.float32(0.0)
             gammaw = np.float32(0.0)
+            stride_bitmask = 0
+            if use_stride_tight_skip != 0 or use_stride_dead_skip != 0:
+                boltz_max = _fastex_nb(elo_val * min_hckt, extab, extabf)
+            else:
+                boltz_max = np.float32(0.0)
 
+            stride_idx = 0
             for j1 in range(8, nrhox + 1, 8):
                 if do_profile != 0:
                     profile_stats[2] += 1
@@ -920,12 +1010,23 @@ if _NUMBA_AVAILABLE:
                 j0 = j1 - 1
                 center = cgf * xnfdop_arr[j0, nelion - 1]
                 if center < tab[j0, nucont0]:
+                    stride_idx += 1
                     continue
+                if use_stride_tight_skip != 0:
+                    if center * boltz_max < tab[j0, nucont0]:
+                        if do_profile != 0:
+                            profile_stats[29] += 1
+                        stride_idx += 1
+                        continue
                 center = center * _fastex_nb(elo_val * hckt_arr[j0], extab, extabf)
                 if center < tab[j0, nucont0]:
+                    stride_idx += 1
                     continue
                 ifj[j1 + 1] = 1
                 ifline = 1
+                stride_bitmask |= 1 << stride_idx
+                if do_profile != 0:
+                    profile_stats[16 + stride_idx] += 1
                 if adamp_seed == 0.0:
                     if use_cached != 0:
                         gammar = gammar_arr[iline]
@@ -938,15 +1039,26 @@ if _NUMBA_AVAILABLE:
                     adamp_seed = 1.0
                 dop = dopple_arr[j0, nelion - 1]
                 if dop <= 0.0:
+                    stride_idx += 1
                     continue
                 adamp = (gammar + gammas * xne_arr[j0] + gammaw * txnxn[j0]) / dop
                 dopwave = dop * wlvac4
                 if do_profile != 0:
                     profile_stats[4] += 1
+                    profile_stats[26] += 1
                 _accwings_nb(
                     xlines, j0, nu0, wlvac, center, adamp, dopwave,
                     tab[j0, nucont0], waveset, h0tab, h1tab, h2tab,
                 )
+                stride_idx += 1
+
+            if do_profile != 0:
+                n_active_strides = 0
+                m = stride_bitmask
+                while m > 0:
+                    n_active_strides += m & 1
+                    m >>= 1
+                profile_stats[5 + n_active_strides] += 1
 
             for k1 in range(8, nrhox + 1, 8):
                 if ifj[k1 - 7] + ifj[k1 + 1] == 0:
@@ -958,6 +1070,11 @@ if _NUMBA_AVAILABLE:
                     center = cgf * xnfdop_arr[j0, nelion - 1]
                     if center < tab[j0, nucont0]:
                         continue
+                    if use_stride_tight_skip != 0:
+                        if center * boltz_max < tab[j0, nucont0]:
+                            if do_profile != 0:
+                                profile_stats[29] += 1
+                            continue
                     center = center * _fastex_nb(elo_val * hckt_arr[j0], extab, extabf)
                     if center < tab[j0, nucont0]:
                         continue
@@ -978,6 +1095,7 @@ if _NUMBA_AVAILABLE:
                     dopwave = dop * wlvac4
                     if do_profile != 0:
                         profile_stats[4] += 1
+                        profile_stats[27] += 1
                     _accwings_nb(
                         xlines, j0, nu0, wlvac, center, adamp, dopwave,
                         tab[j0, nucont0], waveset, h0tab, h1tab, h2tab,
@@ -1591,9 +1709,15 @@ def linop1(
         use_tight_prefilter = int(
             os.environ.get("ATLAS_LINOP1_TIGHT_PREFILTER", "1") != "0"
         )
+        use_stride_dead_skip = int(
+            os.environ.get("ATLAS_LINOP1_STRIDE_DEAD_SKIP", "0") != "0"
+        )
+        use_stride_tight_skip = int(
+            os.environ.get("ATLAS_LINOP1_STRIDE_TIGHT_SKIP", "0") != "0"
+        )
         min_hckt = np.float32(np.min(hckt_arr))
         do_profile = int(os.environ.get("ATLAS_LINOP1_PROFILE", "0") == "1")
-        profile_stats = np.zeros(5, dtype=np.int64)
+        profile_stats = np.zeros(_LINOP1_PROFILE_STATS_SIZE, dtype=np.int64)
 
         scalar_cache = _get_linop1_scalar_cache(records, tablog)
         use_cached = 1 if scalar_cache is not None else 0
@@ -1659,7 +1783,7 @@ def linop1(
                 ]
 
             def _run_chunk(c: int):
-                local_prof = np.zeros(5, dtype=np.int64)
+                local_prof = np.zeros(_LINOP1_PROFILE_STATS_SIZE, dtype=np.int64)
                 prof_arr = local_prof if do_profile else profile_stats
                 prof_flag = do_profile
                 result = _linop1_kernel_nb_chunk(
@@ -1713,6 +1837,8 @@ def linop1(
                     line_valid,
                     min_hckt,
                     use_tight_prefilter,
+                    use_stride_dead_skip,
+                    use_stride_tight_skip,
                     prof_flag,
                     prof_arr,
                     local_chunk_bufs[c],
@@ -1773,6 +1899,8 @@ def linop1(
                 line_valid,
                 min_hckt,
                 use_tight_prefilter,
+                use_stride_dead_skip,
+                use_stride_tight_skip,
                 do_profile,
                 profile_stats,
                 xlines_out,
@@ -1780,17 +1908,33 @@ def linop1(
             )
 
         if do_profile:
+            hist_parts = " ".join(
+                f"n{n}={int(profile_stats[5 + n])}"
+                for n in range(_LINOP1_N_STRIDE_BANDS + 1)
+            )
+            stride_parts = " ".join(
+                f"s{s}={int(profile_stats[16 + s])}"
+                for s in range(_LINOP1_N_STRIDE_BANDS)
+            )
             _logger.info(
                 "LINOP1 profile: lines=%d prefilter_skip=%d j0_outer=%d "
-                "inner7=%d wings=%d cached=%d tight_prefilter=%d",
+                "inner7=%d wings=%d outer_wings=%d inner_wings=%d "
+                "stride_dead_skip=%d tight_stride_skip=%d cached=%d tight_prefilter=%d stride_dead_skip_on=%d",
                 int(profile_stats[0]),
                 int(profile_stats[1]),
                 int(profile_stats[2]),
                 int(profile_stats[3]),
                 int(profile_stats[4]),
+                int(profile_stats[26]),
+                int(profile_stats[27]),
+                int(profile_stats[28]),
+                int(profile_stats[29]),
                 use_cached,
                 use_tight_prefilter,
+                use_stride_dead_skip,
             )
+            _logger.info("LINOP1 stride histogram: %s", hist_parts)
+            _logger.info("LINOP1 per-stride activation: %s", stride_parts)
         return LineOpacityState(xlines=xlines, lineused=int(lineused))
 
     # --- pure-Python fallback (slow, only used when numba is absent) ---

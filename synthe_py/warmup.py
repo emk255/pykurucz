@@ -199,8 +199,11 @@ def _warmup_rt():
 
 
 def _warmup_asynth():
-    """Compile ASYNTH wing kernel."""
-    from synthe_py.physics.line_opacity import _compute_asynth_wings_kernel
+    """Compile ASYNTH wing kernels."""
+    from synthe_py.physics.line_opacity import (
+        _compute_asynth_wings_kernel,
+        _compute_asynth_wings_sparse_kernel,
+    )
 
     n_wl = 10
     n_depths = 2
@@ -230,6 +233,29 @@ def _warmup_asynth():
         np.zeros(201, dtype=np.float64),                     # h0tab
         np.zeros(201, dtype=np.float64),                     # h1tab
         np.zeros(201, dtype=np.float64),                     # h2tab
+    )
+    pair_line = np.array([0], dtype=np.int32)
+    depth_starts = np.array([0, 1, 1], dtype=np.int64)
+    _compute_asynth_wings_sparse_kernel(
+        asynth,
+        np.linspace(500.0, 501.0, n_wl),
+        pair_line,
+        depth_starts,
+        np.array([500.5]),
+        np.array([5], dtype=np.int64),
+        np.ones(1),
+        np.ones(1) * 0.1,
+        np.ones(1) * 0.01,
+        np.ones(1) * 1e-3,
+        np.full(1, -1.0),
+        np.full(1, -1.0),
+        True,
+        300000.0,
+        5000,
+        np.zeros(201, dtype=np.float64),
+        np.zeros(201, dtype=np.float64),
+        np.zeros(201, dtype=np.float64),
+        n_depths,
     )
 
 

@@ -2781,10 +2781,22 @@ def _process_metal_wings_kernel(
             )
 
 
-def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
+def run_synthesis(cfg: SynthesisConfig, *, synthe_policy=None) -> SynthResult:
     """Execute the high-level synthesis pipeline."""
 
+    from atlas_py.engine.threading_policy import ThreadingPolicy, log_threading_banner
+
     logger = logging.getLogger(__name__)
+    if synthe_policy is None:
+        synthe_policy = ThreadingPolicy.for_synthe_grid(
+            cfg.n_workers,
+            wl_start=cfg.wavelength_grid.start,
+            wl_end=cfg.wavelength_grid.end,
+            resolution=cfg.wavelength_grid.resolution,
+        )
+        synthe_policy.apply()
+        log_threading_banner(synthe_policy, stage="synthe_py")
+    rt_pool = synthe_policy.rt_pool
     logger.info("Starting synthesis pipeline")
     logger.info(
         f"Wavelength range: {cfg.wavelength_grid.start:.2f} - {cfg.wavelength_grid.end:.2f} nm"
@@ -3610,7 +3622,7 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
         # cfg.n_workers controls the RT ThreadPool only (see solve_lte_spectrum). Metal-wing
         # kernels below use @jit(parallel=True)/prange — thread count is OpenMP/NUMBA_NUM_THREADS,
         # not cfg.n_workers. Log RT pool size here only so logs match --n-workers for debugging.
-        n_workers_rt = cfg.n_workers
+        n_workers_rt = rt_pool
         if n_workers_rt is None:
             import multiprocessing
 
@@ -4874,7 +4886,7 @@ def run_synthesis(cfg: SynthesisConfig) -> SynthResult:
     logger.info("Solving radiative transfer equation...")
 
     # Determine number of workers for parallel processing
-    n_workers = cfg.n_workers
+    n_workers = rt_pool
     if n_workers is None:
         # Auto-detect: use parallel processing for large wavelength grids
         if wavelength.size > 10000:

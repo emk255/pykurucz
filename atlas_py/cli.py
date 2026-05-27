@@ -101,10 +101,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "ThreadPool size for the per-iteration frequency loop in atlas_py "
-            "(default: all logical CPUs). Set to 1 for a fully serial loop. "
-            "NLTE (STATEQ) forces serial execution regardless of this value."
+            "Total CPU thread budget (frequency loop pool size when atlas_py "
+            "runs standalone). Default: all logical CPUs."
         ),
+    )
+    parser.add_argument(
+        "--linop1-serial",
+        action="store_true",
+        help="Force serial LINOP1.",
+    )
+    parser.add_argument(
+        "--convec-fd-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable parallel CONVEC FD (default: on when n-workers>1).",
+    )
+    parser.add_argument(
+        "--pops-parallel",
+        action="store_true",
+        help="Enable parallel POPS/NELECT (default: off).",
     )
     parser.add_argument(
         "--cache-dir",
@@ -147,6 +162,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         convergence_consecutive=args.convergence_consecutive,
         n_workers=args.n_workers,
         cache_dir=args.cache_dir,
+        linop1_serial=True if args.linop1_serial else None,
+        convec_fd_parallel=args.convec_fd_parallel,
+        pops_parallel=True if args.pops_parallel else None,
     )
     # Fix 10: catch ZeroDivisionError / FloatingPointError that escape josh
     # Python fallback so the slurm task exits cleanly rather than killing the whole array.
