@@ -750,8 +750,18 @@ def run_atlas(cfg: AtlasConfig) -> AtlasAtmosphere:
     convergence_consecutive_required = max(1, int(cfg.convergence_consecutive))
     convergence_consecutive_count = 0
     # Early-stop criterion mirrors Fortran checkconv.f90: deep-layer temperature
-    # test. Fortran checkconv.f90 dlntmax parameter (REAL, PARAMETER :: dlntmax=1E-4).
-    checkconv_dlntmax = float(os.environ.get("ATLAS_CHECKCONV_DLNTMAX", "1.0e-4"))
+    # test (MAXVAL(|dT/T|, layers 40..jmax-5) < dlntmax). Fortran's checkconv.f90
+    # uses dlntmax=1E-4; the validated production default loosens this to 5e-4.
+    # The convergence-criteria study (results/convergence_criteria/REPORT.md;
+    # 9 cases, 3600-10250 K, [M/H] 0 to -2, Fortran-confirmed) shows the
+    # atmosphere/spectrum settle far earlier than dlnt=1e-4 stops it: dlnt<5e-4
+    # stops ~53% sooner with worst-case spectrum error max|F/C|=0.0062 -- 16x
+    # inside the 0.10 parity gate. Precedence: ATLAS_CHECKCONV_DLNTMAX env var >
+    # cfg.convergence_dlntmax (CLI --checkconv-dlntmax). Set either to 1e-4 to
+    # restore the Fortran-faithful threshold.
+    checkconv_dlntmax = float(
+        os.environ.get("ATLAS_CHECKCONV_DLNTMAX", str(cfg.convergence_dlntmax))
+    )
     n_workers = max(1, policy.atlas_freq_pool)
     completed_iterations = 0
 

@@ -404,6 +404,7 @@ def run_atlas_py(
     convergence_epsilon: Optional[float] = None,
     convergence_min_iterations: int = 5,
     convergence_consecutive: int = 1,
+    convergence_dlntmax: float = 5.0e-4,
     n_workers: Optional[int] = None,
     cache_dir: Optional[Path] = None,
 ) -> Path:
@@ -434,8 +435,12 @@ def run_atlas_py(
         exact parity with a previous Fortran ATLAS run.  Used only by the
         validation harness — unused in the user-facing flow.
     convergence_epsilon:
-        Optional early-stop threshold on max normalized changes across
-        physical atmosphere columns.  ``iterations`` remains the maximum.
+        Early-stop enable switch (any positive value enables it). The actual
+        stop threshold is ``convergence_dlntmax``.  ``iterations`` is the maximum.
+    convergence_dlntmax:
+        Deep-layer temperature stop threshold (Fortran checkconv.f90 dlntmax),
+        forwarded as ``--checkconv-dlntmax``.  Validated default 5e-4; pass 1e-4
+        for Fortran-faithful behavior.
     """
     root = (kurucz_root or _default_kurucz_root()).resolve()
     lines_dir = root / "lines"
@@ -481,6 +486,7 @@ def run_atlas_py(
                 "--convergence-epsilon", str(convergence_epsilon),
                 "--convergence-min-iterations", str(convergence_min_iterations),
                 "--convergence-consecutive", str(convergence_consecutive),
+                "--checkconv-dlntmax", str(convergence_dlntmax),
             ]
         )
     if fort12_bin is not None and fort12_bin.exists():
@@ -684,6 +690,7 @@ def synthesize(
     atlas_convergence_epsilon: Optional[float] = 1.0e-3,
     atlas_convergence_min_iterations: int = 5,
     atlas_convergence_consecutive: int = 1,
+    atlas_checkconv_dlntmax: float = 5.0e-4,
     n_workers: Optional[int] = None,
     atlas_fort12_cache: bool = True,
     atlas_cache_dir: Optional[Path] = None,
@@ -734,8 +741,14 @@ def synthesize(
     atlas_iterations : int
         Maximum number of atlas_py outer iterations (default 30).
     atlas_convergence_epsilon : float, optional
-        Early-stop threshold on physical atmosphere column changes.  Defaults
-        to 1e-3; set to None to force all ``atlas_iterations``.
+        Early-stop enable switch (any positive value enables it).  Defaults to
+        1e-3; set to None to force all ``atlas_iterations``.  The actual stop
+        threshold is ``atlas_checkconv_dlntmax``.
+    atlas_checkconv_dlntmax : float
+        Deep-layer temperature stop threshold (Fortran checkconv.f90 dlntmax).
+        Validated production default 5e-4 (~53% fewer iterations than Fortran's
+        1e-4 with worst-case spectrum error max|F/C|=0.0062; see
+        results/convergence_criteria/REPORT.md).  Pass 1e-4 for Fortran parity.
     n_workers : int, optional
         Total CPU thread budget for the full pipeline.  Sets Numba
         (LINOP1, metal wings, RT prange), ATLAS frequency-loop pool,
@@ -888,6 +901,7 @@ def synthesize(
             convergence_epsilon=atlas_convergence_epsilon,
             convergence_min_iterations=atlas_convergence_min_iterations,
             convergence_consecutive=atlas_convergence_consecutive,
+            convergence_dlntmax=atlas_checkconv_dlntmax,
             n_workers=policy.atlas_freq_pool,
             cache_dir=cache_dir,
         )
@@ -1032,6 +1046,24 @@ Notes:
         help="Consecutive converged iterations required before early stopping (default: 1).",
     )
     parser.add_argument(
+        "--atlas-checkconv-dlntmax",
+        type=float,
+        default=5.0e-4,
+        help=(
+            "Deep-layer temperature stop threshold (Fortran checkconv.f90 "
+            "dlntmax). Validated production default 5e-4 (~53%% fewer iterations "
+            "than Fortran's 1e-4 with negligible spectrum error; see "
+            "results/convergence_criteria/REPORT.md). Use --fortran-convergence "
+            "for the Fortran-faithful 1e-4."
+        ),
+    )
+    parser.add_argument(
+        "--fortran-convergence",
+        action="store_true",
+        help="Restore the Fortran-faithful checkconv dlntmax=1e-4 threshold "
+        "(equivalent to --atlas-checkconv-dlntmax 1e-4).",
+    )
+    parser.add_argument(
         "--no-atlas-convergence",
         action="store_true",
         help="Disable convergence early stopping and run exactly --atlas-iterations.",
@@ -1122,6 +1154,11 @@ Notes:
     )
     if atlas_convergence_epsilon is not None and atlas_convergence_epsilon <= 0.0:
         parser.error("--atlas-convergence-epsilon must be positive")
+    atlas_checkconv_dlntmax = (
+        1.0e-4 if args.fortran_convergence else float(args.atlas_checkconv_dlntmax)
+    )
+    if atlas_checkconv_dlntmax <= 0.0:
+        parser.error("--atlas-checkconv-dlntmax must be positive")
     if args.n_workers is not None and args.n_workers < 1:
         parser.error("--n-workers must be >= 1")
 
@@ -1142,6 +1179,7 @@ Notes:
         atlas_convergence_epsilon=atlas_convergence_epsilon,
         atlas_convergence_min_iterations=args.atlas_convergence_min_iterations,
         atlas_convergence_consecutive=args.atlas_convergence_consecutive,
+        atlas_checkconv_dlntmax=atlas_checkconv_dlntmax,
         abundances=individual,
         output_dir=args.output_dir,
         use_molecular_lines=not args.no_molecular_lines,

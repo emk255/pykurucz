@@ -81,7 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Early-stop enable switch. When set, ATLAS stops once the Fortran "
             "checkconv.f90 criterion is met (max |dT/T| over deep layers 40-75 "
-            "< dlntmax, 1e-4). Disabled by default."
+            "< dlntmax). The threshold itself is set by --checkconv-dlntmax "
+            "(default 5e-4). Disabled by default."
         ),
     )
     parser.add_argument(
@@ -95,6 +96,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Consecutive converged iterations required before early stopping (default: 1)",
+    )
+    parser.add_argument(
+        "--checkconv-dlntmax",
+        type=float,
+        default=5.0e-4,
+        help=(
+            "Deep-layer temperature stop threshold for the Fortran checkconv.f90 "
+            "criterion (MAXVAL(|dT/T|, layers 40..jmax-5) < dlntmax). Validated "
+            "production default 5e-4 (~53%% fewer iterations than Fortran's 1e-4 "
+            "with worst-case spectrum error max|F/C|=0.0062; see "
+            "results/convergence_criteria/REPORT.md). Overridden by the "
+            "ATLAS_CHECKCONV_DLNTMAX env var if set."
+        ),
+    )
+    parser.add_argument(
+        "--fortran-convergence",
+        action="store_true",
+        help="Restore the Fortran-faithful checkconv dlntmax=1e-4 threshold "
+        "(equivalent to --checkconv-dlntmax 1e-4).",
     )
     parser.add_argument(
         "--n-workers",
@@ -136,6 +156,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = build_parser().parse_args(argv)
+    checkconv_dlntmax = 1.0e-4 if args.fortran_convergence else args.checkconv_dlntmax
     cfg = AtlasConfig(
         inputs=AtlasInput(
             atmosphere_path=args.atm,
@@ -160,6 +181,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         convergence_epsilon=args.convergence_epsilon,
         convergence_min_iterations=args.convergence_min_iterations,
         convergence_consecutive=args.convergence_consecutive,
+        convergence_dlntmax=checkconv_dlntmax,
         n_workers=args.n_workers,
         cache_dir=args.cache_dir,
         linop1_serial=True if args.linop1_serial else None,
